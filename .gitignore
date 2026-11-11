@@ -1,0 +1,8 @@
+﻿# Produits par une commande ou par l'outil, pas écrits à la main
+target/
+**/.claude/agent-profiler/
+*.ocr.txt
+tools/ui-snapshot/out/
+
+# Points de reprise locaux de l'alignement sur la maquette (remplacés par les commits)
+backups/

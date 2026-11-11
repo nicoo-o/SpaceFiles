@@ -1,0 +1,19 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "eco-app-manifest-v1",
+  "title": "Manifeste d'application Eco, version 1 : %LOCALAPPDATA%/Eco/apps/<id>.json",
+  "type": "object",
+  "required": ["id", "name", "version", "exe", "pipe", "protocol"],
+  "additionalProperties": true,
+  "properties": {
+    "id": { "type": "string", "pattern": "^[a-z][a-z0-9-]*$", "description": "Identifiant stable, aussi nom du fichier" },
+    "name": { "type": "string" },
+    "version": { "type": "string" },
+    "exe": { "type": "string", "description": "Chemin complet de l'exécutable" },
+    "pipe": { "type": "string", "description": "Nom du tube : Eco.<app>.<utilisateur> sous le préfixe des tubes nommés Windows" },
+    "protocol": { "type": "integer", "minimum": 1, "description": "Version du protocole parlée" },
+    "capabilities": { "type": "array", "items": { "type": "string" } },
+    "settingsSchema": { "type": "object", "description": "Schéma des réglages que le Hub peut afficher ; absent : lien profond seulement" },
+    "settingsLink": { "type": "string", "description": "Lien profond vers les réglages (spacefiles://settings)" }
+  }
+}

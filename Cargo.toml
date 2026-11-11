@@ -1,0 +1,79 @@
+﻿[package]
+name = "spacefiles"
+version = "0.1.0"
+edition = "2021"
+description = "Explorateur de fichiers au style Nothing, natif Win32 + Direct2D"
+
+[dependencies]
+windows-core = "0.58"
+# Renommage par lot : chercher / remplacer par expression régulière. Sans la fonctionnalité `perf` (DFA, onepass, littéraux) : -505 Ko
+# sur l'exe (lot 17), sans effet visible sur des noms de fichiers
+regex = { version = "1", default-features = false, features = ["std", "unicode"] }
+
+[dependencies.windows]
+version = "0.58"
+features = [
+    "implement",
+    "Foundation_Numerics",
+    "Data_Pdf",
+    "Media_Ocr",
+    "Globalization",
+    "Storage_Streams",
+    "Graphics_Imaging",
+    "Win32_Devices_PortableDevices",
+    "Win32_System_DataExchange",
+    "Win32_System_Memory",
+    "Win32_System_Ole",
+    "Win32_System_Threading",
+    "Win32_System_Diagnostics_ToolHelp",
+    "Win32_System_RestartManager",
+    "Win32_System_SystemServices",
+    "Win32_Security",
+    "Win32_Security_Authorization",
+    "Win32_System_Pipes",
+    "Win32_Security_Credentials",
+    "Win32_Security_WinTrust",
+    "Win32_Security_Cryptography",
+    "Win32_Security_Cryptography_Catalog",
+    "Win32_Security_Cryptography_Sip",
+    "Win32_NetworkManagement_NetManagement",
+    "Win32_NetworkManagement_WNet",
+    "Win32_System_SystemInformation",
+    "Win32_Globalization",
+    "Win32_System_IO",
+    "Win32_UI_Shell_Common",
+    "Win32_System_Com_StructuredStorage",
+    "Win32_System_Registry",
+    "Win32_Media_Audio",
+    "Win32_Storage_EnhancedStorage",
+    "Win32_UI_Shell_PropertiesSystem",
+    "Win32_Foundation",
+    "Win32_Graphics_Direct2D",
+    "Win32_Graphics_Direct2D_Common",
+    "Win32_Graphics_DirectWrite",
+    "Win32_Graphics_Dwm",
+    "Win32_Graphics_Dxgi_Common",
+    "Win32_Graphics_Gdi",
+    "Win32_Graphics_Imaging",
+    "Win32_Storage_FileSystem",
+    "Win32_Storage_CloudFilters",
+    "Win32_System_Time",
+    "Win32_UI_Shell",
+    "Win32_System_Com",
+    "Win32_System_LibraryLoader",
+    "Win32_UI_Accessibility",
+    "Win32_System_Variant",
+    "Win32_UI_Controls",
+    "Win32_UI_HiDpi",
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_UI_WindowsAndMessaging",
+]
+
+[profile.release]
+# 2 et non 3 (lot 17) : -166 Ko, défilement inchangé (liste 2,40 ms médiane / grille 2,91 ms, mêmes p95 à 5 % près). « s » ferait -620 Ko
+# de plus mais la grille dépasse alors le budget d'image du 240 Hz (p95 5,6 ms pour 4,17) : refusé
+opt-level = 2
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true

@@ -1,0 +1,1012 @@
+// Recherche globale (E17) : index de tous les fichiers des disques fixes, interrogé en quelques ms.
+//
+// Le journal USN de NTFS (comme Everything) demande les droits d'administrateur ; SpaceFiles
+// tourne sans. L'index est donc construit par un parcours en arrière-plan (FindFirstFileEx, gros blocs),
+// gardé dans %LOCALAPPDATA%\SpaceFiles\index.bin, puis tenu à jour par une surveillance
+// récursive de chaque disque (ReadDirectoryChangesW). Le même index sert à la palette et servira au B4.
+
+use std::collections::HashSet;
+use std::io::{Read, Write};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, RwLock};
+
+use windows::core::PCWSTR;
+use windows::Win32::Foundation::{CloseHandle, HANDLE, HWND, LPARAM, WPARAM};
+use windows::Win32::UI::WindowsAndMessaging::{PostMessageW, WM_APP};
+use windows::Win32::Storage::FileSystem::*;
+
+use crate::dossier::{entree_fichier, Entree};
+
+pub const MAX_RESULTATS: usize = 5000;
+/// L'index sur disque est relu tel quel s'il a moins de 6 h ; plus vieux, il est reconstruit
+const AGE_MAX_S: u64 = 6 * 3600;
+const DOSSIER_RACINE: u32 = u32::MAX;
+/// Au-delà, les changements vus depuis la construction sont trop nombreux : on reconstruit
+const MAX_CHANGEMENTS: usize = 50_000;
+
+/// Un élément de l'index (32 octets)
+#[derive(Clone, Copy)]
+struct Noeud {
+    /// Nom en UTF-8 dans `Index::noms`
+    nom: u32,
+    long: u16,
+    dossier: bool,
+    parent: u32,
+    taille: u64,
+    modif: u64,
+}
+
+#[derive(Default)]
+pub struct Index {
+    noeuds: Vec<Noeud>,
+    noms: Vec<u8>,
+    /// Date de construction (secondes depuis 1970)
+    pub construit: u64,
+}
+
+impl Index {
+    fn nom(&self, n: &Noeud) -> &str {
+        std::str::from_utf8(&self.noms[n.nom as usize..n.nom as usize + n.long as usize]).unwrap_or("")
+    }
+
+    /// Chemin complet d'un élément
+    fn chemin(&self, i: u32) -> String {
+        let mut morceaux = Vec::new();
+        let mut k = i;
+        while k != DOSSIER_RACINE {
+            let n = &self.noeuds[k as usize];
+            morceaux.push(self.nom(n));
+            k = n.parent;
+        }
+        morceaux.reverse();
+        let mut c = morceaux.join("\\");
+        if morceaux.len() == 1 {
+            c.push('\\');
+        }
+        c
+    }
+
+    pub fn len(&self) -> usize {
+        self.noeuds.len()
+    }
+
+    fn ajouter(&mut self, nom: &str, parent: u32, dossier: bool, taille: u64, modif: u64) -> u32 {
+        let debut = self.noms.len() as u32;
+        let octets = &nom.as_bytes()[..nom.len().min(u16::MAX as usize)];
+        self.noms.extend_from_slice(octets);
+        self.noeuds.push(Noeud { nom: debut, long: octets.len() as u16, dossier, parent, taille, modif });
+        (self.noeuds.len() - 1) as u32
+    }
+}
+
+static INDEX: RwLock<Option<Arc<Index>>> = RwLock::new(None);
+/// Éléments lus par la construction en cours (barre d'état)
+pub static PROGRES: AtomicUsize = AtomicUsize::new(0);
+pub static EN_CONSTRUCTION: AtomicBool = AtomicBool::new(false);
+static DEMARRE: AtomicBool = AtomicBool::new(false);
+/// « Supprimer l'index » a été demandé : la surveillance des disques n'alimente plus rien jusqu'à la prochaine construction
+static EFFACE: AtomicBool = AtomicBool::new(false);
+/// Lecture de l'index enregistré en cours (au premier besoin)
+static CHARGEMENT: AtomicBool = AtomicBool::new(false);
+/// Changements vus par la surveillance depuis la construction
+static AJOUTS: Mutex<Vec<(String, bool, u64, u64)>> = Mutex::new(Vec::new());
+static RETRAITS: Mutex<Option<HashSet<String>>> = Mutex::new(None);
+/// Numéro de génération : une nouvelle construction remet les changements à zéro
+static GENERATION: AtomicU64 = AtomicU64::new(0);
+/// Index prêt : les fenêtres abonnées relancent leur recherche globale
+pub const WM_INDEX: u32 = WM_APP + 12;
+static ABONNES: Mutex<Vec<isize>> = Mutex::new(Vec::new());
+/// Numéro de la surveillance des disques : `liberer` l'incrémente, les fils de surveillance de l'ancien numéro s'arrêtent.
+/// Les fenêtres normales ne libèrent jamais l'index : pour elles ce numéro ne change pas.
+static SURVEILLANCE: AtomicU64 = AtomicU64::new(0);
+/// Handles des dossiers surveillés (pour annuler leur lecture bloquante quand l'index est libéré)
+/// (handle, numéro de surveillance qui l'a ouvert)
+static HANDLES_SURVEILLANCE: Mutex<Vec<(isize, u64)>> = Mutex::new(Vec::new());
+/// Verrou d'état : `liberer`, `demarrer` (de la bascule de DEMARRE jusqu'à la fin du chargement) et `preparer_service`
+/// ne s'entrecroisent jamais (pas de reconstruction inutile ni de double chargement)
+static ETAT: Mutex<()> = Mutex::new(());
+/// Nombre de « Supprimer l'index » : un chargement ou une construction commencé avant ne réinstalle ni n'enregistre rien
+static EFFACEMENTS: AtomicU64 = AtomicU64::new(0);
+
+pub fn actuel() -> Option<Arc<Index>> {
+    INDEX.read().unwrap_or_else(|e| e.into_inner()).clone()
+}
+
+fn fichier_index() -> Option<std::path::PathBuf> {
+    crate::reglages::dossier_donnees(true).map(|d| d.join("index.bin"))
+}
+
+fn secondes() -> u64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs())
+}
+
+fn wide(s: &str) -> Vec<u16> {
+    s.encode_utf16().chain(std::iter::once(0)).collect()
+}
+
+/// Disques fixes (pas les clés USB, lecteurs réseau, CD)
+pub fn disques() -> Vec<String> {
+    let mut v = Vec::new();
+    unsafe {
+        let mut buf = [0u16; 512];
+        let n = GetLogicalDriveStringsW(Some(&mut buf)) as usize;
+        for r in buf[..n.min(buf.len())].split(|&c| c == 0).filter(|s| !s.is_empty()) {
+            let racine = String::from_utf16_lossy(r);
+            if GetDriveTypeW(PCWSTR(wide(&racine).as_ptr())) == 3 {
+                v.push(racine);
+            }
+        }
+    }
+    v
+}
+
+/// Disque sur un bus USB, FireWire, carte SD ou MMC : Windows déclare « fixe » un SSD USB externe,
+/// d'où ce contrôle du bus (IOCTL_STORAGE_QUERY_PROPERTY, sans droits d'administrateur)
+fn externe(racine: &str) -> bool {
+    matches!(bus(racine), Some(4 | 7 | 0xC | 0xD))
+}
+
+/// Type de bus du disque (STORAGE_BUS_TYPE : 4 = 1394, 7 = USB, 0xC = SD, 0xD = MMC, 0x11 = NVMe), None si illisible
+fn bus(racine: &str) -> Option<u32> {
+    use windows::Win32::System::IO::DeviceIoControl;
+    let lettre = racine.chars().next()?;
+    let chemin = wide(&format!(r"\\.\{lettre}:"));
+    unsafe {
+        let h = CreateFileW(PCWSTR(chemin.as_ptr()), 0, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, None, OPEN_EXISTING, FILE_FLAGS_AND_ATTRIBUTES(0), HANDLE::default()).ok()?;
+        // STORAGE_PROPERTY_QUERY (12 octets) : StorageDeviceProperty, PropertyStandardQuery
+        let requete = [0u32; 3];
+        let mut sortie = [0u8; 1024];
+        let mut lus = 0u32;
+        let ok = DeviceIoControl(h, 0x002D_1400, Some(requete.as_ptr() as *const _), 12, Some(sortie.as_mut_ptr() as *mut _), sortie.len() as u32, Some(&mut lus), None).is_ok();
+        let _ = CloseHandle(h);
+        // STORAGE_DEVICE_DESCRIPTOR.BusType est à l'octet 28
+        (ok && lus >= 32).then(|| u32::from_le_bytes([sortie[28], sortie[29], sortie[30], sortie[31]]))
+    }
+}
+
+/// Dossiers énormes et sans intérêt pour une recherche
+fn ignore(chemin_min: &str) -> bool {
+    chemin_min.ends_with("\\windows\\winsxs")
+        || chemin_min.ends_with("\\$recycle.bin")
+        || chemin_min.ends_with("\\system volume information")
+        || chemin_min.ends_with("\\windows\\installer")
+        || chemin_min.ends_with("\\windows\\servicing")
+}
+
+/// Parcourt tous les disques fixes
+fn construire() -> Index {
+    let mut index = Index { construit: secondes(), ..Default::default() };
+    index.noeuds.reserve(1 << 20);
+    index.noms.reserve(16 << 20);
+    PROGRES.store(0, Ordering::Relaxed);
+    // Disques et dossiers exclus dans les réglages (section RECHERCHE)
+    let exclus = crate::reglages::actuels().exclus;
+    for racine in disques() {
+        if exclus.contains(&crate::reglages::forme_exclu(&racine)) {
+            continue;
+        }
+        let lettre = racine.trim_end_matches('\\').to_string();
+        let r = index.ajouter(&lettre, DOSSIER_RACINE, true, 0, 0);
+        // En largeur : les dossiers proches de la racine sortent les premiers dans les résultats
+        let mut a_lire = std::collections::VecDeque::from([(racine.clone(), r)]);
+        while let Some((dossier, i)) = a_lire.pop_front() {
+            let motif = wide(&if dossier.ends_with('\\') { format!("{dossier}*") } else { format!("{dossier}\\*") });
+            unsafe {
+                let mut d = WIN32_FIND_DATAW::default();
+                let Ok(h) = FindFirstFileExW(PCWSTR(motif.as_ptr()), FindExInfoBasic, &mut d as *mut _ as *mut _, FindExSearchNameMatch, None, FIND_FIRST_EX_LARGE_FETCH)
+                else {
+                    continue;
+                };
+                loop {
+                    let len = d.cFileName.iter().position(|&c| c == 0).unwrap_or(d.cFileName.len());
+                    let nom_u = &d.cFileName[..len];
+                    if nom_u != [b'.' as u16] && nom_u != [b'.' as u16, b'.' as u16] {
+                        let nom = String::from_utf16_lossy(nom_u);
+                        let attr = d.dwFileAttributes;
+                        let est_dossier = attr & FILE_ATTRIBUTE_DIRECTORY.0 != 0;
+                        let taille = ((d.nFileSizeHigh as u64) << 32) | d.nFileSizeLow as u64;
+                        let modif = ((d.ftLastWriteTime.dwHighDateTime as u64) << 32) | d.ftLastWriteTime.dwLowDateTime as u64;
+                        let k = index.ajouter(&nom, i, est_dossier, if est_dossier { 0 } else { taille }, modif);
+                        // Jonctions et liens : on n'y entre pas (boucles)
+                        if est_dossier && attr & FILE_ATTRIBUTE_REPARSE_POINT.0 == 0 {
+                            let enfant = crate::dossier::joindre(&dossier, &nom);
+                            if !ignore(&enfant.to_lowercase()) && !exclus.contains(&crate::reglages::forme_exclu(&enfant)) {
+                                a_lire.push_back((enfant, k));
+                            }
+                        }
+                    }
+                    if FindNextFileW(h, &mut d).is_err() {
+                        break;
+                    }
+                }
+                let _ = FindClose(h);
+            }
+            PROGRES.store(index.noeuds.len(), Ordering::Relaxed);
+        }
+    }
+    index.noeuds.shrink_to_fit();
+    index.noms.shrink_to_fit();
+    index
+}
+
+fn encoder(index: &Index) -> Vec<u8> {
+    let mut octets = Vec::with_capacity(index.noeuds.len() * 27 + index.noms.len() + 32);
+    octets.extend_from_slice(b"NEIX0001");
+    octets.extend_from_slice(&index.construit.to_le_bytes());
+    octets.extend_from_slice(&(index.noeuds.len() as u64).to_le_bytes());
+    octets.extend_from_slice(&(index.noms.len() as u64).to_le_bytes());
+    for n in &index.noeuds {
+        octets.extend_from_slice(&n.nom.to_le_bytes());
+        octets.extend_from_slice(&n.long.to_le_bytes());
+        octets.push(n.dossier as u8);
+        octets.extend_from_slice(&n.parent.to_le_bytes());
+        octets.extend_from_slice(&n.taille.to_le_bytes());
+        octets.extend_from_slice(&n.modif.to_le_bytes());
+    }
+    octets.extend_from_slice(&index.noms);
+    octets
+}
+
+fn enregistrer(index: &Index) {
+    let Some(f) = fichier_index() else { return };
+    if let Some(d) = f.parent() {
+        let _ = std::fs::create_dir_all(d);
+    }
+    let octets = encoder(index);
+    // Écrit à côté puis remplace : une autre fenêtre ne lit jamais un fichier à moitié écrit
+    let tmp = f.with_extension("tmp");
+    if std::fs::File::create(&tmp).and_then(|mut h| h.write_all(&octets)).is_ok() {
+        let _ = std::fs::rename(&tmp, &f);
+    }
+}
+
+fn charger() -> Option<Index> {
+    let mut octets = Vec::new();
+    std::fs::File::open(fichier_index()?).ok()?.read_to_end(&mut octets).ok()?;
+    decoder(&octets)
+}
+
+fn decoder(octets: &[u8]) -> Option<Index> {
+    if octets.len() < 32 || &octets[..8] != b"NEIX0001" {
+        return None;
+    }
+    let u64_ = |p: usize| u64::from_le_bytes(octets[p..p + 8].try_into().unwrap());
+    let construit = u64_(8);
+    let (n, l) = (u64_(16) as usize, u64_(24) as usize);
+    let debut_noms = n.checked_mul(27)?.checked_add(32)?;
+    if Some(octets.len()) != debut_noms.checked_add(l) {
+        return None;
+    }
+    let mut noeuds = Vec::with_capacity(n);
+    for k in 0..n {
+        let p = 32 + k * 27;
+        let noeud = Noeud {
+            nom: u32::from_le_bytes(octets[p..p + 4].try_into().unwrap()),
+            long: u16::from_le_bytes(octets[p + 4..p + 6].try_into().unwrap()),
+            dossier: octets[p + 6] != 0,
+            parent: u32::from_le_bytes(octets[p + 7..p + 11].try_into().unwrap()),
+            taille: u64_(p + 11),
+            modif: u64_(p + 19),
+        };
+        // Fichier abîmé : un nom hors de la zone des noms planterait (panic = arrêt), et un parent qui
+        // ne précède pas son enfant (la construction les range dans cet ordre) ferait boucler `chemin`
+        if noeud.nom as usize + noeud.long as usize > l || (noeud.parent != DOSSIER_RACINE && noeud.parent as usize >= k) {
+            return None;
+        }
+        noeuds.push(noeud);
+    }
+    Some(Index { noeuds, noms: octets[debut_noms..].to_vec(), construit })
+}
+
+fn installer(index: Index) {
+    EFFACE.store(false, Ordering::SeqCst);
+    GENERATION.fetch_add(1, Ordering::SeqCst);
+    AJOUTS.lock().unwrap_or_else(|e| e.into_inner()).clear();
+    *RETRAITS.lock().unwrap_or_else(|e| e.into_inner()) = Some(HashSet::new());
+    *INDEX.write().unwrap_or_else(|e| e.into_inner()) = Some(Arc::new(index));
+}
+
+/// Supprime l'index enregistré et celui en mémoire (réglages › confidentialité)
+pub fn effacer() {
+    effacer_local();
+    // Le résident garde peut-être l'index en mémoire (service de recherche) : il l'efface aussi
+    crate::raccourci::effacer_index();
+}
+
+/// Effacement dans ce processus seulement (appelé aussi par le résident quand une fenêtre le lui demande)
+pub fn effacer_local() {
+    EFFACEMENTS.fetch_add(1, Ordering::SeqCst);
+    EFFACE.store(true, Ordering::SeqCst);
+    if let Some(f) = fichier_index() {
+        let _ = std::fs::remove_file(f);
+    }
+    *INDEX.write().unwrap_or_else(|e| e.into_inner()) = None;
+    AJOUTS.lock().unwrap_or_else(|e| e.into_inner()).clear();
+}
+
+/// Reconstruit l'index en arrière-plan (au démarrage s'il est vieux, ou à la demande)
+pub fn reconstruire() {
+    if EN_CONSTRUCTION.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    let efface = EFFACEMENTS.load(Ordering::SeqCst);
+    std::thread::spawn(move || {
+        unsafe {
+            // Priorité basse : le parcours ne doit pas ralentir le PC
+            let _ = windows::Win32::System::Threading::SetThreadPriority(windows::Win32::System::Threading::GetCurrentThread(), windows::Win32::System::Threading::THREAD_MODE_BACKGROUND_BEGIN);
+        }
+        let index = construire();
+        // Index supprimé pendant le parcours : on ne l'écrit pas et on ne l'installe pas
+        if EFFACEMENTS.load(Ordering::SeqCst) == efface {
+            enregistrer(&index);
+            installer(index);
+        }
+        EN_CONSTRUCTION.store(false, Ordering::SeqCst);
+        prevenir();
+    });
+}
+
+/// L'index est-il complet et à jour (ni chargement ni construction en cours) ?
+pub fn pret() -> bool {
+    actuel().is_some() && !CHARGEMENT.load(Ordering::Relaxed) && !EN_CONSTRUCTION.load(Ordering::Relaxed)
+}
+
+/// Fenêtre qui montre des résultats incomplets : elle recevra WM_INDEX quand l'index sera prêt
+pub fn abonner(hwnd: HWND) {
+    {
+        let mut a = ABONNES.lock().unwrap_or_else(|e| e.into_inner());
+        if !a.contains(&(hwnd.0 as isize)) {
+            a.push(hwnd.0 as isize);
+        }
+    }
+    // Devenu prêt entre-temps : pas d'attente perdue
+    prevenir();
+}
+
+fn prevenir() {
+    if !pret() {
+        return;
+    }
+    for h in ABONNES.lock().unwrap_or_else(|e| e.into_inner()).drain(..) {
+        unsafe {
+            let _ = PostMessageW(HWND(h as *mut _), WM_INDEX, WPARAM(0), LPARAM(0));
+        }
+    }
+}
+
+/// Au premier besoin (palette, recherche globale) : relit l'index enregistré, le reconstruit s'il est trop vieux, puis surveille les disques
+pub fn demarrer() {
+    let _etat = ETAT.lock().unwrap_or_else(|e| e.into_inner());
+    demarrer_verrouille();
+}
+
+/// `demarrer` avec le verrou d'état déjà tenu par l'appelant
+fn demarrer_verrouille() {
+    if DEMARRE.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    CHARGEMENT.store(true, Ordering::SeqCst);
+    let numero = SURVEILLANCE.load(Ordering::SeqCst);
+    let efface = EFFACEMENTS.load(Ordering::SeqCst);
+    std::thread::spawn(move || {
+        let index = charger();
+        let supprime = EFFACEMENTS.load(Ordering::SeqCst) != efface;
+        let vieux = !supprime && index.as_ref().map_or(true, |i| secondes().saturating_sub(i.construit) > AGE_MAX_S);
+        if let Some(i) = index.filter(|_| !supprime) {
+            installer(i);
+        }
+        {
+            // Sous le verrou : un `liberer` ne passe pas entre la fin du chargement et le début de la reconstruction
+            let _etat = ETAT.lock().unwrap_or_else(|e| e.into_inner());
+            CHARGEMENT.store(false, Ordering::SeqCst);
+            prevenir();
+            if vieux {
+                reconstruire();
+            }
+        }
+        // Pas de surveillance sur un disque externe : son handle ouvert empêcherait « Retirer en toute
+        // sécurité ». Il reste dans l'index, rafraîchi à la prochaine reconstruction (6 h).
+        for d in disques().into_iter().filter(|d| !externe(d)) {
+            std::thread::spawn(move || surveiller(d, numero));
+        }
+    });
+}
+
+/// Ce que le service de recherche peut faire d'une requête
+pub enum EtatService {
+    Pret(Arc<Index>),
+    /// Chargement ou construction lancé (ou en cours) : répondre « loading »
+    Chargement,
+    /// « Supprimer l'index » a été demandé : le service ne reconstruit pas de lui-même
+    Efface,
+}
+
+/// Service de recherche du résident : rend l'index tenu par ce seul appel (jamais relu ensuite), sinon lance son
+/// chargement (ou sa construction) en arrière-plan.
+pub fn preparer_service() -> EtatService {
+    let _etat = ETAT.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(i) = actuel() {
+        return EtatService::Pret(i);
+    }
+    if EFFACE.load(Ordering::SeqCst) {
+        // Index supprimé : tant qu'aucune fenêtre n'en a reconstruit un (fichier revenu), on ne recrée rien
+        if !fichier_index().is_some_and(|f| f.exists()) {
+            return EtatService::Efface;
+        }
+        EFFACE.store(false, Ordering::SeqCst);
+        DEMARRE.store(false, Ordering::SeqCst);
+    }
+    demarrer_verrouille();
+    // Déjà démarré (index libéré puis relancé sans fichier) : plus rien ne le recharge sans cet appel
+    if actuel().is_none() && !CHARGEMENT.load(Ordering::SeqCst) && !EN_CONSTRUCTION.load(Ordering::SeqCst) {
+        reconstruire();
+    }
+    EtatService::Chargement
+}
+
+/// Libère l'index en mémoire et arrête la surveillance des disques (service du résident, après une longue inactivité).
+/// Refuse (faux) pendant un chargement ou une construction : l'appelant réessaiera plus tard.
+pub fn liberer() -> bool {
+    let _etat = ETAT.lock().unwrap_or_else(|e| e.into_inner());
+    if CHARGEMENT.load(Ordering::SeqCst) || EN_CONSTRUCTION.load(Ordering::SeqCst) {
+        return false;
+    }
+    let ancien = SURVEILLANCE.fetch_add(1, Ordering::SeqCst);
+    // Un fil de surveillance peut ne pas encore être bloqué dans sa lecture quand l'annulation passe : un fil court
+    // la renouvelle (2 s au plus) jusqu'à ce que tous les fils de l'ancien numéro aient fermé leur handle
+    std::thread::spawn(move || {
+        for _ in 0..40 {
+            {
+                let l = HANDLES_SURVEILLANCE.lock().unwrap_or_else(|e| e.into_inner());
+                let restants: Vec<isize> = l.iter().filter(|x| x.1 == ancien).map(|x| x.0).collect();
+                if restants.is_empty() {
+                    break;
+                }
+                for h in restants {
+                    // SAFETY : le handle figure dans la liste, donc ouvert : `surveiller` l'en retire (sous ce même
+                    // verrou, que nous tenons) avant de le fermer. CancelIoEx n'agit que sur la lecture en attente.
+                    unsafe {
+                        let _ = windows::Win32::System::IO::CancelIoEx(HANDLE(h as *mut _), None);
+                    }
+                }
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+    });
+    *INDEX.write().unwrap_or_else(|e| e.into_inner()) = None;
+    *AJOUTS.lock().unwrap_or_else(|e| e.into_inner()) = Vec::new();
+    *RETRAITS.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    *CARTE.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    DEMARRE.store(false, Ordering::SeqCst);
+    true
+}
+
+/// Carte du disque (O6) : familles de fichiers, dans l'ordre des points
+pub const FAMILLES_CARTE: [&str; 6] = ["VIDEOS", "IMAGES", "AUDIO", "DOCUMENTS", "PROGRAMMES", "AUTRES"];
+/// Octets par famille pour chaque disque indexé (« C: »), avec la date de l'index qui a servi
+static CARTE: Mutex<Option<(u64, Vec<(String, [u64; 6])>)>> = Mutex::new(None);
+static CARTE_EN_COURS: AtomicBool = AtomicBool::new(false);
+
+fn famille_carte(nom: &str) -> usize {
+    match extension(nom).to_ascii_lowercase().as_str() {
+        "mp4" | "mkv" | "avi" | "mov" | "wmv" | "webm" | "m4v" | "flv" | "mpg" | "mpeg" | "ts" | "m2ts" | "3gp" | "vob" => 0,
+        "jpg" | "jpeg" | "png" | "gif" | "bmp" | "webp" | "tif" | "tiff" | "heic" | "heif" | "raw" | "cr2" | "cr3" | "nef" | "arw" | "dng" | "psd" | "svg" | "ico" | "jfif" | "avif" => 1,
+        "mp3" | "wav" | "flac" | "aac" | "ogg" | "m4a" | "wma" | "opus" | "aiff" | "mid" | "alac" => 2,
+        "pdf" | "txt" | "doc" | "docx" | "rtf" | "odt" | "xls" | "xlsx" | "ppt" | "pptx" | "csv" | "md" | "epub" | "odp" | "ods" | "pages" | "key" => 3,
+        "exe" | "dll" | "msi" | "sys" | "bat" | "cmd" | "ps1" | "com" | "jar" | "apk" | "appx" | "msix" | "msixbundle" | "ocx" | "efi" => 4,
+        _ => 5,
+    }
+}
+
+/// Un passage sur l'index : chaque élément hérite du disque de son parent (rangé avant lui)
+fn calculer_carte(index: &Index) -> Vec<(String, [u64; 6])> {
+    let mut disque = vec![u32::MAX; index.noeuds.len()];
+    let mut v: Vec<(String, [u64; 6])> = Vec::new();
+    for (i, n) in index.noeuds.iter().enumerate() {
+        let d = if n.parent == DOSSIER_RACINE {
+            v.push((index.nom(n).to_string(), [0; 6]));
+            (v.len() - 1) as u32
+        } else {
+            disque.get(n.parent as usize).copied().unwrap_or(u32::MAX)
+        };
+        disque[i] = d;
+        if !n.dossier && d != u32::MAX {
+            v[d as usize].1[famille_carte(index.nom(n))] += n.taille;
+        }
+    }
+    v
+}
+
+/// Carte prête (calculée sur l'index actuel), sinon None
+pub fn carte_prete() -> Option<Vec<(String, [u64; 6])>> {
+    let construit = actuel()?.construit;
+    CARTE.lock().unwrap_or_else(|e| e.into_inner()).as_ref().filter(|c| c.0 == construit).map(|c| c.1.clone())
+}
+
+/// Vue Ce PC : prépare la carte en arrière-plan ; la fenêtre reçoit WM_INDEX quand elle est prête
+pub fn preparer_carte(hwnd: HWND) {
+    demarrer();
+    let Some(index) = actuel() else {
+        abonner(hwnd);
+        return;
+    };
+    if carte_prete().is_some() || CARTE_EN_COURS.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    let h = hwnd.0 as isize;
+    std::thread::spawn(move || {
+        let v = calculer_carte(&index);
+        *CARTE.lock().unwrap_or_else(|e| e.into_inner()) = Some((index.construit, v));
+        CARTE_EN_COURS.store(false, Ordering::SeqCst);
+        unsafe {
+            let _ = PostMessageW(HWND(h as *mut _), WM_INDEX, WPARAM(0), LPARAM(0));
+        }
+    });
+}
+
+/// Taille d'un dossier d'après l'index (O4, poids sonore) : None s'il n'y est pas.
+/// Un passage par niveau pour le trouver, puis un passage pour additionner ce qu'il contient
+pub fn taille_dossier(chemin: &str) -> Option<u64> {
+    let index = actuel()?;
+    let mut parties = chemin.trim_end_matches('\\').split('\\');
+    let lettre = parties.next()?;
+    let mut cible = index.noeuds.iter().position(|n| n.parent == DOSSIER_RACINE && index.nom(n).eq_ignore_ascii_case(lettre))? as u32;
+    for p in parties {
+        cible = index.noeuds.iter().enumerate().find(|(_, n)| n.parent == cible && n.dossier && index.nom(n).eq_ignore_ascii_case(p))?.0 as u32;
+    }
+    // Les éléments sont rangés après leur dossier : « dedans » se propage en un seul passage
+    let mut dedans = vec![false; index.noeuds.len()];
+    dedans[cible as usize] = true;
+    let mut total = 0u64;
+    for (i, n) in index.noeuds.iter().enumerate().skip(cible as usize + 1) {
+        if n.parent != DOSSIER_RACINE && dedans.get(n.parent as usize).copied().unwrap_or(false) {
+            dedans[i] = true;
+            total += n.taille;
+        }
+    }
+    Some(total)
+}
+
+/// Surveillance récursive d'un disque : ajouts et retraits gardés à part, fusionnés à la recherche
+fn surveiller(racine: String, numero: u64) {
+    unsafe {
+        let Ok(h) = CreateFileW(
+            PCWSTR(wide(&racine).as_ptr()),
+            FILE_LIST_DIRECTORY.0,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            None,
+            OPEN_EXISTING,
+            FILE_FLAG_BACKUP_SEMANTICS,
+            HANDLE::default(),
+        ) else {
+            return;
+        };
+        {
+            // Inscrit avant de tester le numéro : un `liberer` qui passe entre les deux annule ou nous voit partir
+            let mut l = HANDLES_SURVEILLANCE.lock().unwrap_or_else(|e| e.into_inner());
+            l.push((h.0 as isize, numero));
+        }
+        let mut buf = vec![0u32; 16 * 1024];
+        loop {
+            if SURVEILLANCE.load(Ordering::SeqCst) != numero {
+                break;
+            }
+            let mut lus = 0u32;
+            let ok = ReadDirectoryChangesW(
+                h,
+                buf.as_mut_ptr() as *mut _,
+                (buf.len() * 4) as u32,
+                true,
+                FILE_NOTIFY_CHANGE_FILE_NAME | FILE_NOTIFY_CHANGE_DIR_NAME,
+                Some(&mut lus),
+                None,
+                None,
+            );
+            if ok.is_err() {
+                break;
+            }
+            if lus == 0 {
+                continue; // trop de changements d'un coup : ils sont perdus, tant pis
+            }
+            let octets = std::slice::from_raw_parts(buf.as_ptr() as *const u8, lus as usize);
+            let mut p = 0usize;
+            loop {
+                let info = &*(octets.as_ptr().add(p) as *const FILE_NOTIFY_INFORMATION);
+                let n = info.FileNameLength as usize / 2;
+                let nom = String::from_utf16_lossy(std::slice::from_raw_parts(info.FileName.as_ptr(), n));
+                let chemin = crate::dossier::joindre(&racine, &nom);
+                noter(info.Action, chemin);
+                if info.NextEntryOffset == 0 {
+                    break;
+                }
+                p += info.NextEntryOffset as usize;
+            }
+        }
+        // Retiré de la liste avant de fermer : `liberer` n'appelle jamais CancelIoEx sur un handle fermé
+        HANDLES_SURVEILLANCE.lock().unwrap_or_else(|e| e.into_inner()).retain(|x| x.0 != h.0 as isize);
+        let _ = CloseHandle(h);
+    }
+}
+
+fn noter(action: FILE_ACTION, chemin: String) {
+    if EFFACE.load(Ordering::Relaxed) {
+        return;
+    }
+    let min = chemin.to_lowercase();
+    if min.contains("\\$recycle.bin") || min.contains("\\windows\\winsxs") {
+        return;
+    }
+    match action {
+        FILE_ACTION_ADDED | FILE_ACTION_RENAMED_NEW_NAME => {
+            let Ok(m) = std::fs::symlink_metadata(&chemin) else { return };
+            use std::os::windows::fs::MetadataExt;
+            let mut a = AJOUTS.lock().unwrap_or_else(|e| e.into_inner());
+            a.retain(|x| !x.0.eq_ignore_ascii_case(&chemin));
+            a.push((chemin, m.is_dir(), m.len(), m.last_write_time()));
+            if let Some(r) = RETRAITS.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
+                r.remove(&min);
+            }
+            if a.len() > MAX_CHANGEMENTS {
+                drop(a);
+                reconstruire();
+            }
+        }
+        FILE_ACTION_REMOVED | FILE_ACTION_RENAMED_OLD_NAME => {
+            AJOUTS.lock().unwrap_or_else(|e| e.into_inner()).retain(|x| !x.0.eq_ignore_ascii_case(&chemin));
+            if let Some(r) = RETRAITS.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
+                r.insert(min);
+            }
+        }
+        _ => {}
+    }
+}
+
+// ───────────────────────── Requêtes ─────────────────────────
+
+/// Requête découpée : mots du nom et filtres
+#[derive(Default, Debug, PartialEq)]
+pub struct Requete {
+    pub mots: Vec<String>,
+    pub extensions: Vec<String>,
+    pub taille_min: Option<u64>,
+    pub taille_max: Option<u64>,
+    /// Modifié dans les N derniers jours
+    pub jours: Option<u64>,
+    /// Some(true) : dossiers seulement ; Some(false) : fichiers seulement
+    pub dossiers: Option<bool>,
+    /// Chemin qui doit commencer par…
+    pub dans: Option<String>,
+    pub contenu: Option<String>,
+}
+
+/// `10mo`, `1,5go`, `200k`, `3g` → octets
+fn octets(s: &str) -> Option<u64> {
+    let s = s.trim().to_lowercase().replace(',', ".");
+    let fin = s.find(|c: char| !(c.is_ascii_digit() || c == '.')).unwrap_or(s.len());
+    let n: f64 = s[..fin].parse().ok()?;
+    let mult = match s[fin..].trim_end_matches(['o', 'b']) {
+        "" => 1.0,
+        "k" => 1024.0,
+        "m" => 1024.0 * 1024.0,
+        "g" => 1024.0 * 1024.0 * 1024.0,
+        "t" => 1024f64.powi(4),
+        _ => return None,
+    };
+    Some((n * mult) as u64)
+}
+
+/// Position (en octets de `motif`) de « contenu: » sans tenir compte de la casse. Cherchée dans `motif` lui-même :
+/// le passage en minuscules change la longueur de certaines lettres (`İ`) et décalait la découpe (panique).
+fn position_contenu(motif: &str) -> Option<usize> {
+    motif.char_indices().map(|(i, _)| i).find(|&i| motif.as_bytes().get(i..i + 8).is_some_and(|b| b.eq_ignore_ascii_case(b"contenu:")))
+}
+
+pub fn analyser(motif: &str) -> Requete {
+    let mut r = Requete::default();
+    // `contenu:` prend tout le reste de la ligne (on cherche souvent une phrase)
+    let (avant, contenu) = match position_contenu(motif) {
+        Some(i) => (motif[..i].to_string(), Some(motif[i + 8..].trim().to_string())),
+        None => (motif.to_string(), None),
+    };
+    r.contenu = contenu.filter(|c| !c.is_empty());
+    for mot in avant.split_whitespace() {
+        let m = mot.to_lowercase();
+        if let Some(e) = m.strip_prefix("ext:").or_else(|| m.strip_prefix("type:")) {
+            r.extensions.extend(e.split([',', ';']).filter(|x| !x.is_empty()).map(|x| x.trim_start_matches('.').to_uppercase()));
+        } else if let Some(e) = m.strip_prefix("*.") {
+            r.extensions.push(e.to_uppercase());
+        } else if let Some(v) = m.strip_prefix("taille>").or_else(|| m.strip_prefix("size>")) {
+            r.taille_min = octets(v);
+        } else if let Some(v) = m.strip_prefix("taille<").or_else(|| m.strip_prefix("size<")) {
+            r.taille_max = octets(v);
+        } else if let Some(v) = m.strip_prefix("modif:").or_else(|| m.strip_prefix("recent:")) {
+            r.jours = v.trim_end_matches(['j', 'd']).parse().ok().or(Some(7));
+        } else if m == "dossier:" || m == "dossiers:" {
+            r.dossiers = Some(true);
+        } else if m == "fichier:" || m == "fichiers:" {
+            r.dossiers = Some(false);
+        } else if let Some(v) = mot.strip_prefix("dans:").or_else(|| mot.strip_prefix("DANS:")) {
+            r.dans = Some(v.trim_end_matches('\\').to_lowercase());
+        } else {
+            r.mots.push(m);
+        }
+    }
+    r
+}
+
+/// Le nom (UTF-8) contient-il ce mot (en minuscules) ? Rapide pour les noms ASCII, la grande majorité
+fn contient(nom: &str, mot: &str) -> bool {
+    if nom.is_ascii() && mot.is_ascii() {
+        let (n, m) = (nom.as_bytes(), mot.as_bytes());
+        return m.len() <= n.len() && n.windows(m.len()).any(|w| w.eq_ignore_ascii_case(m));
+    }
+    nom.to_lowercase().contains(mot)
+}
+
+fn extension(nom: &str) -> &str {
+    nom.rfind('.').filter(|&i| i > 0).map_or("", |i| &nom[i + 1..])
+}
+
+impl Requete {
+    fn accepte(&self, nom: &str, dossier: bool, taille: u64, modif: u64, limite_date: u64) -> bool {
+        if self.dossiers.is_some_and(|d| d != dossier) {
+            return false;
+        }
+        if !self.extensions.is_empty() && (dossier || !self.extensions.iter().any(|e| extension(nom).eq_ignore_ascii_case(e))) {
+            return false;
+        }
+        if self.taille_min.is_some_and(|t| dossier || taille < t) || self.taille_max.is_some_and(|t| dossier || taille > t) {
+            return false;
+        }
+        if self.jours.is_some() && modif < limite_date {
+            return false;
+        }
+        self.mots.iter().all(|m| contient(nom, m))
+    }
+
+    fn vide(&self) -> bool {
+        *self == Requete::default()
+    }
+}
+
+/// Cherche dans un fichier texte (sans tenir compte de la casse pour l'ASCII)
+fn fichier_contient(chemin: &str, texte: &str) -> bool {
+    let Ok(octets) = std::fs::read(chemin) else { return false };
+    if octets.iter().take(4000).filter(|&&c| c == 0).count() > 8 {
+        return false; // binaire
+    }
+    let m = texte.as_bytes();
+    !m.is_empty() && octets.windows(m.len()).any(|w| w.eq_ignore_ascii_case(m))
+}
+
+/// Recherche dans tout le PC. Appelée hors du fil de l'interface (sauf la palette, limitée à quelques résultats).
+/// Fichiers de même nom et de même taille ailleurs que dans `exclu` (ni dans la corbeille) :
+/// nom en minuscules → chemins trouvés (index, et changements récents d'abord)
+pub fn copies_ailleurs(cherches: &std::collections::HashMap<String, u64>, exclu: &str) -> std::collections::HashMap<String, Vec<String>> {
+    let mut v: std::collections::HashMap<String, Vec<String>> = std::collections::HashMap::new();
+    if cherches.is_empty() {
+        return v;
+    }
+    let exclu = format!("{}\\", exclu.trim_end_matches('\\').to_lowercase());
+    let retraits = RETRAITS.lock().unwrap_or_else(|e| e.into_inner()).clone().unwrap_or_default();
+    let mut garder = |nom: &str, dossier: bool, taille: u64, chemin: &dyn Fn() -> String| {
+        if dossier {
+            return;
+        }
+        let k = nom.to_lowercase();
+        if cherches.get(&k) != Some(&taille) {
+            return;
+        }
+        let c = chemin();
+        let min = c.to_lowercase();
+        if min.starts_with(&exclu) || min.contains("\\$recycle.bin\\") || retraits.contains(&min) || !std::path::Path::new(&c).exists() {
+            return;
+        }
+        let l = v.entry(k).or_default();
+        if !l.iter().any(|x| x.eq_ignore_ascii_case(&c)) {
+            l.push(c);
+        }
+    };
+    for (c, dossier, taille, _) in AJOUTS.lock().unwrap_or_else(|e| e.into_inner()).clone().iter().rev() {
+        garder(c.rsplit('\\').next().unwrap_or(c), *dossier, *taille, &|| c.clone());
+    }
+    if let Some(index) = actuel() {
+        for (i, n) in index.noeuds.iter().enumerate() {
+            if n.parent != DOSSIER_RACINE {
+                garder(index.nom(n), n.dossier, n.taille, &|| index.chemin(i as u32));
+            }
+        }
+    }
+    v
+}
+
+pub fn chercher(motif: &str, max: usize) -> Result<Vec<Entree>, String> {
+    chercher_avec(motif, max, &|| false)
+}
+
+/// Comme `chercher`, avec un test d'annulation consulté tous les 16 384 éléments (le service du résident l'utilise pour
+/// abandonner une requête quand une nouvelle arrive). Annulée : `Err("ANNULE")`.
+pub fn chercher_avec(motif: &str, max: usize, annule: &dyn Fn() -> bool) -> Result<Vec<Entree>, String> {
+    let Some(index) = actuel() else {
+        demarrer();
+        // Index supprimé (réglages › confidentialité) : reconstruit à la première recherche
+        if !CHARGEMENT.load(Ordering::SeqCst) && !EN_CONSTRUCTION.load(Ordering::SeqCst) {
+            reconstruire();
+        }
+        let n = PROGRES.load(Ordering::Relaxed);
+        return Err(format!("INDEX EN CONSTRUCTION · {} ELEMENTS LUS · REESSAYEZ DANS UN INSTANT", crate::systeme::nombre(n)));
+    };
+    chercher_dans(&index, motif, max, annule)
+}
+
+/// Date limite (FILETIME) d'un filtre « modifié dans les N derniers jours » ; N énorme : 0 (tout passe), sans dépassement
+fn date_limite(jours: Option<u64>, maintenant: u64) -> u64 {
+    jours.map_or(0, |j| maintenant.saturating_sub(j.saturating_mul(864_000_000_000)))
+}
+
+/// La recherche elle-même, sur un index que l'appelant tient déjà (le service du résident ne relit jamais `actuel()` :
+/// une libération pendant la requête ne la fait pas changer d'index)
+pub fn chercher_dans(index: &Index, motif: &str, max: usize, annule: &dyn Fn() -> bool) -> Result<Vec<Entree>, String> {
+    let r = analyser(motif);
+    if r.vide() {
+        return Ok(Vec::new());
+    }
+    let limite_date = date_limite(r.jours, crate::systeme::maintenant());
+    let retraits = RETRAITS.lock().unwrap_or_else(|e| e.into_inner()).clone().unwrap_or_default();
+    // Exclusions : effet immédiat, sans attendre la reconstruction
+    let exclus = crate::reglages::actuels().exclus;
+    let mut v = Vec::new();
+    let mut lus_contenu = 0usize;
+    let ajouts = AJOUTS.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    let deja: HashSet<String> = ajouts.iter().map(|a| a.0.to_lowercase()).collect();
+    // `de_l_index` : un élément déjà vu par la surveillance n'est pas compté deux fois
+    let mut garder = |nom: &str, dossier: bool, taille: u64, modif: u64, chemin: &dyn Fn() -> String, de_l_index: bool, v: &mut Vec<Entree>| -> bool {
+        if !r.accepte(nom, dossier, taille, modif, limite_date) {
+            return true;
+        }
+        let c = chemin();
+        let min = c.to_lowercase();
+        if retraits.contains(&min) || (de_l_index && deja.contains(&min)) || r.dans.as_ref().is_some_and(|d| !min.starts_with(d.as_str())) || exclus.iter().any(|x| min.starts_with(x.as_str())) {
+            return true;
+        }
+        if let Some(t) = &r.contenu {
+            // Lecture du contenu : bornée (fichiers de moins de 20 Mo, 4000 fichiers au plus)
+            if dossier || taille > 20 << 20 || lus_contenu >= 4000 {
+                return true;
+            }
+            lus_contenu += 1;
+            if !fichier_contient(&c, t) {
+                return true;
+            }
+        }
+        let mut e = entree_fichier(nom, taille, modif, dossier);
+        e.parent = Some(Arc::from(crate::dossier::dossier_de(&c)));
+        v.push(e);
+        v.len() < max
+    };
+    // Changements récents d'abord : ce sont souvent eux qu'on cherche
+    for (c, dossier, taille, modif) in ajouts.iter().rev() {
+        let nom = c.rsplit('\\').next().unwrap_or(c);
+        if !garder(nom, *dossier, *taille, *modif, &|| c.clone(), false, &mut v) {
+            return Ok(v);
+        }
+    }
+    for (i, n) in index.noeuds.iter().enumerate() {
+        if i & 0x3FFF == 0 && annule() {
+            return Err("ANNULE".into());
+        }
+        if n.parent != DOSSIER_RACINE && !garder(index.nom(n), n.dossier, n.taille, n.modif, &|| index.chemin(i as u32), true, &mut v) {
+            break;
+        }
+    }
+    Ok(v)
+}
+
+/// Recherche depuis le fil de lecture : attend (quelques secondes au plus) que l'index enregistré soit relu
+pub fn chercher_en_attendant(motif: &str) -> Result<Vec<Entree>, String> {
+    demarrer();
+    for _ in 0..100 {
+        if actuel().is_some() || !CHARGEMENT.load(Ordering::SeqCst) {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    chercher(motif, MAX_RESULTATS)
+}
+
+/// Texte de la barre d'état : taille de l'index, ou sa construction
+pub fn etat() -> String {
+    let construction = EN_CONSTRUCTION.load(Ordering::Relaxed);
+    match actuel() {
+        Some(i) if construction => format!("INDEX : {} ELEMENTS · MISE A JOUR EN COURS ({})", crate::systeme::nombre(i.len()), crate::systeme::nombre(PROGRES.load(Ordering::Relaxed))),
+        Some(i) => {
+            let age = secondes().saturating_sub(i.construit) / 60;
+            let quand = if age < 60 { format!("{age} MIN") } else { format!("{} H", age / 60) };
+            format!("INDEX : {} ELEMENTS · CONSTRUIT IL Y A {quand}", crate::systeme::nombre(i.len()))
+        }
+        None => format!("INDEX EN CONSTRUCTION · {} ELEMENTS LUS", crate::systeme::nombre(PROGRES.load(Ordering::Relaxed))),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn disques_externes() {
+        // Pas de valeur attendue (dépend du PC) : la requête de bus ne doit ni planter ni bloquer
+        // La requête doit aboutir sur chaque disque fixe (sinon on ne saurait jamais distinguer un SSD USB)
+        for d in disques() {
+            println!("{d} bus = {:?}", bus(&d));
+            assert!(bus(&d).is_some(), "bus illisible pour {d}");
+        }
+        assert!(!externe(""));
+    }
+
+    #[test]
+    fn requetes() {
+        let r = analyser("facture ext:pdf,docx taille>1,5mo modif:30 contenu:Total TTC");
+        assert_eq!(r.mots, vec!["facture"]);
+        assert_eq!(r.extensions, vec!["PDF", "DOCX"]);
+        assert_eq!(r.taille_min, Some((1.5 * 1024.0 * 1024.0) as u64));
+        assert_eq!(r.jours, Some(30));
+        assert_eq!(r.contenu.as_deref(), Some("Total TTC"));
+        let r = analyser("*.rs dossier: taille<10k");
+        assert_eq!(r.extensions, vec!["RS"]);
+        assert_eq!(r.dossiers, Some(true));
+        assert_eq!(r.taille_max, Some(10 * 1024));
+        assert!(contient("Rapport-ANNUEL.pdf", "annuel"));
+        assert!(contient("Été.txt", "été"));
+    }
+
+    #[test]
+    fn index_memoire() {
+        let mut i = Index::default();
+        let c = i.ajouter("C:", DOSSIER_RACINE, true, 0, 0);
+        let u = i.ajouter("Users", c, true, 0, 0);
+        let f = i.ajouter("note.txt", u, false, 12, 0);
+        assert_eq!(i.chemin(f), r"C:\Users\note.txt");
+        assert_eq!(i.chemin(c), r"C:\");
+    }
+
+    #[test]
+    fn contenu_avec_lettre_qui_change_de_longueur() {
+        // `İ` passe de 2 à 3 octets en minuscules : l'ancienne découpe tombait au milieu d'un caractère (panique)
+        let r = analyser("İcontenu:é");
+        assert_eq!(r.contenu.as_deref(), Some("é"));
+        assert_eq!(r.mots.len(), 1);
+        assert_eq!(analyser("abc CONTENU: Total").contenu.as_deref(), Some("Total"));
+        assert_eq!(position_contenu("sans rien"), None);
+        assert_eq!(position_contenu("éé contenu:x"), Some(5));
+    }
+
+    #[test]
+    fn filtre_de_date_sans_depassement() {
+        let r = analyser("modif:99999999999999j");
+        assert_eq!(r.jours, Some(99_999_999_999_999));
+        assert_eq!(date_limite(r.jours, 1_000), 0);
+        assert_eq!(date_limite(Some(1), 1_000_000_000_000), 1_000_000_000_000 - 864_000_000_000);
+        assert_eq!(date_limite(None, 5), 0);
+    }
+
+    #[test]
+    fn fichier_abime() {
+        let mut i = Index::default();
+        let c = i.ajouter("C:", DOSSIER_RACINE, true, 0, 0);
+        i.ajouter("Users", c, true, 0, 0);
+        let bon = encoder(&i);
+        assert_eq!(decoder(&bon).map(|x| x.len()), Some(2));
+        // Parent qui boucle sur lui-même (octets 7..11 du 2e nœud)
+        let mut cycle = bon.clone();
+        cycle[32 + 27 + 7..32 + 27 + 11].copy_from_slice(&1u32.to_le_bytes());
+        assert!(decoder(&cycle).is_none());
+        // Nom hors de la zone des noms (longueur 0xFFFF)
+        let mut long = bon.clone();
+        long[32 + 4..32 + 6].copy_from_slice(&u16::MAX.to_le_bytes());
+        assert!(decoder(&long).is_none());
+        // Nombre de nœuds absurde
+        let mut enorme = bon;
+        enorme[16..24].copy_from_slice(&u64::MAX.to_le_bytes());
+        assert!(decoder(&enorme).is_none());
+    }
+}

@@ -1,0 +1,257 @@
+<!doctype html>
+<html lang="fr"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Doto:wght@700&display=swap"><title>Centre de commandes : les 28 idées</title>
+<style>
+:root{--bg:#000;--card:#0b0c0f;--i1:rgba(255,255,255,.92);--i2:rgba(255,255,255,.65);--i3:rgba(255,255,255,.5);--s1:rgba(255,255,255,.07);--s2:rgba(255,255,255,.14);--sel:rgba(255,255,255,.07);--ac:#E8A66B;--er:#F0836B;--ok:#7BD88F;--bl:#6AA9FF;--vi:#B58CFF;--tc:#E8A66B}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--i1);font:14px/1.4 "Segoe UI Variable Text","Segoe UI",system-ui,sans-serif;background-image:radial-gradient(rgba(255,255,255,.06) 1px,transparent 1.2px);background-size:10px 10px;min-height:100vh}
+.wrap{max-width:1120px;margin:0 auto;padding:18px 16px 70px}
+h1{font:700 19px "Courier New",monospace;letter-spacing:1px;text-transform:uppercase;margin:0 0 4px}
+.sub{color:var(--i2);margin:0 0 14px;max-width:780px}
+.tabs{display:flex;gap:8px;margin:0 0 14px;flex-wrap:wrap}
+.tab,.btn{border:1px solid var(--s2);border-radius:18px;padding:6px 15px;color:var(--i2);cursor:pointer;background:none;font:inherit}
+.tab[aria-pressed=true]{border-color:var(--ac);color:var(--i1);background:rgba(232,166,107,.1)}
+.btn{padding:4px 12px;border-radius:13px;color:var(--i1)}.btn.pri{border-color:var(--ac);background:rgba(232,166,107,.12)}
+kbd{border:0;padding:0;font:11px "Courier New",monospace;letter-spacing:.1em;text-transform:uppercase;color:var(--i3);background:none}.row kbd+kbd::before{content:"·";margin:0 5px 0 1px;opacity:.6}.row.cur kbd{color:var(--i2)}
+.hint{color:var(--i3);font-size:12px;margin:8px 2px}
+.tip{display:inline-block;border:1px dashed var(--s2);border-radius:10px;padding:2px 9px;color:var(--i2);font-size:12px;margin:2px 4px 2px 0;cursor:pointer}.tip:hover{border-color:var(--ac);color:var(--i1)}
+.badge{display:inline-block;min-width:22px;text-align:center;border-radius:9px;background:var(--ac);color:#000;font:700 11px "Segoe UI";padding:0 6px;margin-right:6px}
+.pal{background:var(--card);border:1px solid var(--s2);border-radius:26px;overflow:hidden;box-shadow:0 30px 80px rgba(0,0,0,.6);--tc:var(--ac)}
+.ph{display:flex;align-items:center;gap:12px;padding:13px 18px;border-bottom:1px solid var(--s1)}
+.eyes{display:flex;gap:5px;align-items:center;height:18px}.eyes i{width:7px;height:16px;border-radius:2px;background:#4fd3ff;display:block;transition:height .25s,background .2s,transform .3s}
+.eyes.happy i{height:5px;background:var(--ac)}.eyes.worry i{height:16px;background:var(--er);transform:rotate(12deg)}.eyes.worry i+i{transform:rotate(-12deg)}.eyes.tired i{height:4px;background:var(--i3)}
+.ph input{flex:1;background:none;border:0;outline:0;color:var(--i1);font:inherit;font-size:16px;min-width:0}
+.chip{display:inline-flex;align-items:center;gap:6px;border:1px solid var(--s2);border-radius:14px;padding:2px 10px;font-size:12px;color:var(--i2);white-space:nowrap}
+.crumbs{display:flex;gap:6px;align-items:center;padding:9px 18px 0;flex-wrap:wrap;min-height:38px}.crumbs .sep{color:var(--i3)}
+.crumbs .chip{animation:pin .25s both}.crumbs .c1{border-color:rgba(232,166,107,.6)}.crumbs .c2{border-color:rgba(181,140,255,.6)}.crumbs .c3{border-color:rgba(123,216,143,.6)}
+@keyframes pin{from{opacity:0;transform:translateX(-8px)}to{opacity:1;transform:none}}
+.split{display:grid;grid-template-columns:1.1fr .9fr;min-height:360px}
+.list{padding:8px;max-height:430px;overflow:auto}
+.gh{margin:8px 10px 2px;font-size:11px;letter-spacing:.09em;text-transform:uppercase;color:var(--i3)}
+.row{display:flex;align-items:center;gap:10px;min-height:38px;padding:3px 10px;border-radius:12px;cursor:pointer;color:var(--i2);position:relative}
+.row.cur{background:var(--sel);color:var(--i1)}.row.cur::before{content:"";position:absolute;left:0;top:9px;bottom:9px;width:3px;border-radius:2px;background:var(--tc)}
+.row .k{margin-left:auto;display:flex;gap:4px;align-items:center;color:var(--i3);font-size:11px}
+.row small{color:var(--i3)}
+.ic{width:24px;height:24px;border-radius:8px;display:flex;align-items:center;justify-content:center;font:700 9px "Courier New",monospace;letter-spacing:.04em;color:var(--i2);border:1px solid var(--s2);flex:none;position:relative}.row.cur .ic{color:var(--i1);border-color:var(--i3)}.ic.f::after{content:"";position:absolute;right:-2px;bottom:-2px;width:5px;height:5px;border-radius:50%;background:var(--tc)}
+.ic.dir{border-style:dashed}
+.cb{width:15px;height:15px;border:1px solid var(--s2);border-radius:5px;flex:none;display:flex;align-items:center;justify-content:center;font-size:10px;color:#000}.cb.on{background:var(--ac);border-color:var(--ac)}
+.pv{border-left:1px solid var(--s1);padding:16px 18px;background:rgba(255,255,255,.025);display:flex;flex-direction:column;gap:10px;min-width:0}
+.vt{font:700 17px "Courier New",monospace;letter-spacing:1px;text-transform:uppercase;overflow:hidden;text-overflow:ellipsis}
+.vd{color:var(--i2);font-size:12.5px}
+.art{border:1px solid var(--s1);border-radius:14px;padding:10px;background:var(--bg);display:flex;flex-direction:column;gap:5px;font-size:12.5px;color:var(--i2)}
+.art .fr{display:flex;gap:8px}.art .fr .sz{margin-left:auto;color:var(--i3)}.art .ok{color:var(--ok)}.art .no{color:var(--er)}
+.eff{font-size:12.5px;padding:8px 10px;border-radius:10px;border:1px solid var(--s1)}.eff.ok{border-color:rgba(123,216,143,.4);color:var(--ok)}.eff.warn{border-color:rgba(240,131,107,.5);color:var(--er)}
+.ft{display:flex;gap:14px;padding:9px 18px;border-top:1px solid var(--s1);color:var(--i3);font-size:12px;flex-wrap:wrap}
+.bar{height:6px;border-radius:3px;background:var(--s1);overflow:hidden}.bar i{display:block;height:100%;background:var(--ac);width:0}
+.disk{height:6px;border-radius:3px;background:var(--s1);overflow:hidden;margin-top:4px}.disk i{display:block;height:100%;background:var(--er)}
+.thumb{height:120px;border-radius:12px;display:flex;align-items:center;justify-content:center;font:700 24px "Courier New";letter-spacing:2px;color:var(--i2);border:1px solid var(--s2);background:radial-gradient(rgba(255,255,255,.1) 1px,transparent 1.2px) 0 0/8px 8px}
+.toast{position:fixed;right:16px;bottom:16px;background:var(--card);border:1px solid var(--s2);border-radius:14px;padding:10px 16px;max-width:360px;display:none;z-index:9}
+.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(310px,1fr));gap:12px}
+.card{border:1px solid var(--s1);border-radius:16px;padding:14px;background:var(--card);display:flex;flex-direction:column;gap:8px}
+.card h4{margin:0;font-size:12px;letter-spacing:.08em;text-transform:uppercase;color:var(--ac);font-weight:600}
+.card p{margin:0;color:var(--i2);font-size:12.5px}
+table{border-collapse:collapse;width:100%;font-size:13px}td,th{border-bottom:1px solid var(--s1);padding:6px 8px;text-align:left}th{color:var(--i3);font-weight:400;font-size:11px;letter-spacing:.08em;text-transform:uppercase}
+.sec{margin:14px 0 6px;color:var(--i3);letter-spacing:.09em;text-transform:uppercase;font-size:11px}
+@media(max-width:800px){.split{grid-template-columns:1fr}.pv{border-left:0;border-top:1px solid var(--s1)}}
+
+/* ---- Passe 3 : tokens et composants de la maquette (docs/design/maquette-spacefiles-2026-11-03.html) ---- */
+:root{--mono:"Doto","Courier New",monospace;--dot:rgba(255,255,255,.06);--rim:rgba(255,255,255,.14);--panel:rgba(255,255,255,.025);--spring:cubic-bezier(.2,1.25,.3,1)}
+body{background:#14161a;background-image:none}
+h1{font-family:var(--mono);font-weight:700;font-size:22px;letter-spacing:1px}
+.tab,.btn{transition:border-color .2s,background-color .2s}
+.btn.pri{border-color:color-mix(in srgb,var(--tc,var(--ac)) 60%,transparent);background:color-mix(in srgb,var(--tc,var(--ac)) 10%,transparent)}
+/* fenêtre noire à points, comme .win */
+#app{position:relative;background:#000 radial-gradient(var(--dot) 1px,transparent 1.2px);background-size:10px 10px;border:1px solid var(--s2);border-radius:20px;padding:0 0 36px;overflow:hidden}
+.pal{width:min(900px,100%);margin:0 auto;background:var(--card);border:1px solid var(--s2);border-top:0;border-radius:0 0 30px 30px;box-shadow:inset 0 -1px 0 var(--rim),0 24px 60px rgba(0,0,0,.5)}
+.ph{position:relative;height:64px;padding:0 22px;gap:16px;border-bottom:0;background-image:radial-gradient(circle,var(--dot) 1.2px,transparent 1.6px);background-size:10px 10px}
+.ph::after{content:"";position:absolute;inset:0;background:linear-gradient(180deg,transparent 30%,var(--card) 100%);pointer-events:none}
+.ph>*{position:relative;z-index:1}.ph input{font-size:18px}.ph input::placeholder{color:var(--i3)}
+.eyes i{width:7px;height:16px;border-radius:2px;background:#7FE6FF}
+.eyes.happy i{background:var(--tc,var(--ac))}.eyes.worry i{background:var(--er)}
+.crumbs{padding:8px 22px 4px;gap:8px;min-height:44px}
+.crumbs .chip{height:28px;padding:0 12px;border-radius:14px;border:1px solid var(--s1);color:var(--i2);font-size:12px;background:none}
+.crumbs .chip:last-of-type{border-color:color-mix(in srgb,var(--ac) 60%,transparent);color:var(--i1);background:color-mix(in srgb,var(--ac) 10%,transparent)}
+.crumbs .sep{color:var(--i3)}
+.list{padding:6px 10px 8px}
+.gh{height:28px;line-height:34px;margin:0;padding:0 16px;font-size:12px;letter-spacing:.09em;text-transform:uppercase;color:var(--i3)}
+.row{height:46px;gap:14px;padding:0 14px 0 16px;border-radius:14px;color:var(--i1);border:0;transition:background-color .2s}
+.row.cur{background:var(--sel)}.row:hover:not(.cur){background:rgba(255,255,255,.04)}
+.row.cur::before{left:0;top:13px;bottom:13px;width:3px;background:var(--tc)}
+.row small{font-size:12px;color:var(--i3)}
+/* tuile d'icône 30 px, bord s1, accent sur la ligne courante (.pt) */
+.ic{width:30px;height:30px;border-radius:10px;border:1px solid var(--s1);color:var(--i2);background:none;transition:border-color .2s,color .2s}
+.ic svg{width:18px;height:18px;display:block}
+.row.cur .ic{border-color:color-mix(in srgb,var(--tc) 60%,transparent);color:var(--tc)}
+.ic.dir,.ic.f::after{border-style:solid;content:none}
+.cb{border-radius:5px}.cb.on{background:var(--tc);border-color:var(--tc)}
+/* touches : capsules fines comme dans l'app */
+kbd{border:1px solid var(--s2);border-radius:10px;padding:1px 8px;font:11px "Segoe UI Variable Text","Segoe UI",sans-serif;letter-spacing:0;text-transform:none;color:var(--i2);background:none}
+.row kbd+kbd::before{content:none}.row .k{gap:4px}
+.pv{padding:18px 20px;gap:14px;background:var(--panel)}
+.vt{font-family:var(--mono);font-weight:700;font-size:20px;letter-spacing:1px;text-transform:uppercase;line-height:1.15}
+.art{border-radius:16px;background:#000 radial-gradient(var(--dot) 1px,transparent 1.2px);background-size:10px 10px;border-color:var(--s1);padding:14px;gap:7px}
+.thumb{background:#000 radial-gradient(var(--dot) 1px,transparent 1.2px);background-size:10px 10px;border:1px solid var(--s1);color:var(--i2)}
+.eff::before{content:none}
+.bar,.disk{height:6px;border-radius:3px;background:var(--s1)}.bar i,.disk i{-webkit-mask:none;mask:none}
+.ft{min-height:46px;padding:0 22px;gap:16px;align-items:center;font-family:inherit;font-size:12px;letter-spacing:0;text-transform:none;color:var(--i3)}
+.card{background:var(--card);border-radius:16px}.card h4{font-family:inherit;letter-spacing:.09em;color:var(--i3)}
+th{font-family:inherit}.list{scrollbar-width:none}.list::-webkit-scrollbar{display:none}
+@media (prefers-reduced-motion:reduce){*{transition:none!important;animation:none!important}}
+</style></head><body><div class="wrap">
+<h1>Centre de commandes · les 28 idées</h1>
+<p class="sub">Prototype jouable (données fictives, rien n'est enregistré). L'onglet <b>Palette vivante</b> rassemble les idées dans un vrai flux ; <b>Galerie UI</b> montre les composants ; <b>Les 28</b> dit où voir chaque idée.</p>
+<div class="tabs"><button class="tab" data-t="p" aria-pressed="true">Palette vivante</button><button class="tab" data-t="g" aria-pressed="false">Galerie UI</button><button class="tab" data-t="l" aria-pressed="false">Les 28</button></div>
+
+<section id="p">
+<div class="hint">Dossier ouvert : <button class="tab" id="ctx1" aria-pressed="true">Téléchargements</button><button class="tab" id="ctx2" aria-pressed="false">Photos</button> &nbsp;·&nbsp; Essaie :
+<span class="tip" data-q="dl">dl</span><span class="tip" data-q=">trier">&gt;trier</span><span class="tip" data-q="/Archives">/Archives</span><span class="tip" data-q="@Travail">@Travail</span><span class="tip" data-q="?facture">?facture</span><span class="tip" data-q="1,2 go en mo">1,2 go en mo</span><span class="tip" data-q="15% de 340">15% de 340</span><span class="tip" data-q="copie les pdf de la semaine dernière dans archives">langage naturel</span><span class="tip" data-q="zzz">zzz (vide)</span><span class="tip" data-q="rapport">rapport</span></div>
+<div class="hint"><kbd>↑↓</kbd> choisir · <kbd>Tab</kbd> cocher plusieurs · <kbd>↵</kbd> / <kbd>→</kbd> suivant · <kbd>←</kbd> / <kbd>⌫</kbd> retour · <kbd>.</kbd> (champ vide) rejouer la dernière commande</div>
+<div id="app"></div></section>
+
+<section id="g" hidden>
+<div class="grid">
+<div class="card"><h4>13 · Icônes de type, monochromes (refonte)</h4><div id="g13"></div></div>
+<div class="card"><h4>14 · Touches en texte mono (refonte)</h4><div class="row"><span class="ic dir">▭</span>Renommer<span class="k"><kbd>F2</kbd></span></div><div class="row"><span class="ic dir">▭</span>Ajouter au groupe<span class="k"><kbd>Ctrl</kbd><kbd>Maj</kbd><kbd>G</kbd></span></div><div class="row"><span class="ic dir">▭</span>Historique<span class="k"><kbd>Ctrl</kbd><kbd>Maj</kbd><kbd>H</kbd></span></div></div>
+<div class="card"><h4>16 · Fil d'Ariane animé</h4><div class="crumbs" style="padding:0" id="g16"></div><button class="btn" onclick="g16()">Rejouer</button></div>
+<div class="card"><h4>17 · Pixel expressif</h4><div style="display:flex;gap:22px" id="g17"></div><p>Normal · content (succès) · inquiet (conflit) · fatigué (longue copie)</p></div>
+<div class="card"><h4>18 · Accent selon l'élément</h4><div id="g18" style="display:flex;gap:8px;flex-wrap:wrap"></div></div>
+<div class="card"><h4>15 · Progression, vitesse, temps restant</h4><div class="bar"><i id="g15b" style="width:64%"></i></div><p>Copie de 3 fichiers · <b>64 %</b> · 48 Mo/s · reste 12 s</p></div>
+<div class="card"><h4>12 · Destination en arborescence</h4><p>Disque (D:) › Archives › 2026 › <b>Rapports</b></p><div class="disk"><i style="width:81%"></i></div><p>Presque plein · 28 Go libres sur 476 Go</p></div>
+<div class="card"><h4>11 · Renommage avant / après</h4><div class="art"><div class="fr">IMG_0412.jpg <span>→</span> <span class="ok">vacances-01.jpg</span></div><div class="fr">IMG_0413.jpg <span>→</span> <span class="ok">vacances-02.jpg</span></div><div class="fr">IMG_0414.jpg <span>→</span> <span class="no">vacances-02.jpg · conflit</span></div></div></div>
+<div class="card"><h4>9 · Annulation douce</h4><p>« Mis à la corbeille » avec compte à rebours de 5 s, au lieu d'une question.</p><div class="bar"><i id="g9b" style="width:100%"></i></div><button class="btn" onclick="g9()">Rejouer</button></div>
+<div class="card"><h4>20 · Presse-papiers</h4><div class="art"><div class="fr">rapport-2026.pdf<span class="sz">il y a 2 min</span></div><div class="fr">« facture n° 3341 »<span class="sz">il y a 9 min</span></div><div class="fr">3 fichiers<span class="sz">il y a 1 h</span></div></div></div>
+</div></section>
+
+<section id="l" hidden><table><tr><th>#</th><th>Idée</th><th>À voir</th></tr></table></section>
+</div><div class="toast" id="toast"></div>
+<script>
+const $=s=>document.querySelector(s);
+const TC={pdf:['#F0836B','PDF'],xls:['#7BD88F','XLS'],img:['#6AA9FF','IMG'],txt:['#B58CFF','TXT'],dir:['#E8A66B','▭']};
+const FILES={Téléchargements:[['rapport-2026.pdf','pdf','1,2 Mo','hier',2],['facture-mars.pdf','pdf','210 Ko','il y a 3 j',1],['contrat-signé.pdf','pdf','640 Ko','il y a 9 j',0],['budget.xlsx','xls','340 Ko','il y a 2 j',0],['notes.txt','txt','2 Ko','il y a 6 j',0],['installeur.exe','txt','52 Mo','il y a 1 j',0]],
+ Photos:[['IMG_0412.jpg','img','4,1 Mo','hier',0],['IMG_0413.jpg','img','3,9 Mo','hier',0],['IMG_0414.jpg','img','4,4 Mo','hier',0],['vacances.jpg','img','5,2 Mo','il y a 8 j',1]]};
+const DIRS={Archives:['2025','rapport-2026.pdf','contrat.pdf'],Documents:['Factures','CV.docx','budget.xlsx'],Bureau:['Projets'],Téléchargements:['installeur.exe'],Projets:['spacefiles','hub']};
+const ALIAS={dl:'Téléchargements',doc:'Documents',arc:'Archives'};
+const GROUPS=['Travail','Perso','Admin'];
+const GCMDS=[['Trier par date','Ctrl+1'],['Trier par taille',''],['Vue grille','Ctrl+2'],['Vue liste','Ctrl+3'],['Réglages','Ctrl+,'],['Historique','Ctrl+Maj+H'],['Double panneau','F6']];
+const ECMDS=[['Copier vers…','','dest'],['Déplacer vers…','','dest'],['Renommer…','F2','ren'],['Mettre à la corbeille','Suppr','del'],['Compresser (.zip)','','zip'],['Coller ici (presse-papiers)','Ctrl+V','paste']];
+const SAVED=[['PDF > 1 Mo ce mois','?ext:pdf taille>1mo'],['Photos non triées','?ext:jpg modif:7']];
+const RECIPES=[['Recette · Rapport mensuel','Compresser → Envoyer vers Archives → Annuler possible'],['Recette · Ranger Téléchargements','Trier par type → Dossiers PDF / Images']];
+const WS=[['Espace · Compta mars','3 onglets : Factures, Budget, Archives']];
+let ctx='Téléchargements',S;
+const use=JSON.parse(JSON.stringify({}));let freq={},last=null;
+function fresh(){S={q:'',cur:0,step:'el',subj:[],cmd:null,dest:null,checked:new Set(),eyes:'',msg:null,ren:'vacances-{n}',prog:0}}
+fresh();
+const files=()=>FILES[ctx];
+const acc=s=>s.normalize('NFD').replace(/[\u0300-\u036f]/g,'').toLowerCase();
+const match=(t,q)=>!q||acc(t).includes(acc(q));
+const D='fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" stroke-dasharray="0.1 2.6"';
+const SV={file:`<path d="M6 3h8l4 4v14H6z"/><path d="M14 3v4h4"/>`,pdf:`<path d="M6 3h8l4 4v14H6z"/><path d="M14 3v4h4"/><path d="M9 12h6M9 15h6M9 18h4"/>`,txt:`<path d="M6 3h8l4 4v14H6z"/><path d="M14 3v4h4"/><path d="M9 12h6M9 15h6M9 18h4"/>`,xls:`<rect x="4" y="5" width="16" height="14" rx="2"/><path d="M4 10h16M4 14.5h16M10 5v14"/>`,img:`<rect x="3" y="5" width="18" height="14" rx="2"/><circle cx="8.5" cy="10" r="1.5"/><path d="M4 18l5-5 4 4 3-3 4 4"/>`,dir:`<path d="M3 7a2 2 0 012-2h4l2 2h8a2 2 0 012 2v9a2 2 0 01-2 2H5a2 2 0 01-2-2z"/>`};
+function badge(t){return `<span class="ic"><svg viewBox="0 0 24 24" ${D}>${SV[t]||SV.dir}</svg></span>`}
+function toast(t){const e=$('#toast');e.textContent=t;e.style.display='block';clearTimeout(toast.t);toast.t=setTimeout(()=>e.style.display='none',2600)}
+function calc(q){let m=q.match(/^([\d.,]+)\s*(go|mo|ko)\s*(?:en|->|→)\s*(go|mo|ko)$/i);if(m){const f={go:1024*1024,mo:1024,ko:1},v=parseFloat(m[1].replace(',','.'))*f[m[2].toLowerCase()]/f[m[3].toLowerCase()];return `${m[1]} ${m[2].toUpperCase()} = ${v.toLocaleString('fr-FR',{maximumFractionDigits:2})} ${m[3].toUpperCase()}`}
+ m=q.match(/^(\d+)\s*%\s*de\s*(\d+)$/i);if(m)return `${m[1]} % de ${m[2]} = ${(+m[1]*+m[2]/100).toLocaleString('fr-FR')}`;return null}
+function nl(q){const m=q.match(/copie.*(pdf).*(semaine derni[eè]re|ce mois).*dans\s+(\w+)/i);if(!m)return null;const d=Object.keys(DIRS).find(k=>acc(k)===acc(m[3]));if(!d)return null;const f=files().filter(x=>x[1]==='pdf'&&/hier|jour|j$/.test(x[3])&&parseInt((x[3].match(/\d+/)||[1])[0])<=7);return{files:f,dest:d,txt:`Copier ${f.length} PDF (${m[2]}) → ${d}`}}
+// ---- lignes de l'étape 1 ----
+function lines(){const q=S.q,L=[];
+ const add=(g,o)=>{o.g=g;L.push(o)};
+ if(!q){ // fréquence + rejouer
+  const fr=files().slice().sort((a,b)=>(freq[b[0]]||0)+b[4]-(freq[a[0]]||0)-a[4]);
+  fr.forEach(f=>add('Dans ce dossier',{t:f[0],ty:f[1],sub:f[2],kind:'file',f,hot:(freq[f[0]]||0)+f[4]>=2}));
+  if(ctx==='Téléchargements')add('Suggestion pour ce dossier',{t:'Ranger par type (PDF, Images, Installeurs)',ty:'dir',kind:'sug',txt:'Ranger'});
+  else add('Suggestion pour ce dossier',{t:'Trier par date de prise de vue',ty:'dir',kind:'sug',txt:'Tri photos'});
+  SAVED.forEach(s=>add('Recherches enregistrées',{t:s[0],ty:'dir',sub:s[1],kind:'saved'}));
+  WS.forEach(s=>add('Espaces de travail',{t:s[0],ty:'dir',sub:s[1],kind:'ws'}));
+  RECIPES.forEach(s=>add('Recettes',{t:s[0],ty:'dir',sub:s[1],kind:'rec'}));
+  GCMDS.slice(0,4).forEach(c=>add('Partout',{t:c[0],ty:'dir',keys:c[1],kind:'gcmd'}));
+  return L}
+ if(q[0]==='>'){const r=q.slice(1).trim();GCMDS.concat(ECMDS.map(c=>[c[0],c[1]])).filter(c=>match(c[0],r)).forEach(c=>add('Commandes seulement',{t:c[0],ty:'dir',keys:c[1],kind:'gcmd'}));return L}
+ if(q[0]==='/'){const r=q.slice(1);Object.keys(DIRS).filter(d=>match(d,r)).forEach(d=>add('Aller à un chemin',{t:'D:\\'+d,ty:'dir',sub:DIRS[d].length+' éléments',kind:'dir',d}));return L}
+ if(q[0]==='@'){GROUPS.filter(g=>match(g,q.slice(1))).forEach(g=>add('Groupes',{t:g,ty:'dir',sub:'groupe',kind:'grp'}));return L}
+ if(q[0]==='?'){const r=q.slice(1).trim();Object.values(FILES).flat().filter(f=>match(f[0],r)||match('contenu '+r,r)).forEach(f=>add('Dans le contenu et les noms (tout le PC)',{t:f[0],ty:f[1],sub:'trouvé dans le texte',kind:'file',f}));return L}
+ const c=calc(q);if(c)add('Calcul',{t:c,ty:'dir',kind:'calc',txt:c});
+ const n=nl(q);if(n)add('Commande préparée (langage naturel)',{t:n.txt,ty:'dir',kind:'nl',n});
+ const al=ALIAS[acc(q)];if(al)add('Alias',{t:al+'  (alias « '+q+' »)',ty:'dir',kind:'dir',d:al});
+ files().filter(f=>match(f[0],q)).forEach(f=>add('Fichiers',{t:f[0],ty:f[1],sub:f[2],kind:'file',f}));
+ Object.keys(DIRS).filter(d=>match(d,q)).forEach(d=>add('Dossiers',{t:d,ty:'dir',sub:'dossier',kind:'dir',d}));
+ GCMDS.filter(c=>match(c[0],q)).forEach(c=>add('Partout',{t:c[0],ty:'dir',keys:c[1],kind:'gcmd'}));
+ RECIPES.concat(WS).filter(c=>match(c[0],q)).forEach(c=>add('Recettes et espaces',{t:c[0],ty:'dir',sub:c[1],kind:'rec'}));
+ if(!L.length){add('Aucun résultat',{t:`Créer le fichier « ${q} »`,ty:'txt',kind:'create'});add('Aucun résultat',{t:'Chercher « '+q+' » dans tout le PC',ty:'dir',kind:'all'});add('Aucun résultat',{t:'Chercher « '+q+' » dans le contenu des fichiers',ty:'dir',kind:'all'})}
+ return L}
+function cmdLines(){const q=S.q;return ECMDS.filter(c=>match(c[0],q)).map(c=>({t:c[0],ty:'dir',keys:c[1],kind:'ecmd',c}))}
+function destLines(){const q=S.q.replace(/^\//,''),L=[];const add=(g,o)=>{o.g=g;L.push(o)};
+ add('Autre panneau',{t:'D:\\Archives',ty:'dir',kind:'d',d:'Archives',sub:'autre panneau'});
+ const seen=new Set(['Archives']);Object.keys(DIRS).filter(d=>match(d,q)&&!seen.has(d)).forEach(d=>add(q?'Dossiers':'Récents',{t:d,ty:'dir',kind:'d',d,sub:DIRS[d].length+' éléments'}));
+ return L.filter(l=>match(l.t,q)||l.d==='Archives'&&!q)}
+function curLines(){return S.step==='el'?lines():S.step==='cmd'?cmdLines():S.step==='dest'?destLines():[]}
+// ---- aperçu ----
+function pvEl(l){if(!l)return '<div class="vd">Aucun élément.</div>';
+ if(l.kind==='file'){const c=TC[l.f[1]];return `<div class="thumb"><svg viewBox="0 0 24 24" width="56" height="56" ${D}>${SV[l.f[1]]||SV.file}</svg></div><div class="vt">${l.f[0]}</div><div class="vd">${l.f[2]} · modifié ${l.f[3]}</div><div class="art"><div class="fr">${l.f[1]==='pdf'?'Page 1 · Rapport annuel 2026 — Synthèse…':l.f[1]==='img'?'4032 × 3024 · iPhone · f/1.8':l.f[1]==='xls'?'3 feuilles · 128 lignes':'Texte brut · 12 lignes'}</div></div>`}
+ if(l.kind==='dir'&&DIRS[l.d])return `<div class="vt">${l.d}</div><div class="vd">${DIRS[l.d].length} éléments</div><div class="art">${DIRS[l.d].map(x=>`<div class="fr">▭ ${x}</div>`).join('')}</div>`;
+ if(l.kind==='nl')return `<div class="vt">Commande préparée</div><div class="vd">Comprise comme :</div><div class="art">${l.n.files.map(f=>`<div class="fr">${f[0]}<span class="sz">${f[3]}</span></div>`).join('')||'<div class="fr no">Aucun PDF de la semaine</div>'}<div class="fr ok">→ ${l.n.dest}</div></div><div><button class="btn pri" onclick="runNL()">Confirmer ↵</button></div>`;
+ if(l.kind==='calc')return `<div class="vt">${l.txt}</div><div class="vd">Résultat copié avec ↵</div>`;
+ if(l.kind==='sug')return `<div class="vt">${l.txt}</div><div class="vd">Suggestion selon le dossier ouvert (${ctx}).</div><div class="art"><div class="fr">PDF → Documents/PDF</div><div class="fr">Images → Images</div><div class="fr">Installeurs → Installeurs</div></div>`;
+ if(l.kind==='rec'||l.kind==='ws'||l.kind==='saved')return `<div class="vt">${l.t}</div><div class="vd">${l.sub||''}</div><div class="vd">↵ pour lancer</div>`;
+ if(l.kind==='create')return `<div class="vt">Créer</div><div class="vd">Aucun résultat : on te propose d'agir plutôt qu'une page vide.</div>`;
+ return `<div class="vt">${l.t}</div><div class="vd">${l.keys?'Touche directe : '+l.keys:'Commande'}</div>`}
+function pvCmd(l){const n=S.subj.length;return `<div class="vt">${l?l.t.replace('…',''):''}</div><div class="vd">Agit sur <b>${n>1?n+' éléments':S.subj[0]||''}</b>${l&&l.keys?` · touche directe <kbd>${l.keys}</kbd>`:''}</div>`}
+function pvDest(l){if(!l)return '';const c=DIRS[l.d]||[];const dup=S.subj.filter(s=>c.includes(s));
+ return `<div class="vt">${l.d}</div><div class="vd">Disque D: · 28 Go libres</div><div class="disk"><i style="width:94%"></i></div><div class="art">${c.map(x=>`<div class="fr">▭ ${x}</div>`).join('')}${S.subj.map(s=>`<div class="fr ${c.includes(s)?'no':'ok'}">${c.includes(s)?'!':'+'} ${s}<span class="sz">${c.includes(s)?'existe déjà':'nouveau'}</span></div>`).join('')}</div><div class="eff ${dup.length?'warn':'ok'}">${dup.length?`${dup.length} fichier(s) déjà présent(s) : Remplacer, Garder les deux ou Ignorer.`:`${S.subj.length>1?S.subj.length+' éléments seront ajoutés':'Sera ajouté'} ici.`}</div><div><button class="btn pri" onclick="go()">${S.cmd&&S.cmd.t.startsWith('Déplacer')?'Déplacer':'Copier'} ici ↵</button></div>`}
+function render(){const A=$('#app'),L=curLines();if(S.cur>=L.length)S.cur=Math.max(0,L.length-1);const l=L[S.cur];
+ const first=S.subj[0],type=first?(Object.values(FILES).flat().find(f=>f[0]===first)||[0,'dir'])[1]:(l&&l.ty)||'dir';
+ let tc=(TC[l&&l.step!=='x'&&S.step==='el'&&l?l.ty:type]||TC.dir)[0];
+ let h=`<div class="pal" style="--tc:${tc}"><div class="ph"><span class="eyes ${S.eyes}"><i></i><i></i></span><input id="q" value="${S.q.replace(/"/g,'&quot;')}" placeholder="${S.step==='ren'?'Modèle de nom…':'Un fichier, un dossier ou une commande… (> / ? @ pour filtrer)'}" autocomplete="off"><span class="chip">Ctrl K</span></div>`;
+ const ch=[];if(S.subj.length&&S.step!=='el')ch.push(`<span class="chip c1">${S.subj.length>1?S.subj.length+' éléments':S.subj[0]}</span>`);if(['dest','ren','prog','done'].includes(S.step)&&S.cmd)ch.push(`<span class="chip c2">${S.cmd.t.replace('…','')}</span>`);if(['prog','done'].includes(S.step)&&S.dest)ch.push(`<span class="chip c3">${S.dest}</span>`);
+ h+=`<div class="crumbs">${ch.join('<span class="sep">›</span>')||'<span class="chip" style="color:var(--ac)">Élément</span>'}</div>`;
+ if(S.step==='prog'){h+=`<div style="padding:22px 24px"><div class="vt">Copie en cours…</div><div class="bar" style="margin:10px 0"><i style="width:${S.prog}%"></i></div><div class="vd">${Math.round(S.prog)} % · 48 Mo/s · reste ${Math.max(0,Math.round((100-S.prog)/8))} s</div></div>`}
+ else if(S.step==='done'){h+=`<div style="padding:22px 24px;display:flex;flex-direction:column;gap:10px"><div style="color:var(--ok);font-size:16px">✓ ${S.msg}</div><div><button class="btn" onclick="act(0)" id="b0">Autre action sur ${S.subj[0]||''}</button> <button class="btn" onclick="undo()">Annuler</button> <span class="hint">· <kbd>.</kbd> rejoue la commande</span></div>${S.undo?`<div><div class="bar"><i id="ub" style="width:100%;transition:width 5s linear"></i></div><div class="hint">Mis à la corbeille · annulation possible 5 s</div></div>`:''}</div>`}
+ else if(S.step==='ren'){const names=S.subj.map((s,i)=>S.ren.replace('{n}',String(i+1).padStart(2,'0'))+s.slice(s.lastIndexOf('.')));const dup=new Set(names).size!==names.length;h+=`<div class="split"><div class="list"><div class="gh">Modèle · {n} = numéro</div><div class="row">${S.ren}</div></div><div class="pv"><div class="vt">Aperçu du renommage</div><div class="art">${S.subj.map((s,i)=>`<div class="fr">${s} <span>→</span> <span class="ok">${names[i]}</span></div>`).join('')}</div><div class="eff ${dup?'warn':'ok'}">${dup?'Conflit de noms':'Aucun conflit'}</div><div><button class="btn pri" onclick="go()">Renommer ↵</button></div></div></div>`}
+ else{let last='';const rows=L.map((x,i)=>{let g=x.g!==last?`<div class="gh">${x.g}</div>`:'';last=x.g;const ck=S.step==='el'&&x.kind==='file'?`<span class="cb ${S.checked.has(x.t)?'on':''}">${S.checked.has(x.t)?'✓':''}</span>`:'';
+  return `${g}<div class="row ${i===S.cur?'cur':''}" data-i="${i}" onclick="S.cur=${i};next()">${ck}${badge(x.ty)}<span style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${x.t}</span>${x.hot?'<span class="chip" style="color:var(--ac)">★ fréquent</span>':''}<span class="k">${x.sub?`<small>${x.sub}</small>`:''}${x.keys?x.keys.split('+').map(k=>`<kbd>${k}</kbd>`).join(''):''}</span></div>`}).join('');
+  h+=`<div class="split"><div class="list">${rows||'<div class="gh">Aucun résultat</div>'}</div><div class="pv">${S.step==='el'?pvEl(l):S.step==='cmd'?pvCmd(l):pvDest(l)}${S.step==='el'&&S.checked.size?`<div class="eff ok">${S.checked.size} élément(s) coché(s) · ↵ pour choisir la commande</div>`:''}</div></div>`}
+ h+=`<div class="ft"><span><kbd>↑↓</kbd> choisir</span><span><kbd>←</kbd>/<kbd>⌫</kbd> retour</span><span><kbd>→</kbd>/<kbd>↵</kbd> suivant</span>${S.step==='el'?'<span><kbd>Tab</kbd> cocher</span><span><kbd>.</kbd> rejouer</span>':''}<span style="margin-left:auto">${L.length} résultat(s)</span></div></div>`;
+ A.innerHTML=h;const q=$('#q');q.focus();q.setSelectionRange(q.value.length,q.value.length);q.oninput=()=>{S.q=q.value;S.cur=0;if(S.step==='ren'){S.ren=q.value}render()};q.onkeydown=key}
+function pick(){const L=curLines();return L[S.cur]}
+function setSubj(l){S.subj=S.checked.size?[...S.checked]:[l.t]}
+function next(){const l=pick();
+ if(S.step==='el'){if(!l)return;
+  if(l.kind==='file'){setSubj(l);S.step='cmd';S.q='';S.cur=0}
+  else if(l.kind==='dir'||l.kind==='grp'){toast('Aller à '+l.t);S.q=''}
+  else if(l.kind==='calc'){toast('Copié : '+l.txt)}
+  else if(l.kind==='nl'){runNL();return}
+  else if(l.kind==='rec'){S.eyes='happy';toast(l.t.startsWith('Espace')?'3 onglets restaurés':'Recette lancée : '+l.sub);setTimeout(()=>{S.eyes='';render()},900)}
+  else if(l.kind==='saved'){S.q=l.sub;S.cur=0}
+  else if(l.kind==='sug'){toast('Suggestion appliquée : '+l.txt)}
+  else if(l.kind==='gcmd'){toast(l.t+' (commande générale : part directement)')}
+  else if(l.kind==='create'){toast('Fichier créé : '+S.q);S.q=''}
+  else if(l.kind==='all'){toast('Recherche lancée dans tout le PC…')}
+ }else if(S.step==='cmd'){if(!l)return;S.cmd=l;const k=l.c[2];S.q='';S.cur=0;if(k==='dest')S.step='dest';else if(k==='ren'){S.step='ren';S.q=''}else if(k==='paste'){toast('Collé : '+S.subj.join(', '))}else{S.dest=null;finish(k==='del'?'Mis à la corbeille':'Compressé')}}
+ else if(S.step==='dest'){if(!l)return;S.dest=l.d;go()}
+ render()}
+function back(){if(S.step==='cmd')S.step='el';else if(S.step==='dest')S.step='cmd';else if(S.step==='ren')S.step='cmd';else if(S.step==='done')S.step='cmd';else return;S.q='';S.cur=0;render()}
+function act(){S.step='cmd';S.q='';S.cur=0;render()}
+function go(){if(S.step==='ren'){finish('Renommé');return}S.step='prog';S.prog=0;S.eyes=S.subj.length>2?'tired':'';render();const t=setInterval(()=>{S.prog+=9;if(S.prog>=100){clearInterval(t);const dup=(DIRS[S.dest]||[]).filter(x=>S.subj.includes(x)).length;finish((S.cmd&&S.cmd.t.startsWith('Déplacer')?'Déplacé':'Copié')+' dans '+S.dest,dup)}else render()},160)}
+function finish(m,dup){S.msg=m;S.step='done';S.eyes=dup?'worry':'happy';S.undo=/corbeille/.test(m);last={cmd:S.cmd,dest:S.dest};S.subj.forEach(s=>freq[s]=(freq[s]||0)+1);render();if(S.undo){setTimeout(()=>{const u=$('#ub');if(u)u.style.width='0%'},30)}setTimeout(()=>{S.eyes='';const e=$('.eyes');if(e)e.className='eyes'},1800)}
+function undo(){toast('Annulé');S.step='cmd';S.q='';render()}
+function runNL(){const l=pick();const n=l.n||nl(S.q);if(!n)return;S.subj=n.files.map(f=>f[0]);S.cmd={t:'Copier vers…',c:ECMDS[0]};S.dest=n.dest;go()}
+function key(e){const L=curLines();
+ if(e.key==='ArrowDown'){e.preventDefault();S.cur=Math.min(L.length-1,S.cur+1);render()}
+ else if(e.key==='ArrowUp'){e.preventDefault();S.cur=Math.max(0,S.cur-1);render()}
+ else if(e.key==='Enter'||(e.key==='ArrowRight'&&!S.q)){e.preventDefault();next()}
+ else if(e.key==='Tab'&&S.step==='el'){e.preventDefault();const l=pick();if(l&&l.kind==='file'){S.checked.has(l.t)?S.checked.delete(l.t):S.checked.add(l.t);S.cur=Math.min(L.length-1,S.cur+1);render()}}
+ else if((e.key==='Backspace'||e.key==='ArrowLeft')&&!S.q){e.preventDefault();back()}
+ else if(e.key==='.'&&!S.q&&S.step==='el'&&last){e.preventDefault();toast('Rejoué : '+last.cmd.t+(last.dest?' → '+last.dest:''));const l=pick();if(l&&l.kind==='file'){S.subj=[l.t];S.cmd=last.cmd;if(last.dest){S.dest=last.dest;go()}else finish(last.cmd.t)}}}
+document.querySelectorAll('.tip').forEach(t=>t.onclick=()=>{fresh();S.q=t.dataset.q;render()});
+$('#ctx1').onclick=()=>{ctx='Téléchargements';$('#ctx1').setAttribute('aria-pressed',true);$('#ctx2').setAttribute('aria-pressed',false);fresh();render()};
+$('#ctx2').onclick=()=>{ctx='Photos';$('#ctx2').setAttribute('aria-pressed',true);$('#ctx1').setAttribute('aria-pressed',false);fresh();render()};
+// ---- galerie ----
+$('#g13').innerHTML=['pdf','xls','img','txt','dir'].map(t=>`<div class="row">${badge(t)}${{pdf:'rapport.pdf',xls:'budget.xlsx',img:'photo.jpg',txt:'notes.txt',dir:'Documents'}[t]}</div>`).join('');
+$('#g17').innerHTML=['','happy','worry','tired'].map(c=>`<span class="eyes ${c}"><i></i><i></i></span>`).join('');
+$('#g18').innerHTML=Object.entries(TC).map(([k,v])=>`<span class="chip" style="border-color:${v[0]};color:${v[0]}">${{pdf:'Document',xls:'Tableur',img:'Image',txt:'Texte',dir:'Dossier'}[k]}</span>`).join('');
+function g16(){$('#g16').innerHTML='';['Élément|c1','Commande|c2','Destination|c3'].forEach((s,i)=>setTimeout(()=>{const [a,b]=s.split('|');$('#g16').insertAdjacentHTML('beforeend',(i?'<span class="sep">›</span>':'')+`<span class="chip ${b}">${a}</span>`)},i*350))}g16();
+function g9(){const b=$('#g9b');b.style.transition='none';b.style.width='100%';void b.offsetWidth;b.style.transition='width 5s linear';b.style.width='0%'}
+// ---- les 28 ----
+const IDEAS=[[1,'Classement par fréquence','Palette · ★ fréquent, utilise une commande puis rouvre'],[2,'Rejouer la dernière commande','Palette · touche . sur un fichier après une action'],[3,'Alias personnels','Palette · tape dl, doc ou arc'],[4,'Touche directe sur chaque commande','Palette · pastilles à droite'],[5,'État vide utile','Palette · tape zzz'],[6,'Multi-sélection','Palette · Tab sur plusieurs fichiers'],[7,'Retour sans perdre les choix','Palette · ← à chaque étape'],[8,'Préfixes > / ? @','Palette · essaie les 4'],[9,'Annulation douce 5 s','Galerie + corbeille dans la palette'],[10,'Aperçu riche','Palette · étape 1, à droite'],[11,'Aperçu du renommage','Palette · Renommer…, tape le modèle'],[12,'Destination en arborescence + disque','Galerie + étape destination'],[13,'Icônes de type monochromes (refonte)','Galerie + palette'],[14,'Touches en texte mono (refonte)','Galerie + palette'],[15,'Progression, vitesse, temps restant','Galerie + copie dans la palette'],[16,'Fil d\'Ariane animé','Galerie + palette'],[17,'Pixel expressif','Galerie + après une copie (content, inquiet si doublon, fatigué si 3 fichiers ou plus)'],[18,'Accent selon l\'élément','Galerie + liseré de la palette'],[19,'Langage naturel','Palette · bouton « langage naturel »'],[20,'Presse-papiers','Galerie + Coller ici'],[21,'Chaînage d\'actions','Recettes (liste de départ)'],[22,'Recettes personnelles','Palette · section Recettes'],[23,'Recherches enregistrées','Palette · section Recherches enregistrées'],[24,'Espaces de travail','Palette · Espace · Compta mars'],[25,'Calculs et conversions','Palette · 1,2 go en mo, 15% de 340'],[26,'Doublons à la copie','Palette · copie vers Archives avec rapport-2026.pdf'],[27,'Historique universel','Commande Historique (tiroir du lot 15B)'],[28,'Suggestions selon le dossier','Palette · change de dossier ouvert']];
+$('#l table').insertAdjacentHTML('beforeend',IDEAS.map(i=>`<tr><td>${i[0]}</td><td>${i[1]}</td><td style="color:var(--i2)">${i[2]}</td></tr>`).join(''));
+document.querySelectorAll('.tab[data-t]').forEach(b=>b.onclick=()=>{document.querySelectorAll('.tab[data-t]').forEach(x=>x.setAttribute('aria-pressed',x===b));['p','g','l'].forEach(id=>$('#'+id).hidden=id!==b.dataset.t)});
+render();
+</script></body></html>

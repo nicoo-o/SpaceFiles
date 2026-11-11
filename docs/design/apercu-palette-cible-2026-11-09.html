@@ -1,0 +1,127 @@
+<!doctype html>
+<html lang="fr"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Palette Ctrl+K : deux façons de travailler</title>
+<style>
+:root{--bg:#000;--card:#0b0c0f;--i1:rgba(255,255,255,.92);--i2:rgba(255,255,255,.65);--i3:rgba(255,255,255,.5);--s1:rgba(255,255,255,.07);--s2:rgba(255,255,255,.14);--sel:rgba(255,255,255,.07);--ac:#E8A66B;--er:#F0836B;--ok:#7BD88F}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--i1);font:14px/1.4 "Segoe UI Variable Text","Segoe UI",system-ui,sans-serif;background-image:radial-gradient(rgba(255,255,255,.06) 1px,transparent 1.2px);background-size:10px 10px;min-height:100vh}
+.wrap{max-width:1080px;margin:0 auto;padding:20px 16px 60px}
+h1{font:700 20px "Courier New",monospace;letter-spacing:1px;text-transform:uppercase;margin:0 0 6px}
+p.sub{color:var(--i2);margin:0 0 16px;max-width:760px}
+.tabs{display:flex;gap:8px;margin-bottom:14px;flex-wrap:wrap}
+.tab{border:1px solid var(--s2);border-radius:18px;padding:7px 16px;color:var(--i2);cursor:pointer;background:none;font:inherit}
+.tab[aria-pressed=true]{border-color:var(--ac);color:var(--i1);background:rgba(232,166,107,.1)}
+.hint{color:var(--i3);font-size:12px;margin:10px 2px}
+kbd{border:1px solid var(--s2);border-radius:6px;padding:1px 6px;font:11px "Segoe UI",sans-serif;color:var(--i2)}
+.pal{background:var(--card);border:1px solid var(--s2);border-radius:26px;overflow:hidden;box-shadow:0 30px 80px rgba(0,0,0,.6)}
+.ph{display:flex;align-items:center;gap:12px;padding:14px 18px;border-bottom:1px solid var(--s1)}
+.eyes{display:flex;gap:5px}.eyes i{width:7px;height:16px;border-radius:2px;background:#4fd3ff;display:block}
+.ph input{flex:1;background:none;border:0;outline:0;color:var(--i1);font:inherit;font-size:16px;min-width:0}
+.chip{display:inline-flex;align-items:center;gap:6px;border:1px solid var(--s2);border-radius:14px;padding:3px 10px;font-size:12px;color:var(--i2);white-space:nowrap}
+.chip.on{border-color:rgba(232,166,107,.6);color:var(--i1);background:rgba(232,166,107,.1)}
+.crumbs{display:flex;gap:6px;align-items:center;padding:10px 18px 0;flex-wrap:wrap;min-height:40px}
+.crumbs .sep{color:var(--i3)}
+.body{display:grid;min-height:340px}
+.cols{display:grid;grid-template-columns:1fr 1fr 1fr;gap:0;border-bottom:1px solid var(--s1)}
+.col{padding:10px 8px;border-right:1px solid var(--s1);min-width:0}
+.col:last-child{border-right:0}
+.col h5{margin:2px 10px 8px;font:400 11px "Segoe UI";letter-spacing:.09em;text-transform:uppercase;color:var(--i3);display:flex;justify-content:space-between}
+.col.act h5{color:var(--ac)}
+.col.done .row.cur{background:none}
+.row{display:flex;align-items:center;gap:10px;height:38px;padding:0 10px;border-radius:12px;cursor:pointer;color:var(--i2);position:relative}
+.row.cur{background:var(--sel);color:var(--i1)}
+.col.act .row.cur::before,.list .row.cur::before{content:"";position:absolute;left:0;top:10px;bottom:10px;width:3px;border-radius:2px;background:var(--ac)}
+.row .k{margin-left:auto;color:var(--i3);font-size:11px}
+.row.dis{opacity:.4;cursor:not-allowed}
+.ic{width:20px;text-align:center;color:var(--i3)}
+.gh{margin:8px 10px 2px;font-size:11px;letter-spacing:.09em;text-transform:uppercase;color:var(--i3)}
+.split{display:grid;grid-template-columns:1fr 1fr}
+.list{padding:8px}
+.pv{border-left:1px solid var(--s1);padding:16px 18px;background:rgba(255,255,255,.025);display:flex;flex-direction:column;gap:10px;min-width:0}
+.pv .vt{font:700 18px "Courier New",monospace;letter-spacing:1px;text-transform:uppercase}
+.pv .vd{color:var(--i2);font-size:12.5px}
+.art{border:1px solid var(--s1);border-radius:14px;padding:10px;background:var(--bg);display:flex;flex-direction:column;gap:4px}
+.frow{display:flex;gap:8px;font-size:12.5px;color:var(--i2)}.frow .sz{margin-left:auto;color:var(--i3)}
+.frow.new{color:var(--ok)}.frow.warn{color:var(--er)}
+.eff{font-size:12.5px;padding:8px 10px;border-radius:10px;border:1px solid var(--s1)}
+.eff.ok{border-color:rgba(123,216,143,.4);color:var(--ok)}.eff.warn{border-color:rgba(240,131,107,.5);color:var(--er)}
+.ft{display:flex;gap:16px;padding:10px 18px;border-top:1px solid var(--s1);color:var(--i3);font-size:12px;flex-wrap:wrap}
+.btn{border:1px solid var(--s2);border-radius:14px;background:none;color:var(--i1);padding:5px 14px;font:inherit;cursor:pointer}
+.btn.pri{border-color:var(--ac);background:rgba(232,166,107,.12)}
+.res{padding:22px 24px;display:flex;flex-direction:column;gap:12px;align-items:flex-start}
+.bar{height:6px;border-radius:3px;background:var(--s1);width:260px;overflow:hidden}.bar i{display:block;height:100%;background:var(--ac);width:0;transition:width 1.2s ease}
+.cmp{display:grid;grid-template-columns:1fr 1fr;gap:14px;margin-top:18px}
+.cmp>div{border:1px solid var(--s1);border-radius:14px;padding:12px 14px;font-size:13px;color:var(--i2)}
+.cmp b{color:var(--i1)}
+@media(max-width:760px){.cols{grid-template-columns:1fr}.split{grid-template-columns:1fr}.cmp{grid-template-columns:1fr}}
+</style></head><body><div class="wrap">
+<h1>Palette Ctrl+K : tout le travail dedans</h1>
+<p class="sub">Même scénario dans les deux options : <b>copier « rapport-2026.pdf »</b> vers un dossier. La palette s'ouvre sur l'élément sélectionné ; pour en travailler un autre, on tape son nom. Essaie au clavier ou à la souris.</p>
+<div class="tabs"><button class="tab" id="t1" aria-pressed="true">Option 1 · Trois colonnes</button><button class="tab" id="t2" aria-pressed="false">Option 2 · Étapes + fil d'Ariane</button><button class="tab" id="rs">↺ Recommencer</button></div>
+<div class="hint" id="hint"></div>
+<div id="app"></div>
+<div class="cmp"><div><b>Option 1 · colonnes</b><br>Tu vois toute la phrase d'un coup (élément · commande · destination). Idéal pour comparer et corriger une étape sans perdre les autres. Prend de la largeur ; l'aperçu passe sous la 3ᵉ colonne.</div><div><b>Option 2 · étapes</b><br>Une seule liste à la fois, aperçu large à droite. Plus calme et plus lisible sur petite fenêtre, mais on voit moins l'ensemble ; revenir en arrière demande plus de Retour arrière.</div></div>
+</div>
+<script>
+const $=s=>document.querySelector(s);
+const FILES=[['rapport-2026.pdf','1,2 Mo'],['budget.xlsx','340 Ko'],['photo-vacances.jpg','4,1 Mo'],['notes.txt','2 Ko']];
+const FOLD={
+ 'Autre panneau · D:\\Archives':{ic:'⇆',c:[['2025',''],['contrat.pdf','210 Ko'],['rapport-2026.pdf','1,1 Mo']],free:'412 Go'},
+ 'Documents':{ic:'🕑',c:[['Factures',''],['CV.docx','88 Ko'],['budget.xlsx','340 Ko']],free:'181 Go'},
+ 'Bureau':{ic:'★',c:[['Projets',''],['capture-hub.png','1,4 Mo']],free:'181 Go'},
+ 'Téléchargements':{ic:'🕑',c:[['installeur.exe','52 Mo'],['musique.zip','88 Mo']],free:'181 Go'},
+ 'OneDrive':{ic:'☁',c:[['Perso',''],['Travail','']],free:'1,8 To'},
+ 'Projets':{ic:'▸',c:[['spacefiles',''],['hub','']],free:'181 Go'}};
+const CMDS=[['Copier vers…','Ctrl+C','dest'],['Déplacer vers…','Ctrl+X','dest'],['Renommer…','F2','ren'],['Mettre à la corbeille','Suppr','go'],['Compresser en .zip','','go'],['Ouvrir avec…','','go'],['Ajouter à un groupe…','','go']];
+let mode=1,S;
+function fresh(){S={subj:0,cmd:0,dest:0,col:0,step:0,q:'',done:null,progress:false,mem:{subj:null,cmd:null,dest:null}}}
+fresh();
+const dests=()=>Object.keys(FOLD).filter(k=>!S.q||k.toLowerCase().includes(S.q.toLowerCase()));
+const subs=()=>FILES.filter(f=>!S.q||f[0].toLowerCase().includes(S.q.toLowerCase()));
+const cmdsL=()=>CMDS.filter(c=>!S.q||c[0].toLowerCase().includes(S.q.toLowerCase()));
+function subjName(){return FILES[S.subj][0]}
+function preview(){
+ const ds=dests(),d=ds[Math.min(S.dest,ds.length-1)],f=FOLD[d];if(!f)return '';
+ const exists=f.c.some(x=>x[0]===subjName());const verb=cmdsL()[S.cmd]?cmdsL()[S.cmd][0].startsWith('Déplacer')?'déplacé':'copié':'copié';
+ return `<div class="vt">${d.replace(/^Autre panneau · /,'')}</div><div class="vd">${f.free} libres · ${f.c.length} éléments</div><div class="art">${f.c.map(x=>`<div class="frow"><span class="ic">${x[1]?'▯':'▭'}</span>${x[0]}<span class="sz">${x[1]}</span></div>`).join('')}<div class="frow ${exists?'warn':'new'}"><span class="ic">${exists?'!':'+'}</span>${subjName()}<span class="sz">${exists?'existe déjà':'nouveau'}</span></div></div><div class="eff ${exists?'warn':'ok'}">${exists?`Un fichier du même nom existe ici : tu choisiras <b>Remplacer</b>, <b>Garder les deux</b> ou <b>Ignorer</b>.`:`${subjName()} sera ${verb} ici.`}</div><div><button class="btn pri" onclick="run()">${verb==='déplacé'?'Déplacer':'Copier'} ici ↵</button></div>`}
+function run(){S.progress=true;S.done=null;render();setTimeout(()=>{const b=$('.bar i');if(b)b.style.width='100%'},30);setTimeout(()=>{S.progress=false;const d=dests()[S.dest];S.done=`${subjName()} copié dans ${d.replace(/^Autre panneau · /,'')}`;render()},1400)}
+function head(){const chips=`<span class="chip on">◧ ${subjName()} ✕</span>`;return `<div class="ph"><span class="eyes"><i></i><i></i></span><input id="q" placeholder="${S.col===0&&S.step===0?'Chercher un fichier ou une commande…':'Filtrer…'}" value="${S.q}" autocomplete="off"><span class="chip">Ctrl K</span></div>`}
+function list(arr,cur,fn,opt){return arr.map((x,i)=>`<div class="row ${i===cur?'cur':''} ${x.dis?'dis':''}" data-i="${i}" onclick="${fn}(${i})"><span class="ic">${x.ic||'▯'}</span>${x.t}<span class="k">${x.k||''}</span></div>`).join('')}
+function view1(){
+ const sA=subs().map(f=>({t:f[0],k:f[1]})),cA=cmdsL().map(c=>({t:c[0],k:c[1],ic:c[2]==='dest'?'→':'·'})),dA=dests().map(d=>({t:d.replace(/^Autre panneau · /,'Autre panneau · '),ic:FOLD[d].ic}));
+ if(S.progress)return head()+`<div class="res"><div class="vt">Copie en cours…</div><div class="bar"><i></i></div></div>`;
+ if(S.done)return head()+`<div class="res"><div style="color:var(--ok);font-size:16px">✓ ${S.done}</div><div><button class="btn" onclick="undo()">Annuler</button> <button class="btn" onclick="again()">Autre action sur ${subjName()}</button> <span class="hint">ou Échap pour fermer</span></div></div>`;
+ const colAct=i=>S.col===i?'act':'';
+ return head()+`<div class="body"><div class="cols"><div class="col ${colAct(0)}"><h5><span>1 · Élément</span><span>${sA.length}</span></h5>${list(sA,S.subj,'pickS')}</div><div class="col ${colAct(1)}"><h5><span>2 · Commande</span></h5>${list(cA,S.cmd,'pickC')}</div><div class="col ${colAct(2)}"><h5><span>3 · Destination</span></h5>${S.col>=2||S.mem.cmd?list(dA,S.dest,'pickD'):'<div class="hint" style="margin:10px">Choisis « Copier vers… » ou « Déplacer vers… »</div>'}</div></div>${S.col>=2?`<div class="pv" style="border-left:0">${preview()}</div>`:''}</div><div class="ft"><span><kbd>↑↓</kbd> choisir</span><span><kbd>Tab</kbd>/<kbd>→</kbd> colonne suivante</span><span><kbd>←</kbd>/<kbd>⌫</kbd> précédente</span><span><kbd>↵</kbd> valider</span></div>`}
+function view2(){
+ const steps=['Élément','Commande','Destination'];
+ const names=[subjName(),CMDS[S.cmd][0].replace('…',''),dests()[S.dest]?dests()[S.dest].replace(/^Autre panneau · /,''):''];
+ const crumbs=`<div class="crumbs">${steps.map((s,i)=>i<S.step?`<span class="chip on">${names[i]}</span><span class="sep">›</span>`:i===S.step?`<span class="chip" style="color:var(--ac);border-color:rgba(232,166,107,.5)">${s}</span>`:'').join('')}</div>`;
+ if(S.progress)return head()+crumbs+`<div class="res"><div class="vt">Copie en cours…</div><div class="bar"><i></i></div></div>`;
+ if(S.done)return head()+`<div class="res"><div style="color:var(--ok);font-size:16px">✓ ${S.done}</div><div><button class="btn" onclick="undo()">Annuler</button> <button class="btn" onclick="again()">Autre action sur ${subjName()}</button> <span class="hint">ou Échap pour fermer</span></div></div>`;
+ let L,fn,cur;
+ if(S.step===0){L=subs().map(f=>({t:f[0],k:f[1]}));fn='pickS';cur=S.subj}
+ else if(S.step===1){L=cmdsL().map(c=>({t:c[0],k:c[1],ic:c[2]==='dest'?'→':'·'}));fn='pickC';cur=S.cmd}
+ else{L=dests().map(d=>({t:d,ic:FOLD[d].ic}));fn='pickD';cur=S.dest}
+ const right=S.step===2?preview():S.step===1?`<div class="vt">${CMDS[S.cmd][0]}</div><div class="vd">Agit sur <b>${subjName()}</b>. ${CMDS[S.cmd][2]==='dest'?'Tu choisiras la destination à l\'étape suivante.':'S\'applique tout de suite.'}</div>`:`<div class="vt">${subjName()}</div><div class="vd">Sélectionné dans le dossier ouvert. Tape pour chercher un autre fichier.</div>`;
+ return head()+crumbs+`<div class="split"><div class="list">${list(L,cur,fn)}</div><div class="pv">${right}</div></div><div class="ft"><span><kbd>↑↓</kbd> choisir</span><span><kbd>↵</kbd> étape suivante</span><span><kbd>⌫</kbd> (champ vide) étape précédente</span></div>`}
+function render(){const v=mode===1?view1():view2();$('#app').innerHTML=`<div class="pal">${v}</div>`;const q=$('#q');if(q&&!S.progress&&!S.done){q.focus();q.setSelectionRange(q.value.length,q.value.length);q.oninput=()=>{S.q=q.value;S[mode===1?['subj','cmd','dest'][S.col]:['subj','cmd','dest'][S.step]]=0;render()};q.onkeydown=key}
+ $('#hint').innerHTML=mode===1?'Clavier : <kbd>↑↓</kbd> dans la colonne, <kbd>Tab</kbd> ou <kbd>→</kbd> pour la suivante, <kbd>⌫</kbd> champ vide pour revenir. Dans la colonne 3, <kbd>↵</kbd> lance.':'Clavier : <kbd>↑↓</kbd>, <kbd>↵</kbd> pour avancer, <kbd>⌫</kbd> sur champ vide pour reculer. À la dernière étape, <kbd>↵</kbd> lance.'}
+function cap(k){return mode===1?S.col:S.step}
+function setK(k,v){S[['subj','cmd','dest'][cap()]]=v}
+function lenCur(){return [subs,cmdsL,dests][cap()]().length}
+function curV(){return S[['subj','cmd','dest'][cap()]]}
+function next(){const c=cap();if(c===1&&CMDS[S.cmd][2]!=='dest'){S.q='';doneSimple();return}if(c<2){S.q='';mode===1?S.col++:S.step++;render()}else run()}
+function prev(){if(cap()>0){S.q='';mode===1?S.col--:S.step--;render()}}
+function doneSimple(){S.done=`${CMDS[S.cmd][0].replace('…','')} · ${subjName()} : fait`;render()}
+function key(e){if(e.key==='ArrowDown'){e.preventDefault();setK(0,Math.min(lenCur()-1,curV()+1));render()}else if(e.key==='ArrowUp'){e.preventDefault();setK(0,Math.max(0,curV()-1));render()}else if(e.key==='Enter'){e.preventDefault();next()}else if((e.key==='Tab'&&!e.shiftKey||e.key==='ArrowRight'&&mode===1&&!S.q)){e.preventDefault();if(cap()<2)next()}else if(e.key==='Tab'&&e.shiftKey||e.key==='ArrowLeft'&&mode===1&&!S.q||e.key==='Backspace'&&!S.q){e.preventDefault();prev()}}
+function pickS(i){S.subj=i;if(mode===1){S.col=0;render();} else {S.step=0;render()};next()}
+function pickC(i){S.cmd=i;if(mode===1)S.col=1;else S.step=1;next()}
+function pickD(i){S.dest=i;if(mode===1)S.col=2;else S.step=2;render()}
+function undo(){S.done='Annulé : '+subjName()+' retiré de la destination';render()}
+function again(){S.done=null;S.q='';S.cmd=0;mode===1?S.col=1:S.step=1;render()}
+$('#t1').onclick=()=>{mode=1;fresh();$('#t1').setAttribute('aria-pressed',true);$('#t2').setAttribute('aria-pressed',false);render()};
+$('#t2').onclick=()=>{mode=2;fresh();$('#t2').setAttribute('aria-pressed',true);$('#t1').setAttribute('aria-pressed',false);render()};
+$('#rs').onclick=()=>{fresh();render()};
+render();
+</script></body></html>
