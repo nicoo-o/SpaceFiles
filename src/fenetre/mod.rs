@@ -146,6 +146,8 @@ pub(crate) struct Fenetre {
     pub(crate) lot: Option<Lot>,
     pub(crate) galerie: Option<Galerie>,
     pub(crate) galerie_numero: u64,
+    /// Coup d'œil : dernier point (DIP) du glissement qui déplace l'image zoomée ; `None` hors glissement
+    pub(crate) galerie_glisse: Option<(f32, f32)>,
     /// La touche vient d'être prise par la carte des conflits : son caractère (WM_CHAR) ne va pas au filtre
     pub(crate) avaler_caractere: bool,
     /// Menu Nothing ouvert (barre d'actions, clic droit)
@@ -724,7 +726,14 @@ impl Fenetre {
     }
 }
 
+/// Relecture du 14/11 (audit, phase 4) : la durée de vie `'a` est libre et rien n'empêche d'appeler `etat_de` deux fois pour
+/// la même fenêtre. Deux `&mut Fenetre` vivants en même temps seraient un comportement indéfini : un gestionnaire qui tient `f`
+/// ne doit donc appeler aucune API Win32 qui envoie un message synchrone à `hwnd` (SetWindowPos, DestroyWindow, SendMessage…)
+/// avant d'avoir fini de s'en servir ; il poste (`PostMessageW`) à la place, comme `WM_APPARENCE`. Le pointeur est nul avant
+/// `WM_NCCREATE` et après `WM_DESTROY` : l'appelant doit traiter `None`.
 pub(crate) unsafe fn etat_de<'a>(hwnd: HWND) -> Option<&'a mut Fenetre> {
+    // SAFETY: fil d'interface seulement ; le pointeur vient de `Box::into_raw` posé à WM_NCCREATE et remis à 0 avant le `drop`
+    // de WM_DESTROY. L'exclusivité du `&mut` n'est pas vérifiée ici : voir la règle ci-dessus.
     let p = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut Fenetre;
     p.as_mut()
 }
@@ -784,45 +793,7 @@ pub(crate) fn action_f5(double: bool, maj: bool, ctrl: bool, alt: bool) -> Actio
     }
 }
 
-/// Mode essai seulement (`SPACEFILES_SANS_REGISTRE=1`) : les modificateurs postés (WM_KEYDOWN / WM_KEYUP de Ctrl, Maj, Alt) comptent comme
-/// pressés, car `GetKeyState` ne voit que le vrai clavier et une capture ne doit ni injecter de touche ni prendre le focus de l'auteur.
-static MODIFICATEURS_ESSAI: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
-
-fn essai_actif() -> bool {
-    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *V.get_or_init(defaut::sans_registre)
-}
-
-/// Retient l'appui ou le relâchement d'un modificateur posté (sans effet hors du mode essai)
-pub(crate) fn noter_modificateur_essai(vk: u16, enfonce: bool) {
-    if !essai_actif() {
-        return;
-    }
-    let bit = match vk {
-        0x11 | 0xA2 | 0xA3 => 1,
-        0x10 | 0xA0 | 0xA1 => 2,
-        0x12 | 0xA4 | 0xA5 => 4,
-        _ => return,
-    };
-    if enfonce {
-        MODIFICATEURS_ESSAI.fetch_or(bit, std::sync::atomic::Ordering::Relaxed);
-    } else {
-        MODIFICATEURS_ESSAI.fetch_and(!bit, std::sync::atomic::Ordering::Relaxed);
-    }
-}
-
 pub(crate) fn touche(vk: VIRTUAL_KEY) -> bool {
-    if essai_actif() {
-        let bit = match vk {
-            VK_CONTROL => 1,
-            VK_SHIFT => 2,
-            VK_MENU => 4,
-            _ => 0,
-        };
-        if bit != 0 && MODIFICATEURS_ESSAI.load(std::sync::atomic::Ordering::Relaxed) & bit != 0 {
-            return true;
-        }
-    }
     unsafe { GetKeyState(vk.0 as i32) < 0 }
 }
 
@@ -838,7 +809,7 @@ pub(crate) unsafe fn appliquer_dwm(hwnd: HWND, clair: bool) {
     // en clair, encre 16 % sur #F7F7F8 = #D2D2D3.
     let barre: u32 = if clair { 0x00F0_F0F0 } else { 0x0044_4444 };
     let _ = DwmSetWindowAttribute(hwnd, DWMWA_CAPTION_COLOR, &barre as *const _ as *const c_void, 4);
-    let bordure: u32 = if clair { 0x00D2_D2_D3 } else { 0x0024_2424 };
+    let bordure: u32 = if clair { 0x00D2_D2D3 } else { 0x0024_2424 };
     let _ = DwmSetWindowAttribute(hwnd, DWMWA_BORDER_COLOR, &bordure as *const _ as *const c_void, 4);
 }
 
@@ -950,5 +921,30 @@ mod tests {
         assert!(noms.contains(&"ACTUALISER"), "{noms:?}");
         assert!(noms.iter().any(|n| n.starts_with("COPIER VERS L'AUTRE PANNEAU")), "{noms:?}");
         assert!(palette::COMMANDES.iter().any(|c| c.0 == palette::Commande::CopierVersAutre), "F5 en double panneau reste une commande de la table");
+    }
+
+    #[test]
+    fn les_coordonnees_du_lparam_gardent_leur_signe() {
+        // Deux moniteurs : un point à gauche ou au-dessus du principal a une coordonnée négative (mots de 16 bits signés)
+        let l = |x: i16, y: i16| LPARAM((((y as u16 as u32) << 16) | x as u16 as u32) as isize);
+        assert_eq!((x_lparam(l(10, 20)), y_lparam(l(10, 20))), (10, 20));
+        assert_eq!((x_lparam(l(-5, -7)), y_lparam(l(-5, -7))), (-5, -7));
+        assert_eq!((x_lparam(l(i16::MIN, i16::MAX)), y_lparam(l(i16::MIN, i16::MAX))), (-32768, 32767));
+    }
+
+    #[test]
+    fn combinaison_ecrit_les_modificateurs_dans_l_ordre_de_la_table() {
+        assert_eq!(combinaison(VK_D, true, true, true).as_deref(), Some("CTRL+ALT+MAJ+D"));
+        assert_eq!(combinaison(VK_F2, false, false, false).as_deref(), Some("F2"));
+        assert_eq!(combinaison(VK_F5, false, false, true).as_deref(), Some("MAJ+F5"));
+        assert_eq!(combinaison(VK_RETURN, true, false, false).as_deref(), Some("CTRL+ENTREE"));
+        assert_eq!(combinaison(VK_DELETE, false, true, true).as_deref(), Some("ALT+MAJ+SUPPR"));
+        // Sans Ctrl ni Alt, seules les touches F ont un nom : Entrée, Suppr ou Maj+Suppr seuls restent aux gestes de la liste
+        assert_eq!(combinaison(VK_RETURN, false, false, false), None);
+        assert_eq!(combinaison(VK_DELETE, false, false, true), None);
+        // Une lettre seule sert à la frappe, pas à un raccourci ; Maj+lettre aussi (majuscule)
+        assert_eq!(combinaison(VK_D, false, false, false), None);
+        // Une touche absente de la table n'a pas de nom
+        assert_eq!(combinaison(VK_LEFT, true, false, false), None);
     }
 }

@@ -77,7 +77,7 @@ pub fn valeurs(c: &Cle) -> Vec<(String, String)> {
         if r != ERROR_SUCCESS || (genre != REG_SZ.0 && genre != REG_EXPAND_SZ.0) {
             continue;
         }
-        let u: Vec<u16> = donnees[..taille as usize].chunks_exact(2).map(|p| u16::from_le_bytes([p[0], p[1]])).collect();
+        let u: Vec<u16> = donnees[..taille as usize].as_chunks::<2>().0.iter().map(|p| u16::from_le_bytes([p[0], p[1]])).collect();
         let fin = u.iter().position(|&x| x == 0).unwrap_or(u.len());
         v.push((String::from_utf16_lossy(&nom[..n as usize]), String::from_utf16_lossy(&u[..fin])));
     }

@@ -9,6 +9,9 @@ windows-core = "0.58"
 # Renommage par lot : chercher / remplacer par expression régulière. Sans la fonctionnalité `perf` (DFA, onepass, littéraux) : -505 Ko
 # sur l'exe (lot 17), sans effet visible sur des noms de fichiers
 regex = { version = "1", default-features = false, features = ["std", "unicode"] }
+# Coup d'oeil HTML : WebView2 (scripts et reseau coupes), cree a la demande et detruit a la fermeture. 0.34 est la derniere version qui
+# repose sur `windows` 0.58 (0.35 passe a 0.59) ; justification et mesures dans docs/ui/webview2-dependance.md
+webview2-com = "0.34"
 
 [dependencies.windows]
 version = "0.58"

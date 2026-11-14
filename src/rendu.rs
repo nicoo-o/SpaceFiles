@@ -176,7 +176,7 @@ fn couleur_teinte(t: pixel::Teinte) -> D2D1_COLOR_F {
         pixel::Teinte::Cyan => PIXEL_JOUR,
         pixel::Teinte::Ambre => ACCENT,
         pixel::Teinte::Doux => BLANC_DOUX,
-        pixel::Teinte::Faible => BLANC_FAIBLE,
+        pixel::Teinte::Blanc => BLANC,
         pixel::Teinte::Erreur => ERREUR,
     }
 }
@@ -345,6 +345,46 @@ fn disques_carte(app: &App) -> impl Iterator<Item = (&str, u64, u64)> {
 
 fn haut_carte(app: &App) -> f32 {
     LISTE_Y + app.nb_rangs() as f32 * hauteur_ligne() - app.defilement + 26.0
+}
+
+/// Sections CLOUD et SERVEURS de Ce PC, sous les cartes (maquette `renderPC` : titre, une ligne par lieu avec son mot d'état,
+/// puis « + Ajouter un stockage »)
+const STOCK_LIGNE_H: f32 = 36.0;
+const STOCK_TITRE_H: f32 = 28.0;
+const STOCK_LARGEUR_MAX: f32 = 720.0;
+
+struct StockagesCePc {
+    /// Titre de section et son haut
+    titres: Vec<(&'static str, f32)>,
+    /// Zone de chaque ligne et ce qu'un clic y vise
+    lignes: Vec<(D2D_RECT_F, Cible)>,
+    /// Bas de la dernière ligne
+    bas: f32,
+}
+
+/// `l` : largeur de la liste, `y0` : haut des cartes (`haut_carte`). Un lieu par ligne ; une section vide n'a pas de titre,
+/// comme dans le volet. Le rang de `StockageCePc` compte les nuages puis les serveurs.
+fn stockages_ce_pc(app: &App, l: f32, y0: f32) -> StockagesCePc {
+    let x = largeur_volet() + MARGE_LISTE + 4.0;
+    let w = (l - x - MARGE_LISTE).clamp(160.0, STOCK_LARGEUR_MAX);
+    // Les blocs sont rangés disques d'abord, puis la Corbeille : celle-ci est le dernier
+    let mut y = bloc_carte(l, y0, disques_carte(app).count()).1 + CARTE_BLOC_H;
+    let mut titres = Vec::new();
+    let mut lignes = Vec::new();
+    for (titre, n, decalage) in [("CLOUD", app.nuages.len(), 0), ("SERVEURS ET PARTAGES", app.serveurs.len(), app.nuages.len())] {
+        if n == 0 {
+            continue;
+        }
+        titres.push((titre, y));
+        y += STOCK_TITRE_H;
+        for i in 0..n {
+            lignes.push((rect(x, y, w, STOCK_LIGNE_H - 2.0), Cible::StockageCePc(decalage + i)));
+            y += STOCK_LIGNE_H;
+        }
+        y += 10.0;
+    }
+    lignes.push((rect(x, y, w, STOCK_LIGNE_H - 2.0), Cible::AjouterStockage));
+    StockagesCePc { titres, lignes, bas: y + STOCK_LIGNE_H }
 }
 
 /// Centre de Pixel dans la barre d'état (coordonnées de la fenêtre, DIP)
@@ -730,6 +770,8 @@ pub struct Rendu {
     /// Zone éclairée par le reflet au dernier dessin (DIP, fenêtre) : `None` si aucun reflet. La souris l'invalide seule quand
     /// elle bouge dessus, et n'invalide rien quand elle bouge ailleurs
     pub zone_reflet: Cell<Option<D2D_RECT_F>>,
+    /// Zones des carrés d'étiquette du dernier dessin (rectangle, nombre de carrés) : lues par le survol
+    pub zones_etiquettes: RefCell<Vec<(D2D_RECT_F, u8)>>,
     /// Élément éclairable au dernier dessin, pointeur dedans ou non : invalidé aussi par la souris (voir `dessiner_reflet`)
     pub zone_candidate: Cell<Option<D2D_RECT_F>>,
     /// Style de trait à bouts ronds
@@ -748,6 +790,8 @@ pub struct Rendu {
     fondu_volets: Cell<(f32, f32)>,
     /// Lot 14 : (part de la largeur pleine, opacité) du champ de filtre de chaque panneau pour l'image en cours (`.spill`)
     pilules: Cell<[(f32, f32); 2]>,
+    /// Largeur de la fenêtre à la dernière image : le pied la couvre en entier, les panneaux seulement en partie
+    largeur_fenetre: Cell<f32>,
     /// Lot 12D : la palette telle qu'elle était au dernier dessin, de quoi finir sa fermeture quand l'application l'a déjà fermée
     derniere_palette: RefCell<Option<Palette>>,
     /// Lot 15A : zones de clic de la palette au dernier dessin, et les premiers éléments du dossier montré par l'aperçu « Aller à »
@@ -968,6 +1012,7 @@ impl Rendu {
                 zones_conflit: RefCell::new(Vec::new()),
                 zones_pastilles: RefCell::new(Disposition::default()),
                 zone_reflet: Cell::new(None),
+                zones_etiquettes: RefCell::new(Vec::new()),
                 zone_candidate: Cell::new(None),
                 trait_rond,
                 mouvements: RefCell::new(Mouvements::nouveau()),
@@ -977,6 +1022,7 @@ impl Rendu {
                 cascade: Cell::new(None),
                 fondu_volets: Cell::new((1.0, 1.0)),
                 pilules: Cell::new([(0.0, 0.0); 2]),
+                largeur_fenetre: Cell::new(0.0),
                 derniere_palette: RefCell::new(None),
                 zones_palette: RefCell::new(ZonesPalette::default()),
                 zones_historique: RefCell::new(ZonesHistorique::default()),
@@ -1173,6 +1219,8 @@ impl Rendu {
 
     /// Carrés d'étiquette (maquette `.sq i` : 5 × 5 DIP pleins, 2 DIP d'écart, couleur `--i2`) : `n` carrés à partir de `x`, centrés sur `cy`
     unsafe fn carres_etiquette(&self, c: &Cible2D, x: f32, cy: f32, n: u8) {
+        // Zone survolable (bulle « ÉTIQUETTE N »), marge de 3 DIP autour des carrés : 5 DIP seuls seraient presque introuvables
+        self.zones_etiquettes.borrow_mut().push((rect(x - 3.0, cy - 8.0, largeur_etiquette(n) + 6.0, 16.0), n));
         self.couleur(c, &BLANC_DOUX);
         for k in 0..n {
             c.rt.FillRectangle(&rect(x + k as f32 * (CARRE_ETIQUETTE + ECART_ETIQUETTE), (cy - CARRE_ETIQUETTE / 2.0).round(), CARRE_ETIQUETTE, CARRE_ETIQUETTE), &c.pinceau);
@@ -1194,6 +1242,7 @@ impl Rendu {
 
     /// Dessine toute la fenêtre. `largeur`/`hauteur` en pixels physiques.
     pub fn dessiner(&mut self, hwnd: HWND, largeur: u32, hauteur: u32, dpi: f32, app: &mut App, mut autre: Option<&mut App>, vue: &Vue) -> Result<()> {
+        self.zones_etiquettes.borrow_mut().clear();
         if self.cible.as_ref().is_some_and(|c| c.clair != crate::theme::clair()) {
             self.cible = None;
         }
@@ -1243,12 +1292,23 @@ impl Rendu {
                 crate::index::preparer_carte(hwnd);
                 let (bx, by) = bloc_carte(lp, haut_carte(a), disques_carte(a).count());
                 a.zones.corbeille = crate::corbeille::etat().map(|_| rect(bx - 6.0, by - 4.0, CARTE_BLOC_L - 20.0, CARTE_BLOC_H - 30.0));
+                let (y0, st) = (haut_carte(a), stockages_ce_pc(a, lp, haut_carte(a)));
+                // 26 : l'écart entre la dernière ligne et le haut des cartes (`haut_carte`)
+                a.pied_ce_pc = 26.0 + st.bas - y0;
+                // Le dessin est coupé à la liste : une zone hors de la bande visible ne doit ni réagir au clic (barre d'état, chemin) ni
+                // s'allumer au survol
+                let (bande_haut, bande_bas) = (LISTE_Y, LISTE_Y + a.hauteur_liste);
+                a.zones.stockages = st.lignes.into_iter().filter(|(r, _)| r.bottom > bande_haut && r.top < bande_bas).collect();
+            } else {
+                a.zones.stockages.clear();
+                a.pied_ce_pc = 0.0;
             }
             let pas = a.cote_grille + GRILLE_ECART;
             a.par_rangee = (((lp - MARGE_LISTE_DROITE - grille_x0() + GRILLE_ECART) / pas).floor() as usize).max(1);
         }
 
-        let c = self.cible.as_ref().unwrap();
+        // La cible vient d'être (re)créée plus haut ; si elle manquait, `panic = "abort"` fermerait l'app sans rien dire
+        let Some(c) = self.cible.as_ref() else { return Ok(()) };
         let res = unsafe {
             c.rt.BeginDraw();
             self.dessiner_tout(c, app, autre.as_deref(), l, h, vue);
@@ -1434,9 +1494,33 @@ impl Rendu {
             _ => zone.left,
         };
         let cy = (zone.top + zone.bottom) / 2.0;
-        for m in &morceaux {
+        // Combien de morceaux tiennent en entier ? On s'arrête avant la première touche qui déborde, et le séparateur « · »
+        // qui la précédait est retiré : sinon la ligne finissait par un « · » orphelin (P2-04 de l'audit du 14/11)
+        let mut fin = morceaux.len();
+        let mut xp = x;
+        for (i, m) in morceaux.iter().enumerate() {
+            match m {
+                Morceau::Texte(t) => xp += self.mesurer(t, &self.f.petit),
+                Morceau::Touches(k) => {
+                    if xp + largeur_touches(k) > zone.right + 0.5 {
+                        fin = i;
+                        break;
+                    }
+                    xp += largeur_touches(k);
+                }
+            }
+        }
+        if fin < morceaux.len() {
+            while fin > 0 && matches!(&morceaux[fin - 1], Morceau::Texte(t) if t.trim().trim_matches('·').trim().is_empty()) {
+                fin -= 1;
+            }
+        }
+        let coupe = fin < morceaux.len();
+        for (i, m) in morceaux[..fin].iter().enumerate() {
             match m {
                 Morceau::Texte(t) => {
+                    // Dernier texte avant une coupure : on retire son « · » final (ex. « …DE PANNEAU · » avant une touche absente)
+                    let t: &str = if coupe && i + 1 == fin { t.trim_end().trim_end_matches('·').trim_end() } else { t };
                     let w = self.mesurer(t, &self.f.petit);
                     self.couleur(c, couleur);
                     self.texte(c, &self.f.petit, t, rect(x, zone.top, (w + 2.0).min(zone.right - x), zone.bottom - zone.top));
@@ -1684,7 +1768,8 @@ impl Rendu {
         let puces: f32 = PUCES_FILTRE.iter().map(|p| self.mesurer(p, &f.petit) + 2.0 * PUCE_MARGE + 2.0 + PUCE_ECART).sum();
         let suite = puces + largeur_touche("Échap") + FILTRE_DROITE;
         let souhaite = (self.mesurer(&app.filtre, &f.liste) + 24.0).clamp(96.0, 220.0);
-        let cap = (l * 0.6).max(140.0);
+        // 45 % de la largeur du panneau au plus : à 60 %, le fil d'Ariane était réduit à « DOSSIER-VI… » (P2-04 de l'audit du 14/11)
+        let cap = (l * 0.45).max(140.0);
         let besoin = FILTRE_GAUCHE + souhaite + suite;
         if besoin <= cap {
             MesureFiltre { plein: besoin, texte: souhaite, puces: true }
@@ -1963,7 +2048,7 @@ impl Rendu {
         let mut dessinee = false;
         if let Some(img) = &a.image {
             let mut cache = c.miniature.borrow_mut();
-            if cache.as_ref().map_or(true, |(n, _)| *n != a.numero) {
+            if cache.as_ref().is_none_or(|(n, _)| *n != a.numero) {
                 let props = D2D1_BITMAP_PROPERTIES {
                     pixelFormat: D2D1_PIXEL_FORMAT { format: DXGI_FORMAT_B8G8R8A8_UNORM, alphaMode: D2D1_ALPHA_MODE_PREMULTIPLIED },
                     dpiX: 96.0,
@@ -2023,8 +2108,19 @@ impl Rendu {
             self.couleur(c, &BLANC_FAIBLE);
             self.texte(c, &f.petit, libelle, rect(gauche, y, largeur, 18.0));
             self.couleur(c, &BLANC);
-            self.texte(c, &f.liste, valeur, rect(gauche, y + 16.0, largeur, 20.0));
-            y += 44.0;
+            // Une valeur trop longue pour une ligne (statut de signature ou de disponibilité, emplacement) passe à la ligne, sur
+            // deux lignes au plus, au lieu d'être coupée par « … » : on ne lisait plus le statut
+            let w: Vec<u16> = valeur.encode_utf16().collect();
+            let deux = self.mesurer(valeur, &f.liste) > largeur;
+            let layout = if deux { self.dwrite.CreateTextLayout(&w, &f.liste, largeur, 40.0).ok() } else { None };
+            if let Some(layout) = layout {
+                let _ = layout.SetWordWrapping(DWRITE_WORD_WRAPPING_WRAP);
+                rt.DrawTextLayout(D2D_POINT_2F { x: gauche, y: y + 16.0 }, &layout, &c.pinceau, D2D1_DRAW_TEXT_OPTIONS_CLIP);
+                y += 44.0 + 20.0;
+            } else {
+                self.texte(c, &f.liste, valeur, rect(gauche, y + 16.0, largeur, 20.0));
+                y += 44.0;
+            }
         }
 
         // Début du fichier texte
@@ -2089,7 +2185,7 @@ impl Rendu {
             for op in lignes.iter().rev().take(place).rev() {
                 let heure = op.heure();
                 self.couleur(c, &BLANC_TRES_FAIBLE);
-                self.texte(c, &self.f.petit_mono, &heure, rect(p.left + 24.0, y0, 44.0, 20.0));
+                self.texte(c, &self.f.petit_mono, heure, rect(p.left + 24.0, y0, 44.0, 20.0));
                 self.couleur(c, &ACCENT);
                 self.texte(c, &self.f.petit_mono, &op.action.to_uppercase(), rect(p.left + 72.0, y0, 86.0, 20.0));
                 self.couleur(c, &BLANC_DOUX);
@@ -2342,25 +2438,7 @@ impl Rendu {
             };
             let mut droite_nom = r.right - 12.0;
             if let Some(e) = cle_etat.and_then(|k| app.etats.lire(k)) {
-                let m = crate::etats::mot(e);
-                let largeur = self.mesurer(m.texte, &f.petit_droite).ceil() + 2.0;
-                let x_mot = r.right - 12.0 - largeur;
-                let (cx, cy) = (x_mot - 10.0, r.top + ligne_h / 2.0);
-                self.couleur(c, match m.ton {
-                    crate::etats::Ton::Accent => &ACCENT,
-                    crate::etats::Ton::Neutre => &BLANC_FAIBLE,
-                    crate::etats::Ton::Erreur => &ERREUR,
-                });
-                match m.marque {
-                    crate::etats::Marque::Point => rt.FillEllipse(&ellipse(cx, cy, 3.0), &c.pinceau),
-                    crate::etats::Marque::Coche => {
-                        let (a, b, d) = (D2D_POINT_2F { x: cx - 3.5, y: cy + 0.5 }, D2D_POINT_2F { x: cx - 1.0, y: cy + 3.0 }, D2D_POINT_2F { x: cx + 3.5, y: cy - 3.0 });
-                        rt.DrawLine(a, b, &c.pinceau, 1.5, Some(&self.trait_rond));
-                        rt.DrawLine(b, d, &c.pinceau, 1.5, Some(&self.trait_rond));
-                    }
-                }
-                self.texte(c, &f.petit_droite, m.texte, rect(x_mot, r.top, largeur + 1.0, ligne_h));
-                droite_nom = cx - 3.5 - 8.0;
+                droite_nom = self.mot_etat(c, e, r.right - 12.0, r.top, ligne_h);
             }
             // `.it .d` : le nom est en `--i1` quelle que soit la ligne, seule l'icône reste atténuée
             self.couleur(c, &BLANC);
@@ -2375,6 +2453,7 @@ impl Rendu {
 
         // Volet d'aperçu (pour le panneau qui a le focus) : la suite se limite à la largeur restante
         let largeur_totale = l;
+        self.largeur_fenetre.set(l);
         let ll = largeur_liste(l, vue.apercu_visible);
         if crate::theme::largeur_apercu(l, vue.apercu_visible) > 0.5 {
             // L'aperçu s'arrête au-dessus du pied : celui-ci court sur toute la largeur de la fenêtre. Pendant son glissement le
@@ -2483,16 +2562,20 @@ impl Rendu {
         // Lot 12D : le coup d'œil se déploie depuis la ligne choisie (l. 504, 460 ms au ressort) ; son contenu paraît ensuite en 180 ms
         // et il se replie sur la ligne en 240 ms (l. 497)
         let animer_cadres = crate::reglages::animations_actives();
-        let cible_galerie = [0.0, HAUTEUR_TITRE + 1.0, largeur_totale, h - HAUTEUR_TITRE - 1.0];
+        let cible_galerie = Self::rect_galerie(largeur_totale, h);
         let source_galerie = Self::rect_ligne_choisie(app, ll, vue.galerie.map_or(0, |g| g.1), cible_galerie);
         let etat_galerie = self.mouvements.borrow_mut().morph_galerie.maj(vue.galerie.is_some(), source_galerie, cible_galerie, t_image, animer_cadres);
         if etat_galerie.visible {
+            // Carte flottante sur un voile, comme la palette : le dossier reste entrevu derrière
+            self.couleur(c, &rgba(0, 0, 0, 0.45));
+            rt.FillRectangle(&rect(0.0, HAUTEUR_TITRE + 1.0, largeur_totale, h - HAUTEUR_TITRE - 1.0), &c.pinceau);
             if let Some(cadre) = etat_galerie.cadre {
                 self.carte(c, rect(cadre[0], cadre[1], cadre[2], cadre[3]));
             } else if let Some(g) = vue.galerie {
-                self.carte(c, rect(cible_galerie[0], cible_galerie[1], cible_galerie[2], cible_galerie[3]));
+                let z = rect(cible_galerie[0], cible_galerie[1], cible_galerie[2], cible_galerie[3]);
+                self.carte(c, z);
                 let d = mouvement::Decalage { dx: 0.0, dy: 0.0, echelle: 1.0, opacite: etat_galerie.contenu };
-                self.avec_decalage(c, &d, (largeur_totale / 2.0, h / 2.0), plein, || self.dessiner_galerie(c, g, largeur_totale, h));
+                self.avec_decalage(c, &d, (largeur_totale / 2.0, h / 2.0), plein, || self.dessiner_galerie(c, g, z));
             }
         }
         // La palette se révèle par le haut (`clip-path: inset(0 0 100% 0)` vers `inset(0)`) en tombant de 10 DIP, 480 ms au ressort, et se
@@ -2653,6 +2736,7 @@ impl Rendu {
             Cible::Note => libre(decale(app.zones.note?), 11.0),
             Cible::Puce(k) => libre(decale(*app.zones.puces.get(k)?), 8.0),
             Cible::Corbeille => libre(decale(app.zones.corbeille?), 10.0),
+            Cible::StockageCePc(_) | Cible::AjouterStockage => libre(decale(app.zones.stockages.iter().find(|(_, q)| *q == app.survol)?.0), 10.0),
             Cible::Reglage(k) => {
                 let vp = vue.page.as_ref()?;
                 let (y0, hl) = *page::positions(vp.lignes, vp.page.categorie).get(k)?;
@@ -3004,6 +3088,32 @@ impl Rendu {
         });
     }
 
+    /// Bulle « ÉTIQUETTE N » sous les carrés survolés (maquette `title="Étiquette N"`), même style et même délai que celle de la barre
+    unsafe fn dessiner_bulle_etiquette(&self, c: &Cible2D, app: &App, l: f32) {
+        let Some((z, n)) = app.survol_etiquette else { return };
+        // Le contenu a pu bouger sans mouvement de souris (molette, ouverture d'un dossier) : la bulle ne reste que si les carrés
+        // de ce nombre sont encore sous le rectangle gardé (recouvrement, car le soulèvement de 2 px de la ligne décale les zones)
+        let encore_la = matches!(app.survol, Cible::Ligne(_))
+            && self.zones_etiquettes.borrow().iter().any(|&(r, m)| m == n && r.left < z.right && r.right > z.left && r.top < z.bottom && r.bottom > z.top);
+        if !encore_la {
+            return;
+        }
+        let Some((opacite, dy)) = self.mouvements.borrow().survols.bulle_etiquette(self.t_image.get()) else { return };
+        let texte = format!("ÉTIQUETTE {n}");
+        let w = self.largeur_aide(&segmenter_aide(&texte)) + 24.0;
+        let x = ((z.left + z.right) / 2.0 - w / 2.0).clamp(largeur_volet() + 8.0, (l - w - 8.0).max(largeur_volet() + 8.0));
+        let r = rect(x, z.bottom + 6.0, w, 26.0);
+        let arrondi = D2D1_ROUNDED_RECT { rect: r, radiusX: 8.0, radiusY: 8.0 };
+        let d = mouvement::Decalage { dx: 0.0, dy, echelle: 1.0, opacite };
+        self.avec_decalage(c, &d, ((r.left + r.right) / 2.0, (r.top + r.bottom) / 2.0), rect(r.left - 12.0, r.top - 12.0, w + 24.0, 50.0), || {
+            self.couleur(c, &CHAMP_FOND);
+            c.rt.FillRoundedRectangle(&arrondi, &c.pinceau);
+            self.couleur(c, &BLANC_TRES_FAIBLE);
+            c.rt.DrawRoundedRectangle(&arrondi, &c.pinceau, 1.0, None);
+            self.aide(c, &texte, rect(r.left + 12.0, r.top, w - 18.0, 26.0), Pose::Gauche, &BLANC);
+        });
+    }
+
     unsafe fn dessiner_contenu(&self, c: &Cible2D, app: &App, l: f32, h: f32, vue: &Vue, focus: bool, premier: bool) {
         let rt = &c.rt;
         let f = &self.f;
@@ -3203,6 +3313,7 @@ impl Rendu {
             self.dessiner_chronologie(c, app, l, h);
         }
         self.dessiner_bulle(c, app, l);
+        self.dessiner_bulle_etiquette(c, app, l);
 
         // Lasso : voile rouge léger et contour en points blancs
         if let Some(la) = app.lasso.as_ref().filter(|la| la.actif) {
@@ -3297,8 +3408,10 @@ impl Rendu {
         // sans cette exception son résumé (« 8 ÉLÉMENTS · 1 DOSSIER · LU EN 0,1 MS ») était coupé en « 8 ÉLÉME… » (lot 17)
         let place_droite = match &texte_operation {
             _ if vue.double && premier => 0.0,
-            Some(t) => self.largeur_aide(&segmenter_aide(t)) + MARGE_LISTE + 40.0,
-            None => self.largeur_pied() + MARGE_LISTE + 30.0,
+            // Le pied court sur toute la fenêtre (aperçu compris) : seule sa part qui empiète sur ce panneau retire de la place.
+            // Avant, on retirait toute sa largeur et le message se coupait à 620 px avec 330 px libres (P2-04 de l'audit du 14/11)
+            Some(t) => (self.largeur_aide(&segmenter_aide(t)).min(380.0) + 20.0 + 40.0 - (self.largeur_fenetre.get() - l).max(0.0)).max(0.0),
+            None => (self.largeur_pied() + 20.0 + 30.0 - (self.largeur_fenetre.get() - l).max(0.0)).max(0.0),
         };
         let decalage = if premier { PIXEL_DECALAGE } else { 0.0 };
         let zone_gauche = rect(largeur_volet() + MARGE_LISTE + decalage, ys, (l - largeur_volet() - MARGE_LISTE - decalage - place_droite).max(0.0), STATUT_H);
@@ -3548,7 +3661,7 @@ impl Rendu {
                 if actif { self.couleur_ou(c, &SELECTION, &SELECTION_CLAIR); } else { self.couleur(c, &SELECTION_TERNE); }
                 rt.FillRoundedRectangle(&arrondi, &c.pinceau);
                 // La ligne glissante a sa barre dessinée après la boucle, à sa position animée
-                if pastille.map_or(true, |(p, _)| p != i) {
+                if pastille.is_none_or(|(p, _)| p != i) {
                     self.couleur(c, if actif { &ACCENT } else { &BLANC_FAIBLE });
                     rt.FillRoundedRectangle(&D2D1_ROUNDED_RECT { rect: rect(x0 + 2.0, y + 12.0, 3.0, (hauteur_ligne() - 24.0).max(6.0)), radiusX: 1.5, radiusY: 1.5 }, &c.pinceau);
                 }
@@ -3951,6 +4064,66 @@ impl Rendu {
         Some((i, g.valeur(t)))
     }
 
+    /// Mot d'état (`.st`) aligné à droite de `droite`, dans une ligne de haut `haut` et de hauteur `h` : un `✓` ou un point, puis
+    /// le mot en casse normale. Rend le bord droit libre pour le nom.
+    unsafe fn mot_etat(&self, c: &Cible2D, e: crate::etats::Etat, droite: f32, haut: f32, h: f32) -> f32 {
+        let (f, rt) = (&self.f, &c.rt);
+        let m = crate::etats::mot(e);
+        let largeur = self.mesurer(m.texte, &f.petit_droite).ceil() + 2.0;
+        let x_mot = droite - largeur;
+        let (cx, cy) = (x_mot - 10.0, haut + h / 2.0);
+        self.couleur(c, match m.ton {
+            crate::etats::Ton::Accent => &ACCENT,
+            crate::etats::Ton::Neutre => &BLANC_FAIBLE,
+            crate::etats::Ton::Erreur => &ERREUR,
+        });
+        match m.marque {
+            crate::etats::Marque::Point => rt.FillEllipse(&ellipse(cx, cy, 3.0), &c.pinceau),
+            crate::etats::Marque::Coche => {
+                let (a, b, d) = (D2D_POINT_2F { x: cx - 3.5, y: cy + 0.5 }, D2D_POINT_2F { x: cx - 1.0, y: cy + 3.0 }, D2D_POINT_2F { x: cx + 3.5, y: cy - 3.0 });
+                rt.DrawLine(a, b, &c.pinceau, 1.5, Some(&self.trait_rond));
+                rt.DrawLine(b, d, &c.pinceau, 1.5, Some(&self.trait_rond));
+            }
+        }
+        self.texte(c, &f.petit_droite, m.texte, rect(x_mot, haut, largeur + 1.0, h));
+        cx - 3.5 - 8.0
+    }
+
+    /// Sections CLOUD et SERVEURS de Ce PC (maquette `renderPC`)
+    unsafe fn dessiner_stockages_ce_pc(&self, c: &Cible2D, app: &App, st: &StockagesCePc) {
+        let (f, rt) = (&self.f, &c.rt);
+        let x = largeur_volet() + MARGE_LISTE + 4.0;
+        for &(titre, y) in &st.titres {
+            self.couleur(c, &BLANC_DOUX);
+            self.texte(c, &f.petit, titre, rect(x, y, 400.0, 18.0));
+        }
+        for &(r, quoi) in &st.lignes {
+            let survol = app.survol == quoi;
+            if survol {
+                self.couleur(c, &SURVOL);
+                rt.FillRoundedRectangle(&D2D1_ROUNDED_RECT { rect: r, radiusX: 10.0, radiusY: 10.0 }, &c.pinceau);
+            }
+            let h = r.bottom - r.top;
+            let lieu = match quoi {
+                Cible::StockageCePc(i) => app.nuages.iter().chain(&app.serveurs).nth(i),
+                _ => None,
+            };
+            let Some(lieu) = lieu else {
+                // « + Ajouter un stockage » : centré, atténué
+                self.couleur(c, if survol { &BLANC } else { &BLANC_DOUX });
+                self.texte(c, &f.petit_centre, "+ AJOUTER UN STOCKAGE", r);
+                continue;
+            };
+            self.icone(c, lieu.icone, r.left + 22.0, r.top + h / 2.0, false, if survol { 1.0 } else { 0.7 });
+            let fin_nom = match app.etats.lire(lieu.detail.as_str()) {
+                Some(e) => self.mot_etat(c, e, r.right - 12.0, r.top, h),
+                None => r.right - 12.0,
+            };
+            self.couleur(c, &BLANC);
+            self.texte_espace(c, &f.volet_nom, &lieu.nom.to_uppercase(), rect(r.left + 46.0, r.top, (fin_nom - (r.left + 46.0)).max(0.0), h));
+        }
+    }
+
     /// Corbeille Glyph (O7) : 100 points, allumés selon la place qu'elle occupe ; vidée, ils se dissolvent
     unsafe fn dessiner_corbeille(&self, c: &Cible2D, app: &App, (bx, by): (f32, f32)) {
         const PAS: f32 = 12.0;
@@ -4023,6 +4196,7 @@ impl Rendu {
         }
         let nb = disques_carte(app).count();
         self.dessiner_corbeille(c, app, bloc_carte(l, y0, nb));
+        self.dessiner_stockages_ce_pc(c, app, &stockages_ce_pc(app, l, y0));
         let Some(carte) = carte else { return };
         for (k, (racine, libre, total)) in disques_carte(app).enumerate() {
             let (bx, by) = bloc_carte(l, y0, k);
@@ -4932,6 +5106,54 @@ impl Rendu {
         }
     }
 
+    /// Coupe un titre Doto en deux lignes au plus, aux espaces seulement (un mot à trait d'union reste entier tant qu'il tient)
+    fn lignes_titre(&self, titre: &str, format: &IDWriteTextFormat, largeur: f32) -> Vec<String> {
+        let mut lignes = vec![String::new()];
+        for mot in titre.split_whitespace() {
+            // Un mot plus large que la colonne (« a-rapport-2026.pdf ») : l'ellipse de DirectWrite le réduisait à « a… » (coupe après
+            // le trait d'union). On le coupe par caractères, comme un retour à la ligne de secours ; le reste reste ouvert pour la suite.
+            if self.mesurer_espace(mot, format) > largeur {
+                let mut courant = String::new();
+                for ch in mot.chars() {
+                    let essai = format!("{courant}{ch}");
+                    if !courant.is_empty() && self.mesurer_espace(&essai, format) > largeur {
+                        // De préférence après un « - », « . » ou « _ » (pas de lettre seule orpheline sur la ligne suivante)
+                        let mut reste = String::new();
+                        if let Some(p) = courant.rfind(['-', '.', '_']) {
+                            if p + 1 < courant.len() {
+                                reste = courant.split_off(p + 1);
+                            }
+                        }
+                        if lignes.len() >= 2 {
+                            lignes.last_mut().unwrap().push_str(&courant);
+                        } else if lignes.last().is_some_and(|l| l.is_empty()) {
+                            *lignes.last_mut().unwrap() = courant.clone();
+                            lignes.push(String::new());
+                        } else {
+                            lignes.push(courant.clone());
+                        }
+                        courant = format!("{reste}{ch}");
+                    } else {
+                        courant = essai;
+                    }
+                }
+                lignes.last_mut().unwrap().push_str(&courant);
+                continue;
+            }
+            let essai = match lignes.last() {
+                Some(l) if !l.is_empty() => format!("{l} {mot}"),
+                _ => mot.to_string(),
+            };
+            let premier_mot = lignes.last().is_some_and(|l| l.is_empty());
+            if premier_mot || lignes.len() >= 2 || self.mesurer_espace(&essai, format) <= largeur {
+                *lignes.last_mut().unwrap() = essai;
+            } else {
+                lignes.push(mot.to_string());
+            }
+        }
+        lignes
+    }
+
     /// Colonne de droite de la palette : titre en Doto, description, puis le dessin de la commande (apparition `vin` : 350 ms au ressort)
     unsafe fn dessiner_apercu_palette(&self, c: &Cible2D, a: &palette::ApercuPalette, zone: D2D_RECT_F, vin: f32) {
         let f = &self.f;
@@ -4939,8 +5161,11 @@ impl Rendu {
         let (x, y) = (zone.left + 20.0, zone.top + 18.0);
         let l = zone.right - zone.left - 40.0;
         self.couleur(c, &BLANC);
-        // Deux lignes de titre au plus (Doto 20, interligne 1,15) : une troisième serait coupée par « … »
-        self.texte_espace(c, &f.apercu_titre, &a.titre, rect(x, y, l, 56.0));
+        // Deux lignes de titre au plus (Doto 20, interligne 1,15), coupées aux espaces : DirectWrite casse aussi après un trait d'union
+        // (« COPIER-COLLER » devenait « COPIER- » / « COLLER »)
+        for (k, ligne) in self.lignes_titre(&a.titre, &f.apercu_titre, l).iter().enumerate() {
+            self.texte_espace(c, &f.apercu_titre, ligne, rect(x, y + k as f32 * 28.0, l, 28.0));
+        }
         self.couleur(c, &BLANC_DOUX);
         self.texte(c, &f.carte_desc, &a.description, rect(x, y + 56.0 + 10.0, l, 54.0));
         let haut_art = y + 56.0 + 10.0 + 54.0 + 14.0;
@@ -5523,25 +5748,56 @@ impl Rendu {
         *self.zones_historique.borrow_mut() = ZonesHistorique { tiroir: Some(decale(z)), boutons: boutons.into_iter().map(|(r, id)| (decale(r), id)).collect() };
     }
 
-    /// Coup d'œil : l'élément choisi en grand (galerie photo avec ← →)
-    unsafe fn dessiner_galerie(&self, c: &Cible2D, (g, k, n): (&Galerie, usize, usize), l: f32, h: f32) {
+    /// Carte flottante du coup d'œil (x, y, largeur, hauteur) : marge de 60 DIP de chaque côté, sous la barre de titre
+    pub(crate) fn rect_galerie(l: f32, h: f32) -> [f32; 4] {
+        let w = (l - 120.0).clamp(320.0, 1200.0);
+        [(l - w) / 2.0, HAUTEUR_TITRE + 32.0, w, (h - HAUTEUR_TITRE - 64.0).max(240.0)]
+    }
+
+    /// Zone de l'image dans la carte du coup d'œil (x, y, largeur, hauteur en DIP) pour une fenêtre de `l` × `h` DIP
+    pub(crate) fn zone_image_galerie(l: f32, h: f32) -> [f32; 4] {
+        let [x, y, w, hc] = Self::rect_galerie(l, h);
+        [x + 24.0, y + 24.0, w - 48.0, hc - 120.0]
+    }
+
+    /// Ligne de détail du coup d'œil : type, taille, date, puis la page (« PAGE 3 / 12 ») et ce qu'elle montre (« TEXTE EXTRAIT »)
+    fn detail_galerie(g: &Galerie) -> String {
+        let mut d = g.detail.clone();
+        if g.pages > 1 {
+            d.push_str(&format!(" · PAGE {} / {}", g.page + 1, g.pages));
+        }
+        if g.zoom > 1.005 {
+            d.push_str(&format!(" · ZOOM {} %", (g.zoom * 100.0).round() as u32));
+        }
+        if !g.nature.is_empty() {
+            d.push_str(" · ");
+            d.push_str(g.nature);
+        }
+        d
+    }
+
+    /// Coup d'œil : l'élément choisi en grand (galerie photo avec ← →, pages avec ↑ ↓)
+    unsafe fn dessiner_galerie(&self, c: &Cible2D, (g, k, n): (&Galerie, usize, usize), carte: D2D_RECT_F) {
         let rt = &c.rt;
         let f = &self.f;
-        self.couleur(c, &rgba(0, 0, 0, 0.97));
-        rt.FillRectangle(&rect(0.0, HAUTEUR_TITRE + 1.0, l, h - HAUTEUR_TITRE - 1.0), &c.pinceau);
-        self.trame_plein(c, &rect(0.0, HAUTEUR_TITRE + 1.0, l, h - HAUTEUR_TITRE - 1.0));
-        let zone = rect(40.0, HAUTEUR_TITRE + 24.0, l - 80.0, h - HAUTEUR_TITRE - 120.0);
+        // Tout est posé dans la carte flottante `carte` (la carte elle-même est peinte par l'appelant)
+        let (x0, y0, l, h) = (carte.left, carte.top, carte.right - carte.left, carte.bottom - carte.top);
+        let zone = rect(x0 + 24.0, y0 + 24.0, l - 48.0, h - 120.0);
         let mut dessinee = false;
         if let Some(img) = &g.image {
             let mut cache = c.galerie.borrow_mut();
-            if cache.as_ref().map_or(true, |(num, _)| *num != g.numero) {
-                *cache = self.bitmap(c, img).map(|b| (g.numero, b));
+            // Clé : l'élément et la version de l'image (une autre page est une autre image)
+            let cle = (g.numero << 20) | u64::from(g.version & 0xF_FFFF);
+            if cache.as_ref().is_none_or(|(num, _)| *num != cle) {
+                *cache = self.bitmap(c, img).map(|b| (cle, b));
             }
             if let Some((_, b)) = cache.as_ref() {
-                let k = ((zone.right - zone.left) / img.largeur as f32).min((zone.bottom - zone.top) / img.hauteur as f32).min(3.0);
-                let (iw, ih) = (img.largeur as f32 * k, img.hauteur as f32 * k);
-                let r = rect(zone.left + (zone.right - zone.left - iw) / 2.0, zone.top + (zone.bottom - zone.top - ih) / 2.0, iw, ih);
+                // Zoom et déplacement : l'image est rognée à la zone (elle peut la dépasser)
+                let [ix, iy, iw, ih] = g.rect_image((img.largeur, img.hauteur), (zone.right - zone.left, zone.bottom - zone.top));
+                let r = rect(zone.left + ix, zone.top + iy, iw, ih);
+                rt.PushAxisAlignedClip(&zone, D2D1_ANTIALIAS_MODE_ALIASED);
                 rt.DrawBitmap(b, Some(&r), 1.0, D2D1_BITMAP_INTERPOLATION_MODE_LINEAR, None);
+                rt.PopAxisAlignedClip();
                 dessinee = true;
             }
         }
@@ -5556,15 +5812,16 @@ impl Rendu {
                 self.texte(c, &f.petit_centre, "…", rect(zone.left, cy - 12.0, zone.right - zone.left, 24.0));
             }
         }
-        let yb = h - 84.0;
+        let yb = y0 + h - 84.0;
         self.couleur(c, &BLANC);
-        self.texte(c, &f.petit_centre, &g.nom.to_uppercase(), rect(80.0, yb, l - 160.0, 26.0));
+        self.texte(c, &f.petit_centre, &g.nom.to_uppercase(), rect(x0 + 40.0, yb, l - 80.0, 26.0));
         self.couleur(c, &BLANC_DOUX);
-        self.texte(c, &f.petit_centre, &g.detail, rect(80.0, yb + 24.0, l - 160.0, 22.0));
-        self.aide(c, "← → : PRECEDENT / SUIVANT · ESPACE / ECHAP : FERMER · ENTREE : OUVRIR", rect(24.0, h - 34.0, l - 200.0, 24.0), Pose::Gauche, &BLANC_TRES_FAIBLE);
+        self.texte(c, &f.petit_centre, &Self::detail_galerie(g), rect(x0 + 40.0, yb + 24.0, l - 80.0, 22.0));
+        let aide = if g.pages > 1 { "← → : ELEMENT · ↑ ↓ / MOLETTE : PAGE · CTRL+MOLETTE : ZOOM · ESPACE : FERMER · ENTREE : OUVRIR" } else { "← → : ELEMENT · CTRL+MOLETTE / + − 0 : ZOOM · ESPACE : FERMER · ENTREE : OUVRIR" };
+        self.aide(c, aide, rect(x0 + 24.0, y0 + h - 34.0, l - 24.0 - 120.0, 24.0), Pose::Gauche, &BLANC_TRES_FAIBLE);
         // Position en points : où l'on est dans le dossier
         self.couleur(c, &BLANC_DOUX);
-        self.texte(c, &f.petit_droite, &format!("{} / {}", k + 1, n), rect(l - 160.0, h - 34.0, 136.0, 24.0));
+        self.texte(c, &f.petit_droite, &format!("{} / {}", k + 1, n), rect(x0 + l - 24.0 - 96.0, y0 + h - 34.0, 96.0, 24.0));
     }
 
     /// Texte de description coupé à deux lignes de `largeur` (avec « … » si besoin) et son nombre de lignes (1 ou 2).
@@ -5802,7 +6059,13 @@ impl Rendu {
         rt.FillRectangle(&rect(0.0, ys, l, 1.0), &c.pinceau);
         // Pixel occupe le bord gauche de la barre d'état (il est dessiné par la fenêtre, une seule fois)
         let decalage = if premier { PIXEL_DECALAGE } else { 0.0 };
-        let zone = rect(gauche + decalage, ys, droite - gauche - decalage, STATUT_H);
+        // Les trois gestes du pied (OUVRIR · APERÇU · RÉGLAGES) sont dessinés à droite par la fenêtre : on leur réserve leur
+        // place, sinon l'aide longue passe dessous (P2-01 de l'audit du 14/11 : pastilles chevauchées, « RETOUR » coupé)
+        let place_pied = self.largeur_pied() + MARGE_LISTE + 30.0;
+        // Même départ que la barre d'état de la liste : Pixel est dessiné au même endroit dans les deux vues (ici l'aide
+        // commençait trop à gauche et passait sous ses yeux)
+        let depart = (largeur_volet() + MARGE_LISTE).max(gauche) + decalage;
+        let zone = rect(depart, ys, (droite - depart - place_pied).max(0.0), STATUT_H);
         match app.annonce.as_ref().filter(|a| a.2.elapsed() < crate::app::DUREE_ANNONCE) {
             Some((texte, erreur, _)) => {
                 self.couleur(c, if *erreur { &ERREUR } else { &BLANC });
@@ -5959,6 +6222,21 @@ mod tests {
     fn carres_d_etiquette_de_la_maquette() {
         assert_eq!([largeur_etiquette(1), largeur_etiquette(2), largeur_etiquette(3)], [5.0, 12.0, 19.0]);
         assert_eq!(largeur_etiquette(0), 0.0);
+    }
+
+    /// Carte flottante de l'aperçu Espace : centrée, sous la barre de titre, bornée en largeur et jamais plus basse que la fenêtre
+    #[test]
+    fn carte_flottante_de_la_galerie_centree_et_bornee() {
+        for (l, h) in [(1280.0_f32, 800.0_f32), (500.0, 600.0), (3000.0, 1400.0), (320.0, 200.0)] {
+            let [x, y, w, hc] = Rendu::rect_galerie(l, h);
+            assert!((320.0..=1200.0).contains(&w), "largeur {w} pour {l}");
+            assert!((x + w / 2.0 - l / 2.0).abs() < 0.01, "centrée pour {l}");
+            assert_eq!(y, HAUTEUR_TITRE + 32.0);
+            assert!(hc >= 240.0);
+            if h >= HAUTEUR_TITRE + 64.0 + 240.0 {
+                assert!(y + hc <= h - 31.9, "la carte tient dans la fenêtre {l}x{h}");
+            }
+        }
     }
 
     fn touches(r: &str) -> Vec<String> {

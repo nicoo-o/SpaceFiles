@@ -6,7 +6,7 @@
 // récursive de chaque disque (ReadDirectoryChangesW). Le même index sert à la palette et servira au B4.
 
 use std::collections::HashSet;
-use std::io::{Read, Write};
+use std::io::Read;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 
@@ -249,15 +249,9 @@ fn encoder(index: &Index) -> Vec<u8> {
 
 fn enregistrer(index: &Index) {
     let Some(f) = fichier_index() else { return };
-    if let Some(d) = f.parent() {
-        let _ = std::fs::create_dir_all(d);
-    }
     let octets = encoder(index);
-    // Écrit à côté puis remplace : une autre fenêtre ne lit jamais un fichier à moitié écrit
-    let tmp = f.with_extension("tmp");
-    if std::fs::File::create(&tmp).and_then(|mut h| h.write_all(&octets)).is_ok() {
-        let _ = std::fs::rename(&tmp, &f);
-    }
+    // Écriture atomique commune : une autre fenêtre ne lit jamais un fichier à moitié écrit
+    crate::atomique::ecrire_journalise(&f, &octets, "index");
 }
 
 fn charger() -> Option<Index> {
@@ -391,7 +385,7 @@ fn demarrer_verrouille() {
     std::thread::spawn(move || {
         let index = charger();
         let supprime = EFFACEMENTS.load(Ordering::SeqCst) != efface;
-        let vieux = !supprime && index.as_ref().map_or(true, |i| secondes().saturating_sub(i.construit) > AGE_MAX_S);
+        let vieux = !supprime && index.as_ref().is_none_or(|i| secondes().saturating_sub(i.construit) > AGE_MAX_S);
         if let Some(i) = index.filter(|_| !supprime) {
             installer(i);
         }

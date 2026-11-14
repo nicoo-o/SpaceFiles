@@ -57,10 +57,10 @@ pub fn encoder(chemin: &str, reveler: bool, tick: u64) -> Vec<u16> {
 /// de 64 Ko, longueur impaire (UTF-16 tronqué), surrogate isolé, pas de `\n`, drapeau autre que `0` / `1`, instant qui n'est
 /// pas un entier décimal, chemin que `valider_chemin` refuse (relatif, programme, URL, périphérique, contrôle…).
 pub fn decoder(octets: &[u8]) -> Option<Charge> {
-    if octets.len() > CHARGE_MAX || octets.len() % 2 != 0 {
+    if octets.len() > CHARGE_MAX || !octets.len().is_multiple_of(2) {
         return None;
     }
-    let unites: Vec<u16> = octets.chunks_exact(2).map(|p| u16::from_le_bytes([p[0], p[1]])).collect();
+    let unites: Vec<u16> = octets.as_chunks::<2>().0.iter().map(|p| u16::from_le_bytes([p[0], p[1]])).collect();
     // Strict : un surrogate isolé est un refus, pas un caractère de remplacement
     let texte = String::from_utf16(&unites).ok()?;
     let (drapeau, reste) = texte.split_once('\n')?;

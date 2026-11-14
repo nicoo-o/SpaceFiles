@@ -942,7 +942,7 @@ fn rechercher(racine: &str, motif: &str, caches: bool) -> Vec<Entree> {
             if matches!(e.genre, Genre::Dossier) && !e.lien {
                 a_lire.push_back(joindre(&dossier, &e.nom));
             }
-            if filtre.accepte(&e, maintenant) && filtre.etiquette().map_or(true, |n| crate::etiquettes::de(&joindre(&dossier, &e.nom)) == Some(n)) {
+            if filtre.accepte(&e, maintenant) && filtre.etiquette().is_none_or(|n| crate::etiquettes::de(&joindre(&dossier, &e.nom)) == Some(n)) {
                 e.parent = Some(parent.clone());
                 resultats.push(e);
             }

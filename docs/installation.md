@@ -3,6 +3,23 @@
 Tout se passe dans le profil de l'utilisateur (`HKEY_CURRENT_USER`, `%LOCALAPPDATA%`, `%APPDATA%`) : aucun droit
 d'administrateur. Scripts PowerShell 5.1, à lancer depuis la racine du dépôt.
 
+## Avant d'installer : prérequis et avertissements
+
+- **Windows 11.** Le programme n'a aucune autre dépendance à installer.
+- **WebView2 (facultatif).** Il ne sert qu'au coup d'œil (Espace) sur les pages HTML, XHTML, MHTML et SVG ; il est livré
+  avec Windows 11. S'il manque, le programme le détecte au démarrage de la visionneuse (`webvue::disponible`) et le coup
+  d'œil montre le texte de la page au lieu de la page rendue ; rien d'autre ne change.
+- **L'exécutable n'est pas signé.** Windows (SmartScreen) peut afficher « Windows a protégé votre ordinateur » à
+  l'ouverture d'un exe téléchargé : ce n'est pas une alerte sur son contenu, seulement l'absence de signature payante.
+  Pour vérifier que l'exe est bien celui annoncé, comparer son empreinte SHA-256 à celle publiée avec la version :
+
+  ```powershell
+  Get-FileHash -Algorithm SHA256 .\spacefiles.exe
+  .\tools\install\empreinte.ps1      # sur la machine qui compile : calcule l'empreinte à publier
+  ```
+
+  Le plus sûr reste de compiler soi-même (`cargo build --release`).
+
 ## Installer
 
 ```powershell

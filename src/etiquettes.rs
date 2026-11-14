@@ -144,13 +144,7 @@ fn sauver(m: &Carte) {
         return;
     }
     let Some(p) = chemin_fichier() else { return };
-    if let Some(d) = p.parent() {
-        let _ = std::fs::create_dir_all(d);
-    }
-    let tmp = p.with_extension("txt.tmp");
-    if std::fs::write(&tmp, ecrire(m)).is_ok() && std::fs::rename(&tmp, &p).is_err() {
-        let _ = std::fs::remove_file(&tmp);
-    }
+    crate::atomique::ecrire_journalise(&p, ecrire(m).as_bytes(), "etiquettes");
 }
 
 fn avec<R>(f: impl FnOnce(&mut Carte) -> R) -> R {

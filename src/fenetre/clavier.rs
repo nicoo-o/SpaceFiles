@@ -327,7 +327,9 @@ pub(crate) unsafe fn touche_lot(hwnd: HWND, f: &mut Fenetre, vk: VIRTUAL_KEY, ct
     }
 }
 
-pub(crate) unsafe fn touche_galerie(hwnd: HWND, f: &mut Fenetre, vk: VIRTUAL_KEY) {
+/// Coup d'œil : ← → passent à l'élément voisin ; ↑ ↓ et PgUp PgDn tournent les pages quand il y en a plusieurs (PDF, document,
+/// long texte, archive, TIFF…), sinon ils passent aussi à l'élément voisin ; Ctrl+Début / Ctrl+Fin : première / dernière page.
+pub(crate) unsafe fn touche_galerie(hwnd: HWND, f: &mut Fenetre, vk: VIRTUAL_KEY, ctrl: bool) {
     let n = f.app.entrees.len() as i64;
     let i = f.app.selection.unwrap_or(0) as i64;
     let aller = |f: &mut Fenetre, k: i64| {
@@ -337,8 +339,27 @@ pub(crate) unsafe fn touche_galerie(hwnd: HWND, f: &mut Fenetre, vk: VIRTUAL_KEY
             ouvrir_galerie(hwnd, f);
         }
     };
+    let plusieurs_pages = f.galerie.as_ref().is_some_and(|g| g.pages > 1);
+    let zoome = f.galerie.as_ref().is_some_and(|g| g.zoom > 1.005);
+    let web = f.galerie.as_ref().is_some_and(|g| g.web);
+    let maj = GetKeyState(VK_SHIFT.0 as i32) < 0;
     match vk {
         VK_ESCAPE | VK_SPACE => f.galerie = None,
+        // Zoom au clavier : + / − (rangée du haut ou pavé numérique), 0 revient à l'ajustement
+        VK_OEM_PLUS | VK_ADD => zoomer_galerie(hwnd, f, 1.25, None),
+        VK_OEM_MINUS | VK_SUBTRACT => zoomer_galerie(hwnd, f, 0.8, None),
+        VK_NUMPAD0 | VIRTUAL_KEY(0x30) => ajuster_galerie(hwnd, f),
+        // Maj + flèches : déplace l'image zoomée (sans zoom, elles gardent leur sens habituel)
+        VK_LEFT if maj && zoome => deplacer_galerie(hwnd, f, 80.0, 0.0),
+        VK_RIGHT if maj && zoome => deplacer_galerie(hwnd, f, -80.0, 0.0),
+        VK_UP if maj && zoome => deplacer_galerie(hwnd, f, 0.0, 80.0),
+        VK_DOWN if maj && zoome => deplacer_galerie(hwnd, f, 0.0, -80.0),
+        // Page web : le clavier reste à la fenêtre (Espace, Entrée, Échap, ← → y fonctionnent) ; la page défile par script de l'hôte
+        VK_UP | VK_DOWN | VK_PRIOR | VK_NEXT | VK_HOME | VK_END if web => crate::webvue::defiler(vk.0),
+        VK_UP | VK_PRIOR if plusieurs_pages => page_galerie(hwnd, f, |p, _| p.saturating_sub(1)),
+        VK_DOWN | VK_NEXT if plusieurs_pages => page_galerie(hwnd, f, |p, _| p.saturating_add(1)),
+        VK_HOME if ctrl && plusieurs_pages => page_galerie(hwnd, f, |_, _| 0),
+        VK_END if ctrl && plusieurs_pages => page_galerie(hwnd, f, |_, n| n - 1),
         VK_LEFT | VK_UP | VK_PRIOR => aller(f, i - 1),
         VK_RIGHT | VK_DOWN | VK_NEXT => aller(f, i + 1),
         VK_HOME => aller(f, 0),
@@ -350,5 +371,73 @@ pub(crate) unsafe fn touche_galerie(hwnd: HWND, f: &mut Fenetre, vk: VIRTUAL_KEY
             }
         }
         _ => {}
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn nul() -> HWND {
+        HWND(std::ptr::null_mut())
+    }
+
+    /// Frappe une touche sans Ctrl : ni le presse-papiers ni la fenêtre ne sont touchés, le HWND nul ne sert donc pas.
+    fn taper(ed: &mut Edition, vk: VIRTUAL_KEY, maj: bool) -> bool {
+        unsafe { editer(nul(), ed, vk, false, maj) }
+    }
+
+    #[test]
+    fn les_fleches_deplacent_le_curseur_sans_toucher_au_texte() {
+        let mut ed = Edition::champ("abc");
+        assert_eq!(ed.curseur, 3);
+        assert!(taper(&mut ed, VK_LEFT, false));
+        assert_eq!(ed.curseur, 2);
+        assert!(taper(&mut ed, VK_HOME, false));
+        assert_eq!(ed.curseur, 0);
+        assert!(taper(&mut ed, VK_RIGHT, false));
+        assert_eq!(ed.curseur, 1);
+        assert!(taper(&mut ed, VK_END, false));
+        assert_eq!(ed.curseur, 3);
+        assert_eq!(ed.valeur(), "abc");
+    }
+
+    #[test]
+    fn maj_et_fleche_etend_la_selection_depuis_l_ancre() {
+        let mut ed = Edition::champ("abc");
+        assert!(taper(&mut ed, VK_LEFT, true));
+        assert!(taper(&mut ed, VK_LEFT, true));
+        assert_eq!(ed.selection(), (1, 3));
+        assert_eq!(ed.texte_choisi(), "bc");
+    }
+
+    #[test]
+    fn retour_arriere_et_suppr_effacent_de_chaque_cote_du_curseur() {
+        let mut ed = Edition::champ("abc");
+        assert!(taper(&mut ed, VK_BACK, false));
+        assert_eq!(ed.valeur(), "ab");
+        assert!(taper(&mut ed, VK_HOME, false));
+        assert!(taper(&mut ed, VK_DELETE, false));
+        assert_eq!(ed.valeur(), "b");
+        // Au bord du texte, rien à effacer et rien ne plante
+        assert!(taper(&mut ed, VK_BACK, false));
+        assert_eq!(ed.valeur(), "b");
+    }
+
+    #[test]
+    fn ctrl_a_choisit_tout_le_texte() {
+        let mut ed = Edition::champ("abc");
+        assert!(unsafe { editer(nul(), &mut ed, VK_A, true, false) });
+        assert_eq!(ed.texte_choisi(), "abc");
+    }
+
+    #[test]
+    fn une_touche_non_prise_est_rendue_a_l_appelant() {
+        let mut ed = Edition::champ("abc");
+        assert!(!taper(&mut ed, VK_F5, false));
+        assert!(!taper(&mut ed, VK_ESCAPE, false));
+        // A sans Ctrl est une lettre : elle arrive par WM_CHAR, pas ici
+        assert!(!taper(&mut ed, VK_A, false));
+        assert_eq!(ed.valeur(), "abc");
     }
 }

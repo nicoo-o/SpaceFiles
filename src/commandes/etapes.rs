@@ -149,8 +149,10 @@ pub(crate) unsafe fn executer_etape(hwnd: HWND, f: &mut Fenetre, ex: Execution) 
             }
         }
         CommandeEl::CopierVers | CommandeEl::DeplacerVers | CommandeEl::Corbeille | CommandeEl::CompresserVers => {
-            if occupe(f) {
-                finir(f, Resultat::erreur("Une autre opération est en cours : réessayez dans un instant"));
+            // Une opération tourne déjà dans cet onglet : celle-ci se met en file derrière elle (`App::lancer_puis`) et part toute seule. Seule
+            // une carte de conflits ouverte dans un AUTRE onglet la refuse : une seule carte se montre à la fois.
+            if f.apps().any(|a| a.conflits.is_some()) && f.app.conflits.is_none() {
+                finir(f, Resultat::erreur("Une carte de conflits attend une réponse dans un autre onglet : répondez-y d'abord"));
                 return;
             }
             let dest = ex.dossier.clone().unwrap_or_default();
@@ -185,6 +187,20 @@ pub(crate) unsafe fn executer_etape(hwnd: HWND, f: &mut Fenetre, ex: Execution) 
                 synchroniser_palette(f);
             }
             f.remplir_palette();
+        }
+        CommandeEl::RaccourciVers => {
+            let dest = ex.dossier.clone().unwrap_or_default();
+            if assistant::destination_distante(&dest) {
+                finir(f, Resultat::erreur("Destination réseau : la palette n'y crée pas de raccourci (la fenêtre attendrait le réseau)"));
+                return;
+            }
+            match f.app.creer_raccourcis_vers(hwnd, &chemins, &dest) {
+                Ok((n, id)) => {
+                    let message = if n > 1 { format!("{n} raccourcis créés dans {}", assistant::nom_de(&dest)) } else { format!("Raccourci créé dans {}", assistant::nom_de(&dest)) };
+                    finir(f, Resultat::ok_avec_entree(message, id));
+                }
+                Err(e) => finir(f, Resultat::erreur(e)),
+            }
         }
         CommandeEl::Renommer => {
             let nom = ex.nom.clone().unwrap_or_default();

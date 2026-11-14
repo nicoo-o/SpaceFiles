@@ -62,7 +62,7 @@ fn racine_de_lecteur(c: &str) -> bool {
 /// - un dossier, sans `reveler` : ouvert, rien de sélectionné ;
 /// - sinon (un fichier, un chemin qui n'existe pas, ou `reveler`) : le dossier parent, l'élément sélectionné ;
 /// - `\\hôte` et la racine d'un lecteur n'ont pas de parent : ouverts tels quels.
-/// Jamais l'Explorateur de Windows, jamais l'exécution du fichier. Les `\` finaux sont ignorés (`C:\a\` = `C:\a`).
+///   Jamais l'Explorateur de Windows, jamais l'exécution du fichier. Les `\` finaux sont ignorés (`C:\a\` = `C:\a`).
 pub(crate) fn resoudre_ouverture(chemin: &str, reveler: bool, est_dossier: impl Fn(&str) -> bool) -> (String, Option<String>) {
     let c = chemin.trim();
     if racine_de_lecteur(c) {
@@ -330,7 +330,7 @@ pub(crate) fn poser_marqueur() {
     let avant = std::fs::read_to_string(&c).unwrap_or_default();
     // Les processus morts d'un arrêt anormal ancien ne doivent pas retenir le fichier : on ne garde que les vivants
     let vivants: String = avant.lines().filter_map(|l| l.trim().parse::<u32>().ok()).filter(|p| processus_vivant(*p)).map(|p| format!("{p}\n")).collect();
-    let _ = std::fs::write(&c, marqueur_avec(&vivants, std::process::id()));
+    crate::atomique::ecrire_journalise(&c, marqueur_avec(&vivants, std::process::id()).as_bytes(), "session");
 }
 
 /// Fermeture normale (ou fin de session Windows) : notre processus sort du marqueur, le fichier part avec le dernier
@@ -340,7 +340,7 @@ pub(crate) fn lever_marqueur() {
     if reste.is_empty() {
         let _ = std::fs::remove_file(&c);
     } else {
-        let _ = std::fs::write(&c, reste);
+        crate::atomique::ecrire_journalise(&c, reste.as_bytes(), "session");
     }
 }
 

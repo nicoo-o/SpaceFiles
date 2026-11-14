@@ -179,7 +179,7 @@ pub const COMMANDES: &[(Commande, &str, &str, &str)] = &[
     (Commande::Doublons, "CHERCHER LES DOUBLONS ICI", "", "doublons identiques copies place gagner nettoyer"),
     (Commande::Chronologie, "CHRONOLOGIE EN POINTS", "", "jours dates calendrier frise timeline"),
     (Commande::Note, "NOTE DU DOSSIER…", "", "note memo post-it commentaire epingler rappel"),
-    (Commande::RegleRangement, "REGLE DE RANGEMENT… (PDF > DOSSIER)", "", "ranger rangement regle trier telechargements automatique hazel"),
+    (Commande::RegleRangement, "RÈGLE DE RANGEMENT… (PDF > DOSSIER)", "", "ranger rangement regle trier telechargements automatique hazel"),
     (Commande::LignesDossier, "DENSITE DES LIGNES DE CE DOSSIER : COMPACT / CONFORT", "", "compacte confort hauteur lignes dossier"),
     (Commande::DossierParDefaut, "CE DOSSIER : COLONNES ET LIGNES PAR DEFAUT", "", "oublier reinitialiser colonnes lignes dossier"),
     (Commande::AjouterPlateau, "AJOUTER LA SELECTION AU PLATEAU", "", "plateau tampon temporaire depot panier etagere"),
@@ -475,12 +475,6 @@ pub struct Palette {
 /// Délai entre Entrée et le lancement : les yeux de Pixel passent contents (`palRun`, 160 ms)
 pub const LANCEMENT_MS: u32 = 160;
 
-/// Mode essai seulement (`SPACEFILES_SANS_REGISTRE=1` et `SPACEFILES_PALETTE_OUVERTE=1`) : la palette est ouverte au lancement, pour les
-/// captures faites sans clavier (Ctrl+Maj+P ne peut pas être posté : il lit l'état réel des touches). Faux en usage normal.
-pub fn ouverte_par_essai() -> bool {
-    crate::defaut::sans_registre() && std::env::var("SPACEFILES_PALETTE_OUVERTE").is_ok_and(|v| v.trim() == "1")
-}
-
 /// Une ligne de la liste : titre de groupe (`.gh`) ou élément (rang dans `Palette::items`)
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum LignePal {
@@ -688,11 +682,15 @@ pub fn score(texte: &str, requete: &str) -> Option<i32> {
     if requete.is_empty() {
         return Some(0);
     }
-    let t: Vec<char> = texte.to_lowercase().chars().collect();
-    let r: Vec<char> = requete.to_lowercase().chars().filter(|c| !c.is_whitespace()).collect();
-    if let Some(i) = texte.to_lowercase().find(&requete.to_lowercase()) {
+    // Sans accent ni casse : « regl » doit trouver « RÉGLAGES » comme sous-chaîne exacte, sinon une commande à lettres éparses la
+    // devance (audit P2-06)
+    let texte_n = crate::dossier::normaliser(texte);
+    let requete_n = crate::dossier::normaliser(requete);
+    let t: Vec<char> = texte_n.chars().collect();
+    let r: Vec<char> = requete_n.chars().filter(|c| !c.is_whitespace()).collect();
+    if let Some(i) = texte_n.find(&requete_n) {
         // Sous-chaîne exacte : le meilleur cas, surtout au début
-        return Some(1000 - i as i32 * 3 - t.len() as i32);
+        return Some(1000 - texte_n[..i].chars().count() as i32 * 3 - t.len() as i32);
     }
     let (mut j, mut s, mut precedent) = (0usize, 0i32, usize::MAX);
     for (i, &c) in t.iter().enumerate() {
@@ -705,9 +703,17 @@ pub fn score(texte: &str, requete: &str) -> Option<i32> {
     (j == r.len()).then_some(s - t.len() as i32 / 4)
 }
 
+/// Les mots-clés d'une commande ne comptent que s'ils contiennent la requête en entier : en lettres éparses, « regl » trouvait
+/// « groupe tag etiquette collection » et « AJOUTER À UN GROUPE… » passait devant « RÉGLAGES » (audit P2-06)
+fn mots_contiennent(mots: &str, requete: &str) -> bool {
+    let r = crate::dossier::normaliser(requete);
+    let r = r.trim();
+    !r.is_empty() && crate::dossier::normaliser(mots).contains(r)
+}
+
 fn nom_court(chemin: &str) -> String {
-    if chemin.starts_with('?') {
-        return format!("« {} »", &chemin[1..]).to_uppercase();
+    if let Some(reste) = chemin.strip_prefix('?') {
+        return format!("« {reste} »").to_uppercase();
     }
     chemin.trim_end_matches('\\').rsplit('\\').next().unwrap_or(chemin).to_uppercase()
 }
@@ -807,12 +813,12 @@ impl Palette {
     pub fn pied(&self) -> (String, Vec<(&'static str, &'static str)>) {
         let param = self.commande.map(|c| assistant::def(c).param);
         match self.etape {
-            Etape::Element => (format!("1 · ÉLÉMENT · {}", self.items.len()), vec![("↑↓", "choisir"), ("→ / ↵", "suivant"), ("ÉCHAP", "fermer")]),
-            Etape::Commande => ("2 · COMMANDE".to_string(), vec![("↑↓", "choisir"), ("← / ⌫", "retour"), ("→ / ↵", "suivant")]),
+            Etape::Element => (format!("ÉTAPE 1/3 · {} {}", self.items.len(), if self.items.len() > 1 { "ÉLÉMENTS" } else { "ÉLÉMENT" }), vec![("↑↓", "choisir"), ("→ / ↵", "suivant"), ("ÉCHAP", "fermer")]),
+            Etape::Commande => ("ÉTAPE 2/3 · COMMANDE".to_string(), vec![("↑↓", "choisir"), ("← / ⌫", "retour"), ("→ / ↵", "suivant")]),
             Etape::Parametre => match param {
-                Some(Param::Destination) => ("3 · DESTINATION".to_string(), vec![("← / ⌫", "retour"), ("→ / ↵", "entrer"), ("CTRL ↵", "ici")]),
-                Some(Param::Nom) => ("3 · NOM".to_string(), vec![("⌫", "retour"), ("↵", "valider")]),
-                _ => ("3 · CONFIRMATION".to_string(), vec![("← / ⌫", "retour"), ("→ / ↵", "confirmer")]),
+                Some(Param::Destination) => ("ÉTAPE 3/3 · DESTINATION".to_string(), vec![("← / ⌫", "retour"), ("→ / ↵", "entrer"), ("CTRL ↵", "ici")]),
+                Some(Param::Nom) => ("ÉTAPE 3/3 · NOM".to_string(), vec![("⌫", "retour"), ("↵", "valider")]),
+                _ => ("ÉTAPE 3/3 · CONFIRMATION".to_string(), vec![("← / ⌫", "retour"), ("→ / ↵", "confirmer")]),
             },
             Etape::Progression => ("EN COURS".to_string(), vec![("ÉCHAP", "fermer")]),
             Etape::Resultat => ("TERMINÉ".to_string(), vec![("← / ⌫", "retour"), ("→ / ↵", "choisir"), ("CTRL Z", "annuler"), ("ÉCHAP", "fermer")]),
@@ -876,7 +882,7 @@ impl Palette {
                     v.push(item(format!("CREER LE GROUPE « {q} »"), "NOUVEAU".into(), Action::MettreDansGroupe(q.clone())));
                 }
                 let mut existants: Vec<(i32, &crate::groupes::Groupe)> = s.groupes.iter().filter_map(|g| score(&g.nom, &q).map(|sc| (sc, g))).collect();
-                existants.sort_by(|a, b| b.0.cmp(&a.0));
+                existants.sort_by_key(|a| std::cmp::Reverse(a.0));
                 for (_, g) in existants {
                     v.push(item(g.nom.clone(), format!("GROUPE · {} ELEMENT{}", g.nombre, if g.nombre > 1 { "S" } else { "" }), Action::MettreDansGroupe(g.nom.clone())));
                 }
@@ -907,7 +913,7 @@ impl Palette {
             }
             Mode::Regle => {
                 if let Some(r) = crate::rangement::Regle::analyser(&self.requete()) {
-                    v.push(item(format!("AJOUTER : {}", r.libelle()), "REGLE DE RANGEMENT".into(), Action::AjouterRegle(r.ecrire())));
+                    v.push(item(format!("AJOUTER : {}", r.libelle()), "RÈGLE DE RANGEMENT".into(), Action::AjouterRegle(r.ecrire())));
                 }
             }
             Mode::Renommer(ancien) => {
@@ -1012,7 +1018,7 @@ impl Palette {
         if q.is_empty() {
             recents.truncate(RECENTS_SANS_REQUETE);
         } else {
-            recents.sort_by(|a, b| b.0.cmp(&a.0));
+            recents.sort_by_key(|a| std::cmp::Reverse(a.0));
             recents.truncate(8);
         }
         for (_, (c, d, i)) in recents {
@@ -1025,7 +1031,7 @@ impl Palette {
         if q.is_empty() {
             dossier.truncate(DOSSIER_SANS_REQUETE);
         } else {
-            dossier.sort_by(|a, b| b.0.cmp(&a.0));
+            dossier.sort_by_key(|a| std::cmp::Reverse(a.0));
             dossier.truncate(60);
         }
         for (_, (c, d, i)) in dossier {
@@ -1047,8 +1053,8 @@ impl Palette {
             };
             if let Some(sujet) = cible {
                 let mut trouvees: Vec<(i32, &assistant::DefCommande)> =
-                    assistant::TABLE.iter().filter(|d| assistant::indisponible(d.commande, &sujet).is_none()).filter_map(|d| score(d.libelle, q).or_else(|| score(d.mots, q).map(|x| x - 200)).map(|sc| (sc, d))).collect();
-                trouvees.sort_by(|a, b| b.0.cmp(&a.0));
+                    assistant::TABLE.iter().filter(|d| assistant::indisponible(d.commande, &sujet).is_none()).filter_map(|d| score(d.libelle, q).or_else(|| mots_contiennent(d.mots, q).then_some(-200)).map(|sc| (sc, d))).collect();
+                trouvees.sort_by_key(|a| std::cmp::Reverse(a.0));
                 for (_, d) in trouvees.into_iter().take(6) {
                     let mut it = Item::nouveau(d.libelle, format!("SUR {}", sujet.libelle().to_uppercase()), d.icone, Action::CommandeSur(sujet.clone(), d.commande), "SUR L'ÉLÉMENT");
                     it.raccourci = d.raccourci;
@@ -1103,7 +1109,7 @@ impl Palette {
             }
         }
         // Le meilleur score en tête
-        v.sort_by(|a, b| b.0.cmp(&a.0));
+        v.sort_by_key(|a| std::cmp::Reverse(a.0));
         v.truncate(MAX_ELEMENTS);
         v.into_iter().map(|x| x.1).collect()
     }
@@ -1116,7 +1122,7 @@ impl Palette {
         let q = requete.trim();
         let mut v: Vec<(i32, Item)> = Vec::new();
         for d in assistant::TABLE {
-            let Some(sc) = score(d.libelle, q).or_else(|| score(d.mots, q).map(|x| x - 200)) else { continue };
+            let Some(sc) = score(d.libelle, q).or_else(|| mots_contiennent(d.mots, q).then_some(-200)) else { continue };
             let raison = assistant::indisponible(d.commande, sujet);
             let mut it = Item::nouveau(d.libelle, raison.unwrap_or(d.param.annonce()), d.icone, Action::ChoisirCommande(d.commande), if raison.is_some() { "NE S'APPLIQUE PAS ICI" } else { "COMMANDES" });
             it.raccourci = d.raccourci;
@@ -1152,6 +1158,7 @@ impl Palette {
         match c {
             CommandeEl::DeplacerVers => "DÉPLACER ICI",
             CommandeEl::CompresserVers => "COMPRESSER ICI",
+            CommandeEl::RaccourciVers => "CRÉER ICI",
             _ => "COPIER ICI",
         }
     }
@@ -1830,11 +1837,27 @@ mod tests {
     }
 
     #[test]
+    fn les_mots_cles_exigent_la_requete_entiere() {
+        assert!(!mots_contiennent("groupe tag etiquette collection", "regl"), "lettres éparses : pas une correspondance");
+        assert!(mots_contiennent("groupe tag etiquette collection", "étiq"));
+        assert!(!mots_contiennent("groupe", ""));
+    }
+
+    #[test]
     fn scores() {
         assert!(score("TERMINAL · JOURNAL ET OUVERTURE EXTERNE", "term").unwrap() > score("TERMINAL · JOURNAL ET OUVERTURE EXTERNE", "otl").unwrap_or(-9999));
         assert!(score("COMPRESSER EN ZIP", "czip").is_some());
         assert!(score("COMPRESSER EN ZIP", "xyz").is_none());
         assert!(score("terminal", "TER").unwrap() > score("un terminal", "ter").unwrap());
+    }
+
+    #[test]
+    fn score_ignore_les_accents_et_classe_la_sous_chaine_avant_les_lettres_eparses() {
+        // Audit P2-06 : « regl » classait « AJOUTER À UN GROUPE… » avant « RÉGLAGES »
+        let reglages = score("RÉGLAGES", "regl").unwrap();
+        assert!(reglages >= 900, "sous-chaîne exacte sans tenir compte de l'accent : {reglages}");
+        assert!(reglages > score("AJOUTER À UN GROUPE…", "regl").unwrap_or(-9999));
+        assert_eq!(score("REGLES", "règl"), score("REGLES", "regl"), "l'accent de la requête ne change rien");
     }
 
     // ── Étape 1 : l'élément ──

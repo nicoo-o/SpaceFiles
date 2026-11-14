@@ -471,11 +471,40 @@ pub struct Survols {
     appui: bool,
     animer: bool,
     entrees: Vec<EntreeSurvol>,
+    /// Carrés d'étiquette survolés (leur nombre) et depuis quand : même infobulle que la barre (500 ms puis ressort)
+    etiquette: Option<u8>,
+    etiquette_depuis: u64,
 }
 
 impl Survols {
     pub fn nouveau() -> Survols {
-        Survols { courant: Cible::Rien, depuis: 0, appui: false, animer: true, entrees: Vec::new() }
+        Survols { courant: Cible::Rien, depuis: 0, appui: false, animer: true, entrees: Vec::new(), etiquette: None, etiquette_depuis: 0 }
+    }
+
+    /// Une image : les carrés d'étiquette sous le pointeur (`Some(n)`) ou rien. Le délai repart quand on change de carrés.
+    pub fn maj_etiquette(&mut self, n: Option<u8>, t: u64) {
+        if n != self.etiquette {
+            self.etiquette = n;
+            self.etiquette_depuis = t;
+        }
+    }
+
+    /// Infobulle des carrés d'étiquette : (opacité, décalage vertical), comme `bulle`
+    pub fn bulle_etiquette(&self, t: u64) -> Option<(f32, f32)> {
+        self.etiquette?;
+        Self::apparition(self.animer, self.etiquette_depuis, t)
+    }
+
+    fn apparition(animer: bool, depuis: u64, t: u64) -> Option<(f32, f32)> {
+        if !animer {
+            return Some((1.0, 0.0));
+        }
+        let ecoule = t.saturating_sub(depuis);
+        if ecoule < BULLE_DELAI_MS {
+            return None;
+        }
+        let p = ressort((ecoule - BULLE_DELAI_MS) as f32 / BULLE_MS as f32);
+        Some((p.clamp(0.0, 1.0), BULLE_DECALAGE * (1.0 - p)))
     }
 
     /// Une image : `cible` est ce qui est survolé, `appui` le bouton de la souris est enfoncé. Mouvement réduit (`animer` faux) :
@@ -534,7 +563,9 @@ impl Survols {
     }
 
     pub fn en_cours(&self, t: u64) -> bool {
-        self.entrees.iter().any(|e| e.fond.en_cours(t) || e.soulevement.en_cours(t)) || (self.animer && self.bulle_possible() && t < self.depuis + BULLE_DELAI_MS + BULLE_MS)
+        self.entrees.iter().any(|e| e.fond.en_cours(t) || e.soulevement.en_cours(t))
+            || (self.animer && self.bulle_possible() && t < self.depuis + BULLE_DELAI_MS + BULLE_MS)
+            || (self.animer && self.etiquette.is_some() && t < self.etiquette_depuis + BULLE_DELAI_MS + BULLE_MS)
     }
 
     fn bulle_possible(&self) -> bool {
@@ -547,15 +578,7 @@ impl Survols {
         if !self.bulle_possible() {
             return None;
         }
-        if !self.animer {
-            return Some((1.0, 0.0));
-        }
-        let ecoule = t.saturating_sub(self.depuis);
-        if ecoule < BULLE_DELAI_MS {
-            return None;
-        }
-        let p = ressort((ecoule - BULLE_DELAI_MS) as f32 / BULLE_MS as f32);
-        Some((p.clamp(0.0, 1.0), BULLE_DECALAGE * (1.0 - p)))
+        Self::apparition(self.animer, self.depuis, t)
     }
 }
 
@@ -1705,7 +1728,7 @@ impl Mouvements {
             return false;
         }
         let Ok(mut attendues) = ATTENDUES.lock() else { return false };
-        attendues.retain(|a| t.saturating_sub(a.depuis) < ATTENTE_SORTIE_MS && a.jouee.map_or(true, |j| t.saturating_sub(j) < SORTIE_PARTAGEE_MS));
+        attendues.retain(|a| t.saturating_sub(a.depuis) < ATTENTE_SORTIE_MS && a.jouee.is_none_or(|j| t.saturating_sub(j) < SORTIE_PARTAGEE_MS));
         if attendues.is_empty() {
             return false;
         }
@@ -2288,6 +2311,28 @@ mod tests {
         assert!(!s.en_cours(10));
         assert!(s.soulevements(10).is_empty());
         assert_eq!(s.bulle(10), None, "pas d'infobulle sur une ligne");
+    }
+
+    #[test]
+    fn bulle_d_etiquette_delai_de_500_ms_et_repart_quand_on_change_de_carres() {
+        let mut s = Survols::nouveau();
+        assert_eq!(s.bulle_etiquette(0), None, "aucun carré survolé : pas de bulle");
+        s.maj_etiquette(Some(2), 1000);
+        assert_eq!(s.bulle_etiquette(1000 + BULLE_DELAI_MS - 1), None);
+        let (o, _) = s.bulle_etiquette(1000 + BULLE_DELAI_MS + 10).expect("elle paraît");
+        assert!(o > 0.0 && o < 1.0);
+        assert!(s.en_cours(1000 + BULLE_DELAI_MS + 10));
+        s.maj_etiquette(Some(2), 1600);
+        assert!(s.bulle_etiquette(1000 + BULLE_DELAI_MS + BULLE_MS).is_some(), "même carré : le délai ne repart pas");
+        s.maj_etiquette(Some(3), 2000);
+        assert_eq!(s.bulle_etiquette(2100), None, "autre carré : le délai repart");
+        s.maj_etiquette(None, 2200);
+        assert_eq!(s.bulle_etiquette(9000), None, "pointeur sorti : plus de bulle");
+        // Mouvement réduit : tout de suite
+        let mut r = Survols::nouveau();
+        r.animer = false;
+        r.maj_etiquette(Some(1), 1000);
+        assert_eq!(r.bulle_etiquette(1000), Some((1.0, 0.0)));
     }
 
     #[test]
@@ -3000,13 +3045,13 @@ mod tests {
     fn yeux_nuit_en_250_ms_et_couleur_en_200_ms() {
         let mut y = Yeux::nouveau();
         y.maj((0.0, 0.0), false, Teinte::Cyan, 0, true);
-        let v = y.maj((0.0, 0.0), true, Teinte::Faible, 1000, true);
-        assert_eq!((v.aplatie, v.teinte_avant, v.teinte, v.fondu), (0.0, Teinte::Cyan, Teinte::Faible, 0.0));
-        let milieu = y.maj((0.0, 0.0), true, Teinte::Faible, 1100, true);
+        let v = y.maj((0.0, 0.0), true, Teinte::Blanc, 1000, true);
+        assert_eq!((v.aplatie, v.teinte_avant, v.teinte, v.fondu), (0.0, Teinte::Cyan, Teinte::Blanc, 0.0));
+        let milieu = y.maj((0.0, 0.0), true, Teinte::Blanc, 1100, true);
         assert!(milieu.aplatie > 0.0 && milieu.aplatie < 1.0 && milieu.fondu > 0.0 && milieu.fondu < 1.0);
         // Couleur finie à 200 ms, hauteur à 250 ms
-        assert!(y.en_cours(1210) && y.maj((0.0, 0.0), true, Teinte::Faible, 1210, true).fondu == 1.0);
-        let fin = y.maj((0.0, 0.0), true, Teinte::Faible, 1000 + YEUX_HAUTEUR_MS, true);
+        assert!(y.en_cours(1210) && y.maj((0.0, 0.0), true, Teinte::Blanc, 1210, true).fondu == 1.0);
+        let fin = y.maj((0.0, 0.0), true, Teinte::Blanc, 1000 + YEUX_HAUTEUR_MS, true);
         assert_eq!(fin.aplatie, 1.0);
         assert!(!y.en_cours(1000 + YEUX_HAUTEUR_MS));
     }

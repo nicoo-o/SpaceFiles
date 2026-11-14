@@ -562,7 +562,7 @@ pub fn baliser(chemins: &[String], b: Option<Balise>) {
     // Appliqué à la dernière version du fichier, pas à la carte de ce processus : une autre fenêtre a pu
     // poser d'autres balises depuis (voir reglages::modifier)
     crate::reglages::modifier(|r| {
-        r.balises.retain(|l| l.split_once('|').map_or(true, |(_, p)| !cles.iter().any(|c| c == &p.to_lowercase())));
+        r.balises.retain(|l| l.split_once('|').is_none_or(|(_, p)| !cles.iter().any(|c| c == &p.to_lowercase())));
         if let Some(b) = b {
             r.balises.extend(cles.iter().map(|c| format!("{}|{c}", b.lettre())));
         }

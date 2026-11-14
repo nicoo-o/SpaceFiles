@@ -12,16 +12,18 @@ use windows::Win32::UI::WindowsAndMessaging::{PostMessageW, WM_APP};
 
 use crate::dossier::{self, Entree, Genre};
 use crate::icones::{self, Icone};
+use crate::pages;
 use crate::systeme;
 
 /// Aperçu prêt (LPARAM = Box<Apercu>)
 pub const WM_APERCU: u32 = WM_APP + 5;
 /// Vignette de la grille prête (LPARAM = Box<(chemin, Option<Image>)>)
 pub const WM_VIGNETTE: u32 = WM_APP + 10;
-/// Image du coup d'œil prête (LPARAM = Box<(numéro, Option<Image>)>)
+/// Page du coup d'œil prête (LPARAM = Box<PageGalerie>)
 pub const WM_GALERIE: u32 = WM_APP + 11;
 
-/// Coup d'œil (Espace) : l'élément choisi en grand, ← → pour passer au suivant (galerie photo)
+/// Coup d'œil (Espace) : l'élément choisi en grand, ← → pour passer au suivant (galerie photo), ↑ ↓ pour tourner les pages
+/// d'un PDF, d'un document, d'un long texte, d'une archive ou d'un TIFF
 pub struct Galerie {
     pub numero: u64,
     pub nom: String,
@@ -29,20 +31,121 @@ pub struct Galerie {
     pub icone: Icone,
     pub image: Option<Image>,
     pub charge: bool,
+    /// Chemin et extension de l'élément (pour redemander une autre page) ; rien s'il n'a pas d'aperçu
+    pub chemin: Option<String>,
+    pub ext: String,
+    /// Page affichée (à partir de 0) et nombre de pages (0 : pas encore connu)
+    pub page: u32,
+    pub pages: u32,
+    /// Ce que la page montre quand ce n'est pas le fichier lui-même (« TEXTE EXTRAIT »)
+    pub nature: &'static str,
+    /// Augmente à chaque nouvelle image : clé du cache Direct2D
+    pub version: u32,
+    /// Zoom demandé (1 : l'élément tient dans la carte) et décalage du centre de l'image par rapport au centre de la zone (DIP)
+    pub zoom: f32,
+    pub decalage: (f32, f32),
+    /// Échelle de rendu de l'image reçue et de celle demandée au fil (1 à `ECHELLE_MAX`) : texte, PDF et images sont redessinés
+    /// plus grands quand on zoome, pour rester nets
+    pub echelle: u32,
+    pub echelle_demandee: u32,
+    /// Montré par la visionneuse web (HTML, SVG…) : l'image reste vide, un contrôle WebView2 couvre la zone (`webvue.rs`)
+    pub web: bool,
 }
 
-/// Demande en attente pour le fil du coup d'œil : seule la plus récente compte (R19)
-static GALERIE: (std::sync::Mutex<Option<(isize, u64, String)>>, std::sync::Condvar) = (std::sync::Mutex::new(None), std::sync::Condvar::new());
+/// Zoom minimal et maximal du coup d'œil, et plus grande échelle de rendu (au-delà, l'image est seulement agrandie)
+pub const ZOOM_MIN: f32 = 1.0;
+pub const ZOOM_MAX: f32 = 8.0;
+pub const ECHELLE_MAX: u32 = 3;
+
+impl Galerie {
+    /// État d'un coup d'œil qui s'ouvre : ajusté à la carte, au centre, échelle 1
+    pub fn vierge(numero: u64, nom: String, detail: String, icone: Icone, chemin: Option<String>, ext: String) -> Self {
+        Self {
+            numero,
+            nom,
+            detail,
+            icone,
+            image: None,
+            charge: chemin.is_none(),
+            chemin,
+            ext,
+            page: 0,
+            pages: 0,
+            nature: "",
+            version: 0,
+            zoom: 1.0,
+            decalage: (0.0, 0.0),
+            echelle: 1,
+            echelle_demandee: 1,
+            web: false,
+        }
+    }
+
+    /// Taille de l'image à l'écran (DIP) : l'image tient dans `zone` (largeur, hauteur) à zoom 1, puis `zoom` la grossit. Les pixels
+    /// de l'image comptent pour `1 / echelle` : une image rendue à l'échelle 2 mesure le double sans paraître plus grande.
+    pub fn taille_affichee(&self, img: (u32, u32), zone: (f32, f32)) -> (f32, f32) {
+        let e = self.echelle.max(1) as f32;
+        let (lw, lh) = (img.0 as f32 / e, img.1 as f32 / e);
+        let k = (zone.0 / lw).min(zone.1 / lh).min(3.0);
+        (lw * k * self.zoom, lh * k * self.zoom)
+    }
+
+    /// Ramène le décalage dans ce qui garde l'image visible : centrée si elle tient dans la zone, bords sur les bords sinon
+    pub fn borner(&mut self, img: (u32, u32), zone: (f32, f32)) {
+        let (w, h) = self.taille_affichee(img, zone);
+        let (mx, my) = (((w - zone.0) / 2.0).max(0.0), ((h - zone.1) / 2.0).max(0.0));
+        self.decalage = (self.decalage.0.clamp(-mx, mx), self.decalage.1.clamp(-my, my));
+    }
+
+    /// Multiplie le zoom par `facteur` en gardant fixe le point `curseur` (DIP, relatif au centre de la zone)
+    pub fn zoomer(&mut self, facteur: f32, curseur: (f32, f32), img: (u32, u32), zone: (f32, f32)) {
+        let nouveau = (self.zoom * facteur).clamp(ZOOM_MIN, ZOOM_MAX);
+        let rapport = nouveau / self.zoom;
+        self.decalage = (curseur.0 - (curseur.0 - self.decalage.0) * rapport, curseur.1 - (curseur.1 - self.decalage.1) * rapport);
+        self.zoom = nouveau;
+        self.borner(img, zone);
+    }
+
+    /// Rectangle de l'image (x, y, largeur, hauteur) relatif au coin de la zone, décalage borné ; il sert au dessin et au clic
+    pub fn rect_image(&self, img: (u32, u32), zone: (f32, f32)) -> [f32; 4] {
+        let (w, h) = self.taille_affichee(img, zone);
+        let (mx, my) = (((w - zone.0) / 2.0).max(0.0), ((h - zone.1) / 2.0).max(0.0));
+        let (dx, dy) = (self.decalage.0.clamp(-mx, mx), self.decalage.1.clamp(-my, my));
+        [(zone.0 - w) / 2.0 + dx, (zone.1 - h) / 2.0 + dy, w, h]
+    }
+
+    /// Échelle de rendu qui suffit au zoom actuel
+    pub fn echelle_voulue(&self) -> u32 {
+        (self.zoom.ceil() as u32).clamp(1, ECHELLE_MAX)
+    }
+}
+
+/// Ce que le fil du coup d'œil renvoie à la fenêtre
+pub struct PageGalerie {
+    pub numero: u64,
+    pub page: u32,
+    pub pages: u32,
+    pub nature: &'static str,
+    pub image: Option<Image>,
+    pub echelle: u32,
+}
+
+/// Demande en attente pour le fil du coup d'œil : seule la plus récente compte (R19). (fenêtre, numéro, chemin, extension, page, échelle)
+static GALERIE: (std::sync::Mutex<Option<(isize, u64, String, String, u32, u32)>>, std::sync::Condvar) = (std::sync::Mutex::new(None), std::sync::Condvar::new());
+
+/// Pages de texte d'un fichier (document, archive, texte), gardées pour tourner les pages sans tout relire : (clé, pages, nature)
+type CachePages = Option<(String, std::sync::Arc<Vec<String>>, &'static str)>;
 
 /// Prépare la grande image du coup d'œil dans un fil séparé. Un seul fil, démarré au premier appel :
 /// en parcourant les images aux flèches, les demandes dépassées sont remplacées au lieu d'être décodées.
-pub fn charger_galerie(hwnd: HWND, numero: u64, chemin: String) {
+pub fn charger_galerie(hwnd: HWND, numero: u64, chemin: String, ext: String, page: u32, echelle: u32) {
     static FIL: std::sync::Once = std::sync::Once::new();
-    *GALERIE.0.lock().unwrap_or_else(|e| e.into_inner()) = Some((hwnd.0 as isize, numero, chemin));
+    *GALERIE.0.lock().unwrap_or_else(|e| e.into_inner()) = Some((hwnd.0 as isize, numero, chemin, ext, page, echelle.clamp(1, ECHELLE_MAX)));
     GALERIE.1.notify_one();
     FIL.call_once(|| {
         std::thread::spawn(|| unsafe {
             let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);
+            let mut cache: CachePages = None;
             loop {
                 let demande = {
                     let mut g = GALERIE.0.lock().unwrap_or_else(|e| e.into_inner());
@@ -51,14 +154,157 @@ pub fn charger_galerie(hwnd: HWND, numero: u64, chemin: String) {
                     }
                     g.take()
                 };
-                let Some((fenetre, numero, chemin)) = demande else { continue };
-                let p = Box::into_raw(Box::new((numero, miniature(&chemin, 1600))));
+                let Some((fenetre, numero, chemin, ext, page, echelle)) = demande else { continue };
+                let s = image_galerie(&chemin, &ext, page, echelle, &mut cache);
+                let p = Box::into_raw(Box::new(PageGalerie { numero, page: s.page, pages: s.pages, nature: s.nature, image: s.image, echelle }));
                 if PostMessageW(HWND(fenetre as *mut _), WM_GALERIE, WPARAM(0), LPARAM(p as isize)).is_err() {
                     drop(Box::from_raw(p));
                 }
             }
         });
     });
+}
+
+/// Une page rendue : l'image, la page réellement montrée (demandée, ramenée dans les bornes) et le nombre de pages
+struct SortieGalerie {
+    image: Option<Image>,
+    page: u32,
+    pages: u32,
+    nature: &'static str,
+}
+
+impl SortieGalerie {
+    fn une(image: Option<Image>) -> Self {
+        Self { image, page: 0, pages: 1, nature: "" }
+    }
+}
+
+/// Grande image du coup d'œil, par la même cascade que le volet d'aperçu : le shell ne fournit aucune miniature
+/// pour un PDF ou une police (HRESULT 0x8004B200), là c'est le lecteur PDF de Windows ou GDI qui dessine.
+/// Ordre : PDF (toutes ses pages) → police → texte, code, archive, document (pages de texte) → miniature du shell de plus en plus
+/// petite (une taille refusée n'interdit pas les autres) → images à plusieurs trames et formats sans miniature (décodeur WIC) →
+/// texte d'un fichier à l'extension inconnue → octets en hexadécimal : tout fichier a un aperçu.
+unsafe fn image_galerie(chemin: &str, ext: &str, page: u32, echelle: u32, cache: &mut CachePages) -> SortieGalerie {
+    let ext = ext.to_uppercase();
+    if ext == "PDF" {
+        if let Some((img, pages)) = pdf(chemin, 1400 * echelle, page) {
+            return SortieGalerie { image: Some(img), page: page.min(pages.saturating_sub(1)), pages: pages.max(1), nature: "" };
+        }
+    }
+    if matches!(ext.as_str(), "TTF" | "OTF" | "TTC") {
+        let mut a = Apercu { numero: 0, nom: String::new(), icone: Icone::Dossier, image: None, texte: None, infos: Vec::new(), teintes: Vec::new() };
+        police(&mut a, chemin);
+        if a.image.is_some() {
+            return SortieGalerie::une(a.image.map(encrer));
+        }
+    }
+    // Texte, code, archives et documents : le shell n'a pas de miniature, on dessine le texte page par page
+    let liste = TEXTE.contains(&ext.as_str()) || crate::archive::est_archive(&ext) || pages::est_document(&ext);
+    if liste {
+        if let Some(s) = page_de_texte(chemin, &ext, page, echelle, cache) {
+            return s;
+        }
+    }
+    // Zoomée : l'image est décodée plus grande que la miniature du shell (qui s'arrête à 1 600 px)
+    if echelle > 1 && !liste {
+        if let Some((t, n)) = pages::trame(chemin, page, false, pages::MAX_COTE * echelle) {
+            return SortieGalerie { image: Some(t), page: page.min(n - 1), pages: n, nature: "" };
+        }
+    }
+    if let Some(img) = [1600, 520, 256].into_iter().find_map(|t| miniature(chemin, t)) {
+        // Un TIFF ou un GIF à plusieurs trames : la miniature du shell n'en montre qu'une
+        if pages::IMAGES_MULTI.contains(&ext.as_str()) {
+            if let Some((t, n)) = pages::trame(chemin, page, true, pages::MAX_COTE * echelle) {
+                return SortieGalerie { image: Some(t), page: page.min(n - 1), pages: n, nature: "" };
+            }
+        }
+        return SortieGalerie::une(Some(img));
+    }
+    if let Some((t, n)) = pages::trame(chemin, page, false, pages::MAX_COTE * echelle) {
+        return SortieGalerie { image: Some(t), page: page.min(n - 1), pages: n, nature: "" };
+    }
+    if !liste {
+        if let Some(s) = page_de_texte(chemin, &ext, page, echelle, cache) {
+            return s;
+        }
+    }
+    if let Some((t, n)) = pages::hexa(chemin, page) {
+        if let Some(img) = texte_image(&t, echelle) {
+            return SortieGalerie { image: Some(encrer(img)), page: page.min(n - 1), pages: n, nature: "OCTETS (HEXADECIMAL)" };
+        }
+    }
+    SortieGalerie::une(None)
+}
+
+/// Une page du texte d'un fichier (les pages sont lues une fois, puis gardées pour les pages suivantes)
+unsafe fn page_de_texte(chemin: &str, ext: &str, page: u32, echelle: u32, cache: &mut CachePages) -> Option<SortieGalerie> {
+    let cle = format!("{chemin}|{}", modifie(chemin));
+    if cache.as_ref().is_none_or(|(k, _, _)| *k != cle) {
+        let (v, nature) = pages::pages_de(chemin, ext)?;
+        *cache = Some((cle, std::sync::Arc::new(v), nature));
+    }
+    let (_, v, nature) = cache.as_ref()?;
+    let n = v.len() as u32;
+    let page = page.min(n.saturating_sub(1));
+    let img = texte_image(v.get(page as usize)?, echelle)?;
+    Some(SortieGalerie { image: Some(encrer(img)), page, pages: n, nature })
+}
+
+/// Les images de texte et de police sont blanches sur transparent (GDI) : en thème clair, la carte est claire, on les repasse en noir
+/// (prémultiplié : seul l'alpha reste)
+fn encrer(mut img: Image) -> Image {
+    if crate::theme::clair() {
+        for p in img.pixels.as_chunks_mut::<4>().0 {
+            p[0] = 0;
+            p[1] = 0;
+            p[2] = 0;
+        }
+    }
+    img
+}
+
+/// Début d'un fichier texte dessiné en blanc sur transparent (GDI, chasse fixe), pour la grande carte du coup d'œil.
+/// Lignes coupées à 110 caractères et 26 lignes au plus : ce n'est qu'un coup d'œil, pas un éditeur.
+unsafe fn texte_image(texte: &str, echelle: u32) -> Option<Image> {
+    const COLONNES: usize = 110;
+    const LIGNES: usize = 26;
+    const PAS: i32 = 24;
+    // Zoomé : tout est dessiné `e` fois plus grand (police, pas, marges) au lieu d'agrandir des pixels
+    let e = echelle.clamp(1, ECHELLE_MAX) as i32;
+    let (l, h) = (1100 * e, (LIGNES as i32 * PAS + 16) * e);
+    let dc = CreateCompatibleDC(None);
+    let info = BITMAPINFO { bmiHeader: BITMAPINFOHEADER { biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32, biWidth: l, biHeight: -h, biPlanes: 1, biBitCount: 32, biCompression: BI_RGB.0, ..Default::default() }, ..Default::default() };
+    let mut bits = std::ptr::null_mut();
+    let mut resultat = None;
+    if let Ok(bmp) = CreateDIBSection(dc, &info, DIB_RGB_COLORS, &mut bits, None, 0) {
+        let ancien = SelectObject(dc, bmp);
+        // SAFETY: la section DIB est de l × h pixels de 4 octets, vivante jusqu'au DeleteObject ci-dessous
+        std::ptr::write_bytes(bits as *mut u8, 0, (l * h * 4) as usize);
+        SetBkMode(dc, TRANSPARENT);
+        SetTextColor(dc, windows::Win32::Foundation::COLORREF(0xFFFFFF));
+        let nom: Vec<u16> = "Consolas".encode_utf16().chain(std::iter::once(0)).collect();
+        let f = CreateFontW(-18 * e, 0, 0, 0, 400, 0, 0, 0, DEFAULT_CHARSET.0 as u32, 0, 0, ANTIALIASED_QUALITY.0 as u32, 0, PCWSTR(nom.as_ptr()));
+        let ancienne = SelectObject(dc, f);
+        for (i, ligne) in texte.lines().take(LIGNES).enumerate() {
+            let coupee: String = if ligne.chars().count() > COLONNES { ligne.chars().take(COLONNES - 1).chain(std::iter::once('…')).collect() } else { ligne.to_string() };
+            let t: Vec<u16> = coupee.encode_utf16().collect();
+            let _ = TextOutW(dc, 8 * e, (8 + i as i32 * PAS) * e, &t);
+        }
+        SelectObject(dc, ancienne);
+        let _ = DeleteObject(f);
+        SelectObject(dc, ancien);
+        if let Some(mut img) = pixels(bmp) {
+            // GDI n'écrit pas d'alpha : la clarté du pixel en tient lieu (blanc sur transparent, prémultiplié)
+            for p in img.pixels.as_chunks_mut::<4>().0 {
+                let c = p[0].max(p[1]).max(p[2]);
+                p.copy_from_slice(&[c, c, c, c]);
+            }
+            resultat = Some(img);
+        }
+        let _ = DeleteObject(bmp);
+    }
+    let _ = DeleteDC(dc);
+    resultat
 }
 
 /// Fils qui préparent les vignettes de la grille : les demandes les plus récentes d'abord
@@ -195,6 +441,10 @@ unsafe fn preparer(numero: u64, chemin: &str, e: Option<&Entree>) -> Apercu {
         Genre::Dossier => infos_dossier(&mut a, chemin),
         Genre::Fichier => {
             a.infos.push(("TAILLE".into(), systeme::taille(e.taille)));
+            // Fichier vide : sans cette ligne la carte n'a ni image ni texte et paraît cassée (audit P2-02)
+            if e.taille == 0 && e.nuage == dossier::Nuage::Aucun {
+                a.infos.push(("CONTENU".into(), "FICHIER VIDE · RIEN À AFFICHER".into()));
+            }
             a.infos.push(("MODIFIÉ".into(), systeme::date(e.modif)));
             a.infos.push(("EMPLACEMENT".into(), dossier::dossier_de(chemin).to_string()));
             if e.ajout > e.modif + 20_000_000 {
@@ -217,7 +467,7 @@ unsafe fn preparer(numero: u64, chemin: &str, e: Option<&Entree>) -> Apercu {
             let en_ligne = e.nuage == dossier::Nuage::EnLigne;
             // PDF : la première page rendue par Windows, et le nombre de pages
             if e.ext == "PDF" && !en_ligne {
-                if let Some((img, pages)) = pdf(chemin) {
+                if let Some((img, pages)) = pdf(chemin, 520, 0) {
                     a.image = Some(img);
                     a.infos.push(("PAGES".into(), systeme::nombre(pages as usize)));
                 }
@@ -295,7 +545,7 @@ fn famille_police(o: &[u8]) -> Option<String> {
         // Windows (3), nom de famille (1) : UTF-16 gros-boutiste
         (u16_(r)? == 3 && u16_(r + 6)? == 1).then_some(())?;
         let (len, dep) = (u16_(r + 8)?, u16_(r + 10)?);
-        let u: Vec<u16> = o.get(chaines + dep..chaines + dep + len)?.chunks_exact(2).map(|c| u16::from_be_bytes([c[0], c[1]])).collect();
+        let u: Vec<u16> = o.get(chaines + dep..chaines + dep + len)?.as_chunks::<2>().0.iter().map(|c| u16::from_be_bytes([c[0], c[1]])).collect();
         String::from_utf16(&u).ok()
     })
 }
@@ -333,7 +583,7 @@ unsafe fn police(a: &mut Apercu, chemin: &str) {
         SelectObject(dc, ancien);
         if let Some(mut img) = pixels(bmp) {
             // GDI n'écrit pas d'alpha : la clarté du pixel en tient lieu (blanc sur transparent, prémultiplié)
-            for p in img.pixels.chunks_exact_mut(4) {
+            for p in img.pixels.as_chunks_mut::<4>().0 {
                 let c = p[0].max(p[1]).max(p[2]);
                 p.copy_from_slice(&[c, c, c, c]);
             }
@@ -345,24 +595,35 @@ unsafe fn police(a: &mut Apercu, chemin: &str) {
     let _ = RemoveFontResourceExW(PCWSTR(w.as_ptr()), FR_PRIVATE.0, None);
 }
 
-/// Première page d'un PDF (lecteur PDF de Windows), et le nombre de pages
-fn pdf(chemin: &str) -> Option<(Image, u32)> {
+/// Page `numero` (à partir de 0, ramenée dans les bornes) d'un PDF (lecteur PDF de Windows), et le nombre de pages
+fn pdf(chemin: &str, largeur: u32, numero: u32) -> Option<(Image, u32)> {
     use windows::core::HSTRING;
     use windows::Data::Pdf::{PdfDocument, PdfPageRenderOptions};
-    use windows::Graphics::Imaging::{BitmapAlphaMode, BitmapDecoder, BitmapPixelFormat};
-    use windows::Storage::Streams::{Buffer, DataReader, InMemoryRandomAccessStream};
+    use windows::Graphics::Imaging::BitmapDecoder;
+    use windows::Storage::Streams::InMemoryRandomAccessStream;
     use windows::Storage::StorageFile;
     let fichier = StorageFile::GetFileFromPathAsync(&HSTRING::from(chemin)).ok()?.get().ok()?;
     let doc = PdfDocument::LoadFromFileAsync(&fichier).ok()?.get().ok()?;
     let pages = doc.PageCount().ok()?;
-    let page = doc.GetPage(0).ok()?;
+    if pages == 0 {
+        return None;
+    }
+    let page = doc.GetPage(numero.min(pages - 1)).ok()?;
     let options = PdfPageRenderOptions::new().ok()?;
-    options.SetDestinationWidth(520).ok()?;
+    options.SetDestinationWidth(largeur).ok()?;
     let flux = InMemoryRandomAccessStream::new().ok()?;
     page.RenderWithOptionsToStreamAsync(&flux, &options).ok()?.get().ok()?;
     flux.Seek(0).ok()?;
     let decodeur = BitmapDecoder::CreateAsync(&flux).ok()?.get().ok()?;
-    let image = decodeur.GetSoftwareBitmapConvertedAsync(BitmapPixelFormat::Bgra8, BitmapAlphaMode::Premultiplied).ok()?.get().ok()?;
+    let image = decodeur.GetSoftwareBitmapAsync().ok()?.get().ok()?;
+    image_de_bitmap(&image).map(|i| (i, pages))
+}
+
+/// Pixels BGRA prémultipliés d'un bitmap WinRT (converti au besoin)
+pub(crate) fn image_de_bitmap(bitmap: &windows::Graphics::Imaging::SoftwareBitmap) -> Option<Image> {
+    use windows::Graphics::Imaging::{BitmapAlphaMode, BitmapPixelFormat, SoftwareBitmap};
+    use windows::Storage::Streams::{Buffer, DataReader};
+    let image = SoftwareBitmap::ConvertWithAlpha(bitmap, BitmapPixelFormat::Bgra8, BitmapAlphaMode::Premultiplied).ok()?;
     let (l, h) = (image.PixelWidth().ok()? as u32, image.PixelHeight().ok()? as u32);
     if l == 0 || h == 0 {
         return None;
@@ -371,7 +632,7 @@ fn pdf(chemin: &str) -> Option<(Image, u32)> {
     image.CopyToBuffer(&tampon).ok()?;
     let mut pixels = vec![0u8; (l * h * 4) as usize];
     DataReader::FromBuffer(&tampon).ok()?.ReadBytes(&mut pixels).ok()?;
-    Some((Image { largeur: l, hauteur: h, pixels }, pages))
+    Some(Image { largeur: l, hauteur: h, pixels })
 }
 
 /// Mots-clés reconnus dans les fichiers de code (tous langages confondus)
@@ -535,13 +796,13 @@ fn markdown(t: &str) -> (String, Vec<(u32, u32, Teinte)>) {
         while i < c.len() {
             let suite: String = c[i..].iter().collect();
             let mut special = None;
-            if suite.starts_with("**") {
-                if let Some(f) = suite[2..].find("**") {
-                    special = Some((suite[2..2 + f].to_string(), Teinte::Gras, 4 + suite[2..2 + f].chars().count()));
+            if let Some(reste) = suite.strip_prefix("**") {
+                if let Some(f) = reste.find("**") {
+                    special = Some((reste[..f].to_string(), Teinte::Gras, 4 + reste[..f].chars().count()));
                 }
-            } else if suite.starts_with('`') {
-                if let Some(f) = suite[1..].find('`') {
-                    special = Some((suite[1..1 + f].to_string(), Teinte::Chaine, 2 + suite[1..1 + f].chars().count()));
+            } else if let Some(reste) = suite.strip_prefix('`') {
+                if let Some(f) = reste.find('`') {
+                    special = Some((reste[..f].to_string(), Teinte::Chaine, 2 + reste[..f].chars().count()));
                 }
             } else if suite.starts_with('[') {
                 if let (Some(f), true) = (suite.find("]("), true) {
@@ -630,8 +891,8 @@ unsafe fn pixels(hbmp: HBITMAP) -> Option<Image> {
         return None;
     }
     // Photos : souvent sans canal alpha (tout à 0) → opaques
-    if px.chunks_exact(4).all(|p| p[3] == 0) {
-        for p in px.chunks_exact_mut(4) {
+    if px.as_chunks::<4>().0.iter().all(|p| p[3] == 0) {
+        for p in px.as_chunks_mut::<4>().0 {
             p[3] = 255;
         }
     }
@@ -646,7 +907,7 @@ fn debut_texte(chemin: &str) -> Option<String> {
     buf.truncate(n);
     // UTF-16 (fichiers .reg, journaux Windows)
     let texte = if buf.starts_with(&[0xFF, 0xFE]) {
-        let u: Vec<u16> = buf[2..].chunks_exact(2).map(|c| u16::from_le_bytes([c[0], c[1]])).collect();
+        let u: Vec<u16> = buf[2..].as_chunks::<2>().0.iter().map(|c| u16::from_le_bytes([c[0], c[1]])).collect();
         String::from_utf16_lossy(&u)
     } else {
         let b = buf.strip_prefix(&[0xEF, 0xBB, 0xBF]).unwrap_or(&buf);
@@ -738,6 +999,57 @@ unsafe fn proprietes(a: &mut Apercu, chemin: &str) {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
+    fn galerie_vide() -> Galerie {
+        Galerie::vierge(1, "a.png".into(), String::new(), crate::icones::pour_extension("png"), None, "png".into())
+    }
+
+    #[test]
+    fn zoom_borne_et_point_fixe() {
+        let mut g = galerie_vide();
+        let (img, zone) = ((800, 600), (400.0, 300.0));
+        // Ajustement : l'image remplit la zone sans la dépasser
+        assert_eq!(g.taille_affichee(img, zone), (400.0, 300.0));
+        g.zoomer(2.0, (100.0, 0.0), img, zone);
+        assert_eq!(g.zoom, 2.0);
+        // Le point sous le curseur ne bouge pas : décalage = −u, dans la limite du surplus (200 DIP de chaque côté)
+        assert_eq!(g.decalage, (-100.0, 0.0));
+        // Le zoom reste entre ZOOM_MIN et ZOOM_MAX
+        g.zoomer(100.0, (0.0, 0.0), img, zone);
+        assert_eq!(g.zoom, ZOOM_MAX);
+        g.zoomer(0.0001, (0.0, 0.0), img, zone);
+        assert_eq!(g.zoom, ZOOM_MIN);
+        // Revenu à 1 : l'image n'a plus de surplus, elle est recentrée
+        assert_eq!(g.decalage, (0.0, 0.0));
+    }
+
+    #[test]
+    fn decalage_reste_dans_l_image_et_echelle_voulue() {
+        let mut g = galerie_vide();
+        let (img, zone) = ((800, 600), (400.0, 300.0));
+        g.zoomer(2.0, (0.0, 0.0), img, zone);
+        g.decalage = (10_000.0, -10_000.0);
+        g.borner(img, zone);
+        assert_eq!(g.decalage, (200.0, -150.0));
+        // Image 800 × 600 à zoom 2 dans 400 × 300 : bords alignés sur ceux de la zone, côté gauche et bas
+        assert_eq!(g.rect_image(img, zone), [0.0, -300.0, 800.0, 600.0]);
+        assert_eq!(g.echelle_voulue(), 2);
+        g.zoom = 1.0;
+        assert_eq!(g.echelle_voulue(), 1);
+        g.zoom = 8.0;
+        assert_eq!(g.echelle_voulue(), ECHELLE_MAX);
+    }
+
+    #[test]
+    fn echelle_deux_ne_change_pas_la_taille_affichee() {
+        let mut g = galerie_vide();
+        let zone = (400.0, 300.0);
+        let a = g.taille_affichee((800, 600), zone);
+        g.echelle = 2;
+        assert_eq!(g.taille_affichee((1600, 1200), zone), a);
+    }
+
     #[test]
     fn famille_d_une_police_et_chemin_court() {
         let o = std::fs::read(r"C:\Windows\Fonts\arial.ttf").expect("Arial est livrée avec Windows");
@@ -746,5 +1058,173 @@ mod tests {
         assert_eq!(super::court("a/b.txt"), "a/b.txt");
         let c = super::court(&format!("{}/fin.txt", "dossier/".repeat(10)));
         assert!(c.starts_with('…') && c.ends_with("fin.txt") && c.chars().count() == 34);
+    }
+
+    /// Le coup d'œil passe par la même cascade que le volet : un PDF (aucune miniature du shell) et une police donnent une image
+    #[test]
+    fn image_galerie_pdf_et_police() {
+        unsafe {
+            let _ = windows::Win32::System::Com::CoInitializeEx(None, windows::Win32::System::Com::COINIT_APARTMENTTHREADED);
+        }
+        // PDF d'une page, table xref calculée à la main
+        let objets = [
+            "<< /Type /Catalog /Pages 2 0 R >>".to_string(),
+            "<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_string(),
+            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 100] /Contents 4 0 R >>".to_string(),
+            "<< /Length 31 >>
+stream
+0 0 0 rg 20 20 160 60 re f
+endstream".to_string(),
+        ];
+        let mut pdf = String::from("%PDF-1.4
+");
+        let mut positions = Vec::new();
+        for (i, o) in objets.iter().enumerate() {
+            positions.push(pdf.len());
+            pdf.push_str(&format!("{} 0 obj
+{}
+endobj
+", i + 1, o));
+        }
+        let xref = pdf.len();
+        pdf.push_str(&format!("xref
+0 {}
+0000000000 65535 f 
+", objets.len() + 1));
+        for p in positions {
+            pdf.push_str(&format!("{p:010} 00000 n 
+"));
+        }
+        pdf.push_str(&format!("trailer
+<< /Size {} /Root 1 0 R >>
+startxref
+{xref}
+%%EOF
+", objets.len() + 1));
+        let chemin = std::env::temp_dir().join("spacefiles-test-galerie.pdf");
+        std::fs::write(&chemin, pdf).unwrap();
+        let c = chemin.to_string_lossy().replace('/', "\\");
+        let s = unsafe { super::image_galerie(&c, "PDF", 0, 1, &mut None) };
+        let _ = std::fs::remove_file(&chemin);
+        let img = s.image.expect("le lecteur PDF de Windows rend la page");
+        assert!(img.largeur >= 1000 && img.hauteur > 0, "{}x{}", img.largeur, img.hauteur);
+        assert_eq!((s.page, s.pages), (0, 1));
+        let police = unsafe { super::image_galerie(r"C:\Windows\Fonts\arial.ttf", "TTF", 0, 1, &mut None) }.image.expect("un échantillon de la police");
+        assert!(police.largeur > 0 && police.pixels.iter().any(|&o| o != 0));
+        let t = unsafe { super::texte_image("fn main() {
+    println!(\"é\");
+}", 1) }.expect("le texte est dessiné");
+        assert!(t.pixels.iter().any(|&o| o != 0));
+    }
+
+    fn com() {
+        unsafe {
+            let _ = windows::Win32::System::Com::CoInitializeEx(None, windows::Win32::System::Com::COINIT_APARTMENTTHREADED);
+        }
+    }
+
+    /// Fichier de test dans un dossier à part (le nom porte le numéro du test : les tests tournent en parallèle)
+    fn fichier_test(nom: &str, octets: &[u8]) -> String {
+        let dossier = std::env::temp_dir().join("spacefiles-test-pages");
+        std::fs::create_dir_all(&dossier).unwrap();
+        let chemin = dossier.join(nom);
+        std::fs::write(&chemin, octets).unwrap();
+        chemin.to_string_lossy().replace('/', "\\")
+    }
+
+    /// Un PDF de `n` pages (table xref calculée à la main)
+    fn pdf_de(n: usize) -> Vec<u8> {
+        let mut objets = vec![String::new(), String::new()];
+        let kids: Vec<String> = (0..n).map(|i| format!("{} 0 R", 3 + i * 2)).collect();
+        objets[0] = "<< /Type /Catalog /Pages 2 0 R >>".into();
+        objets[1] = format!("<< /Type /Pages /Kids [{}] /Count {n} >>", kids.join(" "));
+        for i in 0..n {
+            objets.push(format!("<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 100] /Contents {} 0 R >>", 4 + i * 2));
+            let flux = "0 0 0 rg 20 20 160 60 re f";
+            objets.push(format!("<< /Length {} >>\nstream\n{flux}\nendstream", flux.len()));
+        }
+        let mut pdf = String::from("%PDF-1.4\n");
+        let mut positions = Vec::new();
+        for (i, o) in objets.iter().enumerate() {
+            positions.push(pdf.len());
+            pdf.push_str(&format!("{} 0 obj\n{o}\nendobj\n", i + 1));
+        }
+        let xref = pdf.len();
+        pdf.push_str(&format!("xref\n0 {}\n0000000000 65535 f \n", objets.len() + 1));
+        for p in positions {
+            pdf.push_str(&format!("{p:010} 00000 n \n"));
+        }
+        pdf.push_str(&format!("trailer\n<< /Size {} /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF\n", objets.len() + 1));
+        pdf.into_bytes()
+    }
+
+    #[test]
+    fn pdf_de_plusieurs_pages_toutes_atteignables() {
+        com();
+        let c = fichier_test("trois-pages.pdf", &pdf_de(3));
+        for demandee in [0u32, 1, 2, 9] {
+            let s = unsafe { super::image_galerie(&c, "PDF", demandee, 1, &mut None) };
+            assert!(s.image.is_some(), "page {demandee} rendue");
+            assert_eq!(s.pages, 3);
+            assert_eq!(s.page, demandee.min(2), "la page demandée est ramenée dans les bornes");
+        }
+    }
+
+    #[test]
+    fn texte_long_en_pages_et_cache() {
+        com();
+        let texte: String = (0..70).map(|i| format!("ligne numéro {i}\n")).collect();
+        let c = fichier_test("long.txt", texte.as_bytes());
+        let mut cache = None;
+        let s = unsafe { super::image_galerie(&c, "TXT", 0, 1, &mut cache) };
+        assert_eq!((s.pages, s.page, s.nature), (3, 0, ""));
+        assert!(s.image.is_some() && cache.is_some());
+        let s = unsafe { super::image_galerie(&c, "txt", 2, 1, &mut cache) };
+        assert_eq!((s.pages, s.page), (3, 2));
+        assert!(s.image.expect("dernière page").pixels.iter().any(|&o| o != 0));
+        let s = unsafe { super::image_galerie(&c, "TXT", 50, 1, &mut cache) };
+        assert_eq!(s.page, 2, "au-delà de la fin : dernière page");
+    }
+
+    #[test]
+    fn document_docx_texte_extrait_par_tar() {
+        com();
+        let dossier = std::env::temp_dir().join("spacefiles-test-pages").join("docx-src");
+        let _ = std::fs::remove_dir_all(&dossier);
+        std::fs::create_dir_all(dossier.join("word")).unwrap();
+        let paragraphes: String = (0..40).map(|i| format!("<w:p><w:r><w:t>Paragraphe {i} &amp; suite</w:t></w:r></w:p>")).collect();
+        std::fs::write(dossier.join("word").join("document.xml"), format!("<?xml version=\"1.0\"?><w:document><w:body>{paragraphes}</w:body></w:document>")).unwrap();
+        let zip = std::env::temp_dir().join("spacefiles-test-pages").join("source.zip");
+        let _ = std::fs::remove_file(&zip);
+        crate::archive::creer(&zip.to_string_lossy(), &dossier.to_string_lossy(), &["word".to_string()]).expect("tar.exe crée le zip");
+        let docx = std::env::temp_dir().join("spacefiles-test-pages").join("lettre.docx");
+        std::fs::copy(&zip, &docx).unwrap();
+        let c = docx.to_string_lossy().replace('/', "\\");
+        let (pages, nature) = crate::pages::pages_de(&c, "DOCX").expect("le texte du document est extrait");
+        assert_eq!(nature, "TEXTE EXTRAIT");
+        assert_eq!(pages.len(), 2, "40 paragraphes = 26 + 14 lignes");
+        assert!(pages[0].starts_with("Paragraphe 0 & suite"), "{}", &pages[0][..30]);
+        let s = unsafe { super::image_galerie(&c, "DOCX", 1, 1, &mut None) };
+        assert_eq!((s.pages, s.page, s.nature), (2, 1, "TEXTE EXTRAIT"));
+        assert!(s.image.is_some());
+        // L'archive elle-même se lit comme une liste d'éléments
+        let (pages, nature) = crate::pages::pages_de(&zip.to_string_lossy(), "ZIP").expect("liste de l'archive");
+        assert_eq!(nature, "CONTENU DE L'ARCHIVE");
+        assert!(pages[0].contains("word/document.xml"), "{}", pages[0]);
+    }
+
+    #[test]
+    fn fichier_inconnu_binaire_en_hexadecimal() {
+        com();
+        let octets: Vec<u8> = (0..=255u8).cycle().take(2000).collect();
+        let c = fichier_test("inconnu.xyz", &octets);
+        let s = unsafe { super::image_galerie(&c, "XYZ", 0, 1, &mut None) };
+        assert!(s.image.is_some());
+        assert_eq!(s.nature, "OCTETS (HEXADECIMAL)");
+        assert_eq!(s.pages, 5, "2000 octets = 5 pages de 416 octets");
+        // Un fichier texte sans extension connue s'affiche comme du texte, pas en hexadécimal
+        let c = fichier_test("notes.zzz", "bonjour\nle monde\n".as_bytes());
+        let s = unsafe { super::image_galerie(&c, "ZZZ", 0, 1, &mut None) };
+        assert!(s.image.is_some() && s.nature.is_empty() && s.pages == 1, "{:?}", (s.pages, s.nature));
     }
 }

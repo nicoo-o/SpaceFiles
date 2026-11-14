@@ -92,7 +92,7 @@ pub fn analyser_i(o: &[u8]) -> Option<(u64, u64, String)> {
         }
         _ => return None,
     };
-    let unites: Vec<u16> = texte.chunks_exact(2).map(|c| u16::from_le_bytes([c[0], c[1]])).take_while(|&u| u != 0).collect();
+    let unites: Vec<u16> = texte.as_chunks::<2>().0.iter().map(|c| u16::from_le_bytes([c[0], c[1]])).take_while(|&u| u != 0).collect();
     let chemin = String::from_utf16(&unites).ok().filter(|c| !c.is_empty())?;
     Some((taille, date, chemin))
 }

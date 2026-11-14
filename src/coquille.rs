@@ -264,24 +264,46 @@ pub struct Rappels {
 
 /// Crée un raccourci « nom - Raccourci.lnk » dans `dest` pour chaque source ; renvoie combien
 pub unsafe fn raccourcis(sources: &[String], dest: &str) -> Result<usize> {
-    let dossier = dest.trim_end_matches('\\');
-    let mut n = 0;
-    for s in sources {
-        let lien: IShellLinkW = CoCreateInstance(&ShellLink, None, CLSCTX_INPROC_SERVER)?;
-        lien.SetPath(&HSTRING::from(s.as_str()))?;
-        let _ = lien.SetWorkingDirectory(&HSTRING::from(parent(s)));
-        let nom: String = s.trim_end_matches('\\').rsplit('\\').next().unwrap_or(s).chars().filter(|c| *c != ':').collect();
-        let mut cible = format!("{dossier}\\{nom} - Raccourci.lnk");
-        let mut k = 2;
-        while std::path::Path::new(&cible).exists() {
-            cible = format!("{dossier}\\{nom} - Raccourci ({k}).lnk");
-            k += 1;
-        }
-        let fichier: IPersistFile = lien.cast()?;
-        fichier.Save(&HSTRING::from(cible), TRUE)?;
-        n += 1;
+    raccourcis_crees(sources, dest).map(|v| v.len())
+}
+
+/// Comme `raccourcis`, mais rend les chemins des `.lnk` créés (l'historique les défait par la corbeille). Si l'un échoue, les
+/// précédents restent en place : l'erreur ne les liste pas (`raccourcis_partiels` les garde).
+pub unsafe fn raccourcis_crees(sources: &[String], dest: &str) -> Result<Vec<String>> {
+    match raccourcis_partiels(sources, dest) {
+        (crees, None) => Ok(crees),
+        (_, Some(e)) => Err(e),
     }
-    Ok(n)
+}
+
+/// Crée les raccourcis un à un et rend ce qui existe déjà même si l'un échoue (chemin trop long, destination en lecture seule) :
+/// sans cela les `.lnk` déjà écrits échappent à l'historique, et Ctrl+Z ne les défait pas.
+pub unsafe fn raccourcis_partiels(sources: &[String], dest: &str) -> (Vec<String>, Option<windows::core::Error>) {
+    let dossier = dest.trim_end_matches('\\');
+    let mut crees = Vec::new();
+    for s in sources {
+        match raccourci_un(s, dossier) {
+            Ok(cible) => crees.push(cible),
+            Err(e) => return (crees, Some(e)),
+        }
+    }
+    (crees, None)
+}
+
+unsafe fn raccourci_un(s: &str, dossier: &str) -> Result<String> {
+    let lien: IShellLinkW = CoCreateInstance(&ShellLink, None, CLSCTX_INPROC_SERVER)?;
+    lien.SetPath(&HSTRING::from(s))?;
+    let _ = lien.SetWorkingDirectory(&HSTRING::from(parent(s)));
+    let nom: String = s.trim_end_matches('\\').rsplit('\\').next().unwrap_or(s).chars().filter(|c| *c != ':').collect();
+    let mut cible = format!("{dossier}\\{nom} - Raccourci.lnk");
+    let mut k = 2;
+    while std::path::Path::new(&cible).exists() {
+        cible = format!("{dossier}\\{nom} - Raccourci ({k}).lnk");
+        k += 1;
+    }
+    let fichier: IPersistFile = lien.cast()?;
+    fichier.Save(&HSTRING::from(cible.as_str()), TRUE)?;
+    Ok(cible)
 }
 
 /// Chemins d'un glisser-déposer de fichiers (format CF_HDROP)
@@ -397,7 +419,7 @@ impl Depot {
             (Some(d), Some(f)) => effet_fichiers(&f, d, touches, permis),
             (Some(d), None) => {
                 // Le dossier visé a changé : on quitte l'ancien dépôt Shell et on entre dans le nouveau
-                if e.shell.as_ref().map_or(true, |(c, _)| !meme_chemin(c, d)) {
+                if e.shell.as_ref().is_none_or(|(c, _)| !meme_chemin(c, d)) {
                     if let Some((_, ancien)) = e.shell.take() {
                         let _ = ancien.DragLeave();
                     }
@@ -542,6 +564,34 @@ pub fn menus_theme(clair: bool) {
         if let Some(f) = GetProcAddress(ux, PCSTR(136 as *const u8)) {
             let f: unsafe extern "system" fn() = std::mem::transmute(f);
             f();
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Un vrai `.lnk` est écrit par l'API shell, sans écraser un raccourci du même nom (« (2) »), et les chemins créés sont rendus
+    #[test]
+    fn raccourcis_crees_ecrit_de_vrais_lnk_sans_ecraser() {
+        // SAFETY: fil de test, COM initialisé ici ; les chaînes vivent pendant les appels
+        unsafe {
+            let _ = windows::Win32::System::Com::CoInitializeEx(None, windows::Win32::System::Com::COINIT_APARTMENTTHREADED);
+            let dossier = std::env::temp_dir().join("spacefiles-test-raccourcis");
+            let _ = std::fs::remove_dir_all(&dossier);
+            std::fs::create_dir_all(&dossier).unwrap();
+            let source = dossier.join("cible.txt");
+            std::fs::write(&source, b"x").unwrap();
+            let (s, d) = (source.to_string_lossy().to_string(), dossier.to_string_lossy().to_string());
+            let premier = raccourcis_crees(&[s.clone()], &d).expect("premier raccourci");
+            let second = raccourcis_crees(&[s.clone()], &d).expect("second raccourci");
+            assert_eq!(premier.len(), 1);
+            assert!(premier[0].ends_with("cible.txt - Raccourci.lnk"), "{premier:?}");
+            assert!(second[0].ends_with("cible.txt - Raccourci (2).lnk"), "{second:?}");
+            assert!(std::fs::metadata(&premier[0]).unwrap().len() > 0 && std::path::Path::new(&second[0]).exists());
+            assert_eq!(raccourcis(&[s], &d).unwrap(), 1);
+            let _ = std::fs::remove_dir_all(&dossier);
         }
     }
 }

@@ -612,10 +612,10 @@ unsafe fn executer(hwnd: isize, numero: u64, genre: Genre, elements: &[Element],
             // Les éléments remplacés partent à la corbeille (récupérables) sans nouvelle question : la carte
             // des conflits vient d'avoir la réponse. Windows prévient quand même si la corbeille est impossible.
             if elements.iter().any(|e| e.remplace.is_some()) {
-                drapeaux |= FOFX_RECYCLEONDELETE.0 as u32 | FOF_NOCONFIRMATION.0 | FOF_WANTNUKEWARNING.0;
+                drapeaux |= FOFX_RECYCLEONDELETE.0 | FOF_NOCONFIRMATION.0 | FOF_WANTNUKEWARNING.0;
             }
         }
-        Genre::Corbeille => drapeaux |= FOF_ALLOWUNDO.0 | FOFX_RECYCLEONDELETE.0 as u32,
+        Genre::Corbeille => drapeaux |= FOF_ALLOWUNDO.0 | FOFX_RECYCLEONDELETE.0,
         Genre::SupprimerDefinitivement => {}
     }
     // Tests seulement : Windows ouvre de vraies boîtes (suppression définitive, lecture seule, fichier en cours
@@ -730,7 +730,7 @@ pub fn lancer(hwnd: HWND, numero: u64, genre: Genre, elements: Vec<Element>, vid
             }
             ATTENTES.lock().unwrap_or_else(|e| e.into_inner()).push(numero);
             let _ = windows::Win32::Graphics::Gdi::InvalidateRect(HWND(fenetre as *mut _), None, false);
-            let joignable = |e: &Element| std::path::Path::new(&e.source).exists() && e.dest.as_deref().map_or(true, |d| std::path::Path::new(d).exists());
+            let joignable = |e: &Element| std::path::Path::new(&e.source).exists() && e.dest.as_deref().is_none_or(|d| std::path::Path::new(d).exists());
             // Jusqu'à 10 minutes, un essai toutes les 3 secondes
             let mut revenu = false;
             for _ in 0..200 {
@@ -822,7 +822,7 @@ pub fn deplacer_sans_ecraser(de: &str, vers: &str) -> std::io::Result<()> {
     // donc pendant tout l'appel à `MoveFileW`
     unsafe {
         windows::Win32::Storage::FileSystem::MoveFileW(&windows::core::HSTRING::from(long(de)), &windows::core::HSTRING::from(long(vers)))
-            .map_err(|e| std::io::Error::from_raw_os_error((e.code().0 & 0xFFFF) as i32))
+            .map_err(|e| std::io::Error::from_raw_os_error(e.code().0 & 0xFFFF))
     }
 }
 

@@ -180,6 +180,29 @@ pub fn extraire(fichier: &str, membres: &[String], dest: &str) -> Result<(), Str
     }
 }
 
+/// Contenu brut de ces éléments (noms comme `Membre::chemin`), écrit les uns après les autres dans l'ordre de l'archive :
+/// sert à lire le XML d'un .docx ou d'un .xlsx sans rien écrire sur le disque. 32 Mo au plus.
+pub fn membres_en_sortie(fichier: &str, noms: &[&str]) -> Option<Vec<u8>> {
+    use std::io::Read;
+    use std::process::Stdio;
+    if noms.is_empty() {
+        return None;
+    }
+    let mut enfant = tar().arg("-xOf").arg(fichier).arg("--").args(noms).stdout(Stdio::piped()).stderr(Stdio::null()).spawn().ok()?;
+    let mut octets = Vec::new();
+    if let Some(sortie) = enfant.stdout.as_mut() {
+        let _ = sortie.take(32 << 20).read_to_end(&mut octets);
+    }
+    // Coupé à 32 Mo : on arrête tar au lieu de l'attendre
+    let _ = enfant.kill();
+    let _ = enfant.wait();
+    if octets.is_empty() {
+        None
+    } else {
+        Some(octets)
+    }
+}
+
 /// Dossier temporaire où un fichier de l'archive est extrait pour être ouvert
 pub fn dossier_temporaire(fichier: &str) -> String {
     let mut h = crate::outils::Sha256::new();
@@ -203,13 +226,10 @@ pub fn creer(dest: &str, dossier: &str, noms: &[String]) -> Result<(), String> {
 
 /// Nom libre pour une nouvelle archive ou un dossier d'extraction : `nom.zip`, `nom (2).zip`…
 pub fn nom_libre(dossier: &str, base: &str, ext: &str) -> String {
-    for k in 1.. {
-        let nom = if k == 1 { format!("{base}{ext}") } else { format!("{base} ({k}){ext}") };
-        if !std::path::Path::new(&crate::dossier::joindre(dossier, &nom)).exists() {
-            return nom;
-        }
-    }
-    unreachable!()
+    (1..)
+        .map(|k| if k == 1 { format!("{base}{ext}") } else { format!("{base} ({k}){ext}") })
+        .find(|nom| !std::path::Path::new(&crate::dossier::joindre(dossier, nom)).exists())
+        .unwrap_or_else(|| format!("{base}{ext}"))
 }
 
 /// Nom d'archive sans ses extensions : `photos.tar.gz` → `photos`

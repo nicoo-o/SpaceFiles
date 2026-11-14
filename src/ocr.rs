@@ -87,6 +87,7 @@ pub fn liberer() {
 }
 
 /// Réception du résultat par la fenêtre : libère la place, qu'il s'agisse d'un texte ou d'une erreur
+#[allow(clippy::boxed_local)] // le message de fenêtre transporte un `Box` : il est rendu ici
 pub fn recevoir(r: Box<Resultat>) -> Resultat {
     liberer();
     *r

@@ -106,7 +106,7 @@ fn langue_valide(s: &str) -> bool {
 /// Texte du fichier depuis ses octets : UTF-8 (BOM toléré) ou UTF-16 avec BOM (PowerShell 5.1 écrit ainsi). None : illisible.
 fn decoder(octets: &[u8]) -> Option<String> {
     if let Some(reste) = octets.strip_prefix(&[0xFF, 0xFE]) {
-        let u: Vec<u16> = reste.chunks_exact(2).map(|p| u16::from_le_bytes([p[0], p[1]])).collect();
+        let u: Vec<u16> = reste.as_chunks::<2>().0.iter().map(|p| u16::from_le_bytes([p[0], p[1]])).collect();
         return String::from_utf16(&u).ok();
     }
     let reste = octets.strip_prefix(&[0xEF, 0xBB, 0xBF]).unwrap_or(octets);

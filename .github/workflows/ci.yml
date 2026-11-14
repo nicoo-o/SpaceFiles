@@ -1,0 +1,34 @@
+# Intégration continue minimale : le programme compile en release et les tests passent, sur Windows
+# (Win32 et Direct2D : aucune autre plateforme n'a de sens ici).
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+      - name: Compilation (release)
+        run: cargo build --release --locked
+      - name: Tests
+        run: cargo test --locked
+      - name: Clippy (zéro avertissement)
+        run: cargo clippy --release --locked -- -D warnings
+
+  # Audit des dépendances contre la base RustSec (cargo-audit ne se compile pas avec la chaîne GNU du PC de
+  # l'auteur : il tourne donc ici, sur les serveurs de GitHub).
+  audit:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      checks: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: rustsec/audit-check@v2
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}

@@ -145,33 +145,7 @@ pub(crate) fn dossier_eco() -> Option<PathBuf> {
 /// Écriture atomique : fichier temporaire à côté (nom unique : deux écrivains ne se marchent pas dessus), forcé sur le
 /// disque, puis renommé sur la cible. Après une coupure, le fichier est l'ancien ou le nouveau, jamais un fichier vide.
 pub(crate) fn ecrire_atomique(cible: &Path, texte: &str) -> std::io::Result<()> {
-    use std::io::Write;
-    use std::sync::atomic::{AtomicU32, Ordering};
-    static N: AtomicU32 = AtomicU32::new(0);
-    if let Some(d) = cible.parent() {
-        std::fs::create_dir_all(d)?;
-    }
-    let nom = cible.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-    let tmp = cible.with_file_name(format!("{nom}.{}.{}.tmp", std::process::id(), N.fetch_add(1, Ordering::Relaxed)));
-    let ecrit = std::fs::File::create(&tmp).and_then(|mut f| {
-        f.write_all(texte.as_bytes())?;
-        f.sync_all()
-    });
-    if let Err(e) = ecrit {
-        let _ = std::fs::remove_file(&tmp);
-        return Err(e);
-    }
-    // Le renommage sur un fichier que quelqu'un lit à cet instant peut être refusé un court instant : quelques essais
-    let mut dernier = Ok(());
-    for _ in 0..20 {
-        dernier = std::fs::rename(&tmp, cible);
-        if dernier.is_ok() {
-            return Ok(());
-        }
-        std::thread::sleep(std::time::Duration::from_millis(10));
-    }
-    let _ = std::fs::remove_file(&tmp);
-    dernier
+    crate::atomique::ecrire(cible, texte.as_bytes())
 }
 
 // ───────────────────────── Résident ─────────────────────────

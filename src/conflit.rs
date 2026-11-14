@@ -157,15 +157,16 @@ pub fn nom_libre(dossier: &str, nom: &str, conteneur: bool, pris: &mut HashSet<S
         Some(i) if i > 0 && !conteneur => (&nom[..i], &nom[i..]),
         _ => (nom, ""),
     };
-    for n in 2.. {
-        let essai = format!("{base} ({n}){ext}");
-        let cle = format!("{}\\{}", dossier.trim_end_matches('\\'), essai).to_lowercase();
-        if !pris.contains(&cle) && std::fs::symlink_metadata(dossier::joindre(dossier, &essai)).is_err() {
-            pris.insert(cle);
-            return essai;
-        }
-    }
-    unreachable!()
+    let (essai, cle) = (2..)
+        .map(|n| {
+            let essai = format!("{base} ({n}){ext}");
+            let cle = format!("{}\\{}", dossier.trim_end_matches('\\'), essai).to_lowercase();
+            (essai, cle)
+        })
+        .find(|(essai, cle)| !pris.contains(cle) && std::fs::symlink_metadata(dossier::joindre(dossier, essai)).is_err())
+        .unwrap_or_else(|| (format!("{base}{ext}"), String::new()));
+    pris.insert(cle);
+    essai
 }
 
 /// Sépare les sources en éléments libres et en conflits. Rien à demander : `liste` est vide.

@@ -599,7 +599,7 @@ fn retrouver(dossier: &str, s: &Suivi) -> Option<(String, u64)> {
             continue;
         }
         let Some(age) = m.modified().ok().and_then(|t| t.elapsed().ok()).filter(|a| *a <= RETROUVER) else { continue };
-        if meilleur.as_ref().map_or(true, |(a, _)| age < *a) {
+        if meilleur.as_ref().is_none_or(|(a, _)| age < *a) {
             meilleur = Some((age, nom));
         }
     }

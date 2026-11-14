@@ -125,6 +125,7 @@ pub enum CommandeEl {
     CopierVers,
     DeplacerVers,
     CompresserVers,
+    RaccourciVers,
     Renommer,
     NouveauDossier,
     Corbeille,
@@ -153,6 +154,7 @@ pub const TABLE: &[DefCommande] = &[
     DefCommande { commande: CommandeEl::Renommer, libelle: "RENOMMER…", raccourci: "F2", param: Param::Nom, mots: "rename nom", icone: Icone::Texte },
     DefCommande { commande: CommandeEl::Corbeille, libelle: "METTRE À LA CORBEILLE", raccourci: "SUPPR", param: Param::Confirmation, mots: "supprimer effacer delete corbeille", icone: Icone::Fichier },
     DefCommande { commande: CommandeEl::CompresserVers, libelle: "COMPRESSER VERS… (ZIP)", raccourci: "", param: Param::Destination, mots: "archive zipper zip destination", icone: Icone::Archive },
+    DefCommande { commande: CommandeEl::RaccourciVers, libelle: "RACCOURCI VERS…", raccourci: "", param: Param::Destination, mots: "raccourci lien lnk shortcut alias destination", icone: Icone::Raccourci },
     DefCommande { commande: CommandeEl::NouveauDossier, libelle: "NOUVEAU DOSSIER DEDANS…", raccourci: "", param: Param::Nom, mots: "creer dossier dedans", icone: Icone::Dossier },
     DefCommande { commande: CommandeEl::OuvrirOnglet, libelle: "OUVRIR DANS UN NOUVEL ONGLET", raccourci: "CLIC MILIEU", param: Param::Aucun, mots: "tab onglet", icone: Icone::Dossier },
     DefCommande { commande: CommandeEl::CopierChemin, libelle: "COPIER LE CHEMIN", raccourci: "CTRL+MAJ+C", param: Param::Aucun, mots: "path adresse", icone: Icone::Texte },
@@ -281,6 +283,7 @@ pub fn phrase_effet(c: CommandeEl, s: &Sujet, dossier: &str) -> String {
         CommandeEl::CopierVers => if pluriel { format!("{nom} seront copiés{ou}") } else { format!("{nom} sera copié{ou}") },
         CommandeEl::DeplacerVers => if pluriel { format!("{nom} seront déplacés{ou}") } else { format!("{nom} sera déplacé{ou}") },
         CommandeEl::CompresserVers => if pluriel { format!("{nom} seront compressés en .zip{ou}") } else { format!("{nom} sera compressé en .zip{ou}") },
+        CommandeEl::RaccourciVers => if pluriel { format!("Un raccourci vers chacun de {nom} sera créé{ou}") } else { format!("Un raccourci vers {nom} sera créé{ou}") },
         CommandeEl::Corbeille => phrase_corbeille(s, s.chemins.iter().any(|c| !disque_fixe(c))),
         _ => String::new(),
     }
@@ -596,7 +599,7 @@ mod tests {
         for c in [CommandeEl::Renommer, CommandeEl::Ouvrir, CommandeEl::NouveauDossier, CommandeEl::OuvrirOnglet] {
             assert_eq!(indisponible(c, &p), Some("UN SEUL ÉLÉMENT"), "{c:?}");
         }
-        for c in [CommandeEl::CopierVers, CommandeEl::DeplacerVers, CommandeEl::Corbeille, CommandeEl::CompresserVers, CommandeEl::CopierChemin] {
+        for c in [CommandeEl::CopierVers, CommandeEl::DeplacerVers, CommandeEl::Corbeille, CommandeEl::CompresserVers, CommandeEl::RaccourciVers, CommandeEl::CopierChemin] {
             assert_eq!(indisponible(c, &p), None, "{c:?}");
         }
         // Le dossier ouvert ne se déplace, ni ne se renomme, ni ne se jette ; on peut le copier
@@ -612,6 +615,7 @@ mod tests {
         assert_eq!(def(CommandeEl::CopierVers).param, Param::Destination);
         assert_eq!(def(CommandeEl::DeplacerVers).param, Param::Destination);
         assert_eq!(def(CommandeEl::CompresserVers).param, Param::Destination);
+        assert_eq!(def(CommandeEl::RaccourciVers).param, Param::Destination);
         assert_eq!(def(CommandeEl::Renommer).param, Param::Nom);
         assert_eq!(def(CommandeEl::NouveauDossier).param, Param::Nom);
         assert_eq!(def(CommandeEl::Corbeille).param, Param::Confirmation);
@@ -719,6 +723,7 @@ mod tests {
         let p = Sujet::plusieurs(vec![r"C:\a\x".into(), r"C:\a\y".into(), r"C:\a\z".into()]);
         assert_eq!(phrase_effet(CommandeEl::CompresserVers, &p, r"C:\Docs"), "3 éléments seront compressés en .zip dans Docs");
         assert_eq!(phrase_effet(CommandeEl::CompresserVers, &fichier(r"C:\a\b.txt"), ""), "b.txt sera compressé en .zip");
+        assert_eq!(phrase_effet(CommandeEl::RaccourciVers, &fichier(r"C:\a\b.txt"), r"C:\Bureau"), "Un raccourci vers b.txt sera créé dans Bureau");
         assert_eq!(def(CommandeEl::Ouvrir).raccourci, "ENTRÉE");
     }
 

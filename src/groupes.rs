@@ -152,8 +152,8 @@ pub fn colorer(nom: &str, couleur: char) {
 /// Supprime le groupe (les fichiers ne sont pas touchés)
 pub fn supprimer(nom: &str) {
     crate::reglages::modifier(|r| {
-        r.groupes.retain(|g| g.split_once('|').map_or(true, |(_, n)| n != nom));
-        r.membres.retain(|m| m.split_once('|').map_or(true, |(n, _)| n != nom));
+        r.groupes.retain(|g| g.split_once('|').is_none_or(|(_, n)| n != nom));
+        r.membres.retain(|m| m.split_once('|').is_none_or(|(n, _)| n != nom));
     });
     invalider();
 }

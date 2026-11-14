@@ -16,6 +16,8 @@ pub enum Action {
     Deplacement { paires: Vec<(String, String)>, remplaces: Vec<(String, String)> },
     /// (origine, fichier dans la corbeille)
     Corbeille { paires: Vec<(String, String)> },
+    /// Raccourcis `.lnk` créés (Ctrl+Z : à la corbeille)
+    Raccourcis { crees: Vec<String> },
     /// Renommage par lot : (ancien nom, nouveau nom) dans `dossier`
     RenommageLot { dossier: String, paires: Vec<(String, String)> },
 }
@@ -27,6 +29,7 @@ impl Action {
             Action::RenommageLot { .. } => "RENOMMAGE PAR LOT",
             Action::NouveauDossier { .. } | Action::DossierRetire { .. } => "NOUVEAU DOSSIER",
             Action::Copie { .. } => "COPIE",
+            Action::Raccourcis { .. } => "RACCOURCI",
             Action::Deplacement { .. } => "DEPLACEMENT",
             Action::Corbeille { .. } => "MISE A LA CORBEILLE",
         }
@@ -105,7 +108,7 @@ impl Action {
             Action::Renommage { ancien, nouveau, .. } => format!("{ancien} → {nouveau}"),
             Action::RenommageLot { paires, .. } => plusieurs(paires.first().map(|p| format!("{} → {}", p.0, p.1)), paires.len()),
             Action::NouveauDossier { chemin } | Action::DossierRetire { chemin } => nom(chemin),
-            Action::Copie { crees, .. } => plusieurs(crees.first().map(|c| nom(c)), crees.len()),
+            Action::Copie { crees, .. } | Action::Raccourcis { crees } => plusieurs(crees.first().map(|c| nom(c)), crees.len()),
             Action::Deplacement { paires, .. } | Action::Corbeille { paires } => plusieurs(paires.first().map(|p| nom(&p.0)), paires.len()),
         }
     }
@@ -127,6 +130,7 @@ impl Action {
             }
             Action::NouveauDossier { chemin } | Action::DossierRetire { chemin } => (format!("Nouveau dossier · {}", nom_de(chemin)), parent_de(chemin)),
             Action::Copie { crees, .. } => (format!("Copie · {}", quoi(crees.first().map(|c| nom_de(c)), crees.len())), crees.first().map_or(String::new(), |c| format!("→ {}", parent_de(c)))),
+            Action::Raccourcis { crees } => (format!("Raccourci · {}", quoi(crees.first().map(|c| nom_de(c)), crees.len())), crees.first().map_or(String::new(), |c| format!("→ {}", parent_de(c)))),
             Action::Deplacement { paires, .. } => (
                 format!("Déplacement · {}", quoi(paires.first().map(|p| nom_de(&p.0)), paires.len())),
                 paires.first().map_or(String::new(), |p| format!("{} → {}", parent_de(&p.0), parent_de(&p.1))),
@@ -173,7 +177,9 @@ mod tests {
         assert_eq!(n.entree_journal(), ("Nouveau dossier · Projets".to_string(), "Documents".to_string()));
         let c = Action::Copie { crees: vec![r"C:\Users\a\Documents\capture-hub.png".into()], remplaces: Vec::new() };
         assert_eq!(c.entree_journal(), ("Copie · capture-hub.png".to_string(), "→ Documents".to_string()));
-        let d = Action::Deplacement { paires: vec![p(r"C:\Users\a\Bureau\a.txt", r"D:\Docs\a.txt"), p(r"C:\Users\a\Bureau\b.txt", r"D:\Docs\b.txt"), p(r"C:\Users\a\Bureau\c.txt", r"D:\Docs\c.txt")], remplaces: Vec::new() };
+        let k = Action::Raccourcis { crees: vec![r"C:\Users\a\Bureau\doc.txt - Raccourci.lnk".into()] };
+        assert_eq!((k.libelle(), k.entree_journal()), ("RACCOURCI", ("Raccourci · doc.txt - Raccourci.lnk".to_string(), "→ Bureau".to_string())));
+        let d = Action::Deplacement { paires: vec![p(r"C:\Users\a\Bureau\a.txt",r"D:\Docs\a.txt"), p(r"C:\Users\a\Bureau\b.txt", r"D:\Docs\b.txt"), p(r"C:\Users\a\Bureau\c.txt", r"D:\Docs\c.txt")], remplaces: Vec::new() };
         assert_eq!(d.entree_journal(), ("Déplacement · 3 éléments · a.txt …".to_string(), "Bureau → Docs".to_string()));
         let t = Action::Corbeille { paires: vec![p(r"C:\Users\a\Documents\ancien.txt", r"C:\$Recycle.Bin\S\$R1.txt")] };
         assert_eq!(t.entree_journal(), ("Corbeille · ancien.txt".to_string(), "Documents".to_string()));

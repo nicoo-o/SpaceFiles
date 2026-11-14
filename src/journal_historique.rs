@@ -216,13 +216,7 @@ fn sauver(j: &Journal) {
         return;
     }
     let Some(p) = chemin_fichier() else { return };
-    if let Some(d) = p.parent() {
-        let _ = std::fs::create_dir_all(d);
-    }
-    let tmp = p.with_extension("txt.tmp");
-    if std::fs::write(&tmp, ecrire(j.entrees())).is_ok() && std::fs::rename(&tmp, &p).is_err() {
-        let _ = std::fs::remove_file(&tmp);
-    }
+    crate::atomique::ecrire_journalise(&p, ecrire(j.entrees()).as_bytes(), "journal_historique");
 }
 
 /// Une action de l'utilisateur vient d'entrer dans l'historique : rend l'identifiant qui la lie à la pile d'annulation

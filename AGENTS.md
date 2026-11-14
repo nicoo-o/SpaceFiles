@@ -41,7 +41,8 @@ cargo test             # tests unitaires (une vingtaine de secondes)
 - Dépôt git local depuis le 01/11/2026, tag `pre-reboot` (état d'avant le reboot). Commit seulement à la demande
   de l'auteur. Depuis le 11/11/2026, une version publique existe sur GitHub (`nicoo-o/SpaceFiles`) : **ne jamais
   pousser `main` ni le tag**. `tools/publication/publier.sh "message"` fabrique la branche locale `public` (le
-  contenu de `main` sans les captures de l'écran de l'auteur) ; seul `git push origin public:main` publie, avec
+  contenu de `main` sans les captures, les notes de travail, les briefs ni `.claude`, nom de session et adresses locales
+  neutralisés ; la liste est en tête du script) ; seul `git push origin public:main` publie, avec
   l'accord de l'auteur. Pages d'accueil : `README.md` (anglais), `README.fr.md` ; titre généré par
   `node tools/readme/titre.mjs`. Le plan de travail est `PROJECT_REBOOT_MASTERPLAN.md` (`PLAN.md` et
   `docs/ORDRE.md` sont gelés) ; constats dans `AUDIT.md`. Les mods Windhawk

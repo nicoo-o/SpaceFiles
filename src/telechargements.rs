@@ -271,7 +271,7 @@ pub fn a_la_corbeille(chemins: &[String]) -> bool {
         let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
         let Ok(op) = CoCreateInstance::<_, IFileOperation>(&FileOperation, None, CLSCTX_ALL) else { return false };
         // FOF_WANTNUKEWARNING : sans Corbeille (clé USB, NAS), Windows demande avant de supprimer pour de bon
-        let drapeaux = FOF_SILENT.0 | FOF_NOCONFIRMATION.0 | FOF_WANTNUKEWARNING.0 | FOF_ALLOWUNDO.0 | FOFX_RECYCLEONDELETE.0 as u32;
+        let drapeaux = FOF_SILENT.0 | FOF_NOCONFIRMATION.0 | FOF_WANTNUKEWARNING.0 | FOF_ALLOWUNDO.0 | FOFX_RECYCLEONDELETE.0;
         if op.SetOperationFlags(FILEOPERATION_FLAGS(drapeaux)).is_err() {
             return false;
         }

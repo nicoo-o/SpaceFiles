@@ -100,7 +100,7 @@ pub fn recents() -> Vec<crate::dossier::Entree> {
                 .collect()
         })
         .unwrap_or_default();
-    liens.sort_by(|a, b| b.0.cmp(&a.0));
+    liens.sort_by_key(|a| std::cmp::Reverse(a.0));
     let mut vus = std::collections::HashSet::new();
     let mut v = Vec::new();
     unsafe {
@@ -307,7 +307,7 @@ pub fn date_relative(ft: u64) -> String {
             } else if jour(ft) == hier {
                 format!("HIER {heure}")
             } else if s < 7 * 86400 {
-                format!("IL Y A {} JOURS", (s + 86399) / 86400)
+                format!("IL Y A {} JOURS", s.div_ceil(86400))
             } else {
                 complete
             }
@@ -345,7 +345,7 @@ pub fn nombre(n: usize) -> String {
     let s = n.to_string();
     let mut r = String::new();
     for (i, c) in s.chars().enumerate() {
-        if i > 0 && (s.len() - i) % 3 == 0 {
+        if i > 0 && (s.len() - i).is_multiple_of(3) {
             r.push(' ');
         }
         r.push(c);

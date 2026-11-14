@@ -37,7 +37,7 @@ pub enum Teinte {
     Cyan,
     Ambre,
     Doux,
-    Faible,
+    Blanc,
     Erreur,
 }
 
@@ -169,7 +169,7 @@ pub fn etat_pixel(activite: bool, conflit: bool, erreur: bool, reussite_recente:
 pub fn teinte(etat: EtatPixel, periode: Periode) -> Teinte {
     match (etat, periode) {
         (EtatPixel::Erreur, _) => Teinte::Erreur,
-        (EtatPixel::Nuit, _) => Teinte::Faible,
+        (EtatPixel::Nuit, _) => Teinte::Blanc,
         (_, Periode::Jour) => Teinte::Cyan,
         (_, Periode::Soir) => Teinte::Ambre,
         (_, Periode::Nuit) => Teinte::Doux,
@@ -329,11 +329,11 @@ pub fn regard(rang: usize, total: usize) -> f32 {
 }
 
 /// Texte de l'état vide de la liste (`#emptyTxt` de la maquette) : « Aucun résultat pour « requête ». » quand un filtre est tapé,
-/// sinon « Dossier vide. Glisse des fichiers ici. ». Une requête faite d'espaces ne compte pas.
+/// sinon « Dossier vide. Glissez des fichiers ici. ». Une requête faite d'espaces ne compte pas.
 pub fn texte_vide(requete: &str) -> String {
     let q = requete.trim();
     if q.is_empty() {
-        "Dossier vide. Glisse des fichiers ici.".to_string()
+        "Dossier vide. Glissez des fichiers ici.".to_string()
     } else {
         format!("Aucun résultat pour « {q} ».")
     }
@@ -424,7 +424,7 @@ mod tests {
     fn teintes_selon_l_heure() {
         assert_eq!(teinte(EtatPixel::Repos, Periode::Jour), Teinte::Cyan);
         assert_eq!(teinte(EtatPixel::Activite, Periode::Soir), Teinte::Ambre);
-        assert_eq!(teinte(EtatPixel::Nuit, Periode::Nuit), Teinte::Faible);
+        assert_eq!(teinte(EtatPixel::Nuit, Periode::Nuit), Teinte::Blanc);
         assert_eq!(teinte(EtatPixel::Attention, Periode::Nuit), Teinte::Doux);
         for p in [Periode::Jour, Periode::Soir, Periode::Nuit] {
             assert_eq!(teinte(EtatPixel::Erreur, p), Teinte::Erreur);
@@ -571,8 +571,8 @@ mod tests {
 
     #[test]
     fn texte_de_l_etat_vide() {
-        assert_eq!(texte_vide(""), "Dossier vide. Glisse des fichiers ici.");
-        assert_eq!(texte_vide("   "), "Dossier vide. Glisse des fichiers ici.");
+        assert_eq!(texte_vide(""), "Dossier vide. Glissez des fichiers ici.");
+        assert_eq!(texte_vide("   "), "Dossier vide. Glissez des fichiers ici.");
         assert_eq!(texte_vide("rapport"), "Aucun résultat pour « rapport ».");
         assert_eq!(texte_vide("  a b "), "Aucun résultat pour « a b ».");
     }
@@ -582,7 +582,7 @@ mod tests {
         assert_eq!(yeux_vides(Periode::Jour), (Teinte::Cyan, 1.0));
         assert_eq!(yeux_vides(Periode::Soir), (Teinte::Ambre, 1.0));
         let (t, e) = yeux_vides(Periode::Nuit);
-        assert_eq!((t, e), (Teinte::Faible, NUIT_ECHELLE));
+        assert_eq!((t, e), (Teinte::Blanc, NUIT_ECHELLE));
     }
 
     #[test]

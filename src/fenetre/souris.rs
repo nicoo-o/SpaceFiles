@@ -63,8 +63,9 @@ pub(crate) fn survol_palette(f: &mut Fenetre, x: f32, y: f32) -> bool {
 
 /// Plus rien de l'explorateur n'est survolé. Vrai si quelque chose l'était.
 pub(crate) fn efface_survol(f: &mut Fenetre) -> bool {
-    let avait = f.app.survol != Cible::Rien;
+    let avait = f.app.survol != Cible::Rien || f.app.survol_etiquette.is_some();
     f.app.survol = Cible::Rien;
+    f.app.survol_etiquette = None;
     avait
 }
 
@@ -188,6 +189,9 @@ pub(crate) unsafe fn cible_sous(hwnd: HWND, f: &Fenetre, px: i32, py: i32) -> Ci
     if app.zones.corbeille.is_some_and(|r| dedans(&r, x, y)) {
         return Cible::Corbeille;
     }
+    if let Some((_, q)) = app.zones.stockages.iter().find(|(r, _)| dedans(r, x, y)) {
+        return *q;
+    }
     if let Some(z) = app.zones.jours.iter().find(|z| dedans(&z.0, x, y)) {
         return Cible::Jour(z.1);
     }
@@ -195,7 +199,7 @@ pub(crate) unsafe fn cible_sous(hwnd: HWND, f: &Fenetre, px: i32, py: i32) -> Ci
         return Cible::Statut;
     }
     // Vide de la barre du chemin (après les segments)
-    if y >= NAV_Y && y < NAV_Y + NAV_H && x >= chemin_x() - 10.0 && x < l - MARGE_LISTE && app.emplacement != Emplacement::Reglages {
+    if (NAV_Y..NAV_Y + NAV_H).contains(&y) && x >= chemin_x() - 10.0 && x < l - MARGE_LISTE && app.emplacement != Emplacement::Reglages {
         return Cible::Chemin;
     }
     // Toute la zone des fichiers répond, marge droite comprise : c'est le vide où l'on clique pour le menu du fond, le lasso, le dépôt
@@ -210,7 +214,7 @@ pub(crate) unsafe fn cible_sous(hwnd: HWND, f: &Fenetre, px: i32, py: i32) -> Ci
         Affichage::Grille | Affichage::Colonnes => return Cible::Rien,
         Affichage::Liste => {}
     }
-    if x > largeur_volet() && x < l && y >= ENTETE_Y && y < ENTETE_Y + ENTETE_H {
+    if x > largeur_volet() && x < l && (ENTETE_Y..ENTETE_Y + ENTETE_H).contains(&y) {
         for (col, cx, w) in colonnes(l) {
             if x >= cx && x < cx + w {
                 return Cible::Entete(col);
@@ -425,4 +429,46 @@ pub(crate) unsafe fn depot_menu(hwnd: HWND, sources: Vec<String>, dest: String, 
     ouvrir_menu(hwnd, f, choix, x, y);
     f.app.annoncer(format!("DEPOSER DANS {nom} : CHOISISSEZ"), false);
     let _ = InvalidateRect(hwnd, None, false);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn zone_fichiers_exclut_le_volet_l_en_tete_et_la_barre_d_etat_mais_pas_le_haut_de_la_liste() {
+        let (l, h) = (1000.0f32, 700.0f32);
+        let v = largeur_volet();
+        // Bords exacts : x strictement entre le volet et `l`, y de LISTE_Y inclus à la barre d'état exclue
+        assert!(!zone_fichiers(l, h, v, LISTE_Y + 10.0));
+        assert!(zone_fichiers(l, h, v + 0.5, LISTE_Y));
+        assert!(!zone_fichiers(l, h, l, LISTE_Y + 10.0));
+        assert!(zone_fichiers(l, h, l - 0.5, h - STATUT_H - 0.5));
+        assert!(!zone_fichiers(l, h, 500.0, LISTE_Y - 0.5));
+        assert!(!zone_fichiers(l, h, 500.0, h - STATUT_H));
+    }
+
+    #[test]
+    fn dans_ligne_commence_6_dip_avant_la_marge_gauche_et_finit_au_bord_droit() {
+        let l = 900.0f32;
+        let debut = largeur_volet() + MARGE_LISTE - 6.0;
+        assert!(!dans_ligne(l, debut));
+        assert!(dans_ligne(l, debut + 0.5));
+        assert!(!dans_ligne(l, bord_droit_ligne(l)));
+        assert!(dans_ligne(l, bord_droit_ligne(l) - 0.5));
+        // Le bord droit suit la largeur du panneau, d'un décalage constant
+        assert_eq!(bord_droit_ligne(l + 100.0) - bord_droit_ligne(l), 100.0);
+    }
+
+    #[test]
+    fn le_tiroir_ferme_ne_prend_jamais_la_souris_et_la_palette_la_prend_toujours() {
+        for tiroir in [false, true] {
+            for dans in [false, true] {
+                assert_eq!(destinataire_souris(true, tiroir, dans), DestSouris::Palette);
+            }
+        }
+        for dans in [false, true] {
+            assert_eq!(destinataire_souris(false, false, dans), DestSouris::Explorateur);
+        }
+    }
 }

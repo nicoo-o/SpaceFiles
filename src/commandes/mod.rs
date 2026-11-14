@@ -316,7 +316,7 @@ pub(crate) unsafe fn executer(hwnd: HWND, f: &mut Fenetre, c: Commande) {
             };
             let k = if reglages::lignes_confort() { 0 } else { 1 };
             reglages::memoriser_disposition(&d, reglages::COLONNES.load(Ordering::Relaxed), k);
-            f.app.annoncer(&format!("LIGNES {} DANS CE DOSSIER", reglages::TAILLES_LIGNES[k as usize]), false);
+            f.app.annoncer(format!("LIGNES {} DANS CE DOSSIER", reglages::TAILLES_LIGNES[k as usize]), false);
         }
         Commande::DossierParDefaut => {
             if let Some(d) = f.app.dossier().map(str::to_string) {

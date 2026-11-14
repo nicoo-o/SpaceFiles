@@ -81,6 +81,8 @@ pub(crate) unsafe fn ouvrir_menu(hwnd: HWND, f: &mut Fenetre, choix: Vec<Choix>,
     let largeur = menu::largeur_sous(&lignes).max(240.0);
     let (l, h) = taille_client(hwnd);
     sons::jouer(sons::Son::Tic);
+    // La bulle d'étiquette ne doit pas rester à côté du menu (rapport rust-reviewer, lot 18)
+    f.app.survol_etiquette = None;
     f.menu.insert(menu::Menu::nouveau(lignes, x, y, largeur, (f.dip(l as i32), f.dip(h as i32))))
 }
 

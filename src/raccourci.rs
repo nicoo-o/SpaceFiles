@@ -21,7 +21,8 @@ const WM_EFFACER_INDEX: u32 = WM_APP + 24;
 
 static WIN_ENFONCEE: AtomicBool = AtomicBool::new(false);
 static E_AVALEE: AtomicBool = AtomicBool::new(false);
-static mut FENETRE: HWND = HWND(std::ptr::null_mut());
+/// Fenêtre du résident (valeur brute du HWND, 0 : aucune) : lue par le crochet clavier, écrite une fois à la création
+static FENETRE: AtomicIsize = AtomicIsize::new(0);
 /// Le crochet clavier posé (0 : aucun) : décroché AVANT l'arrêt de `eco`, jamais deux fois
 static CROCHET: AtomicIsize = AtomicIsize::new(0);
 
@@ -117,7 +118,7 @@ unsafe extern "system" fn crochet(code: i32, wparam: WPARAM, lparam: LPARAM) -> 
             // Rien de lent ici (pas d'envoi de touche) : un crochet qui traîne retarde tout le clavier et
             // Windows peut perdre le relâchement de Win. Le travail se fait dans la fenêtre.
             Decision::Ouvrir => {
-                let _ = PostMessageW(FENETRE, WM_OUVRIR, WPARAM(0), LPARAM(0));
+                let _ = PostMessageW(HWND(FENETRE.load(Ordering::Relaxed) as *mut _), WM_OUVRIR, WPARAM(0), LPARAM(0));
                 return LRESULT(1);
             }
         }
@@ -191,7 +192,7 @@ pub fn resident() {
         RegisterClassW(&classe);
         // Fenêtre invisible (pas « message-only » : FindWindow doit la trouver pour la fermer)
         let Ok(hwnd) = CreateWindowExW(WINDOW_EX_STYLE::default(), classe_fenetre, classe_fenetre, WINDOW_STYLE::default(), 0, 0, 0, 0, None, None, instance, None) else { return };
-        FENETRE = hwnd;
+        FENETRE.store(hwnd.0 as isize, Ordering::Relaxed);
         // Ce que le résident offre aux autres applications (tube Eco multi-instances, manifeste, réglages partagés) :
         // AVANT le crochet, pour que rien de lent (lecture de `shared.json`, écriture du manifeste) ne se trouve entre la
         // pose du crochet et la boucle de messages. L'index n'est chargé qu'à la première recherche.

@@ -1,9 +1,21 @@
 // SpaceFiles : fenêtre principale (Win32 natif, sans bordure, fond noir opaque)
 #![windows_subsystem = "windows"]
+// Choix assumés (audit du 14/11, phase 5) : les fonctions de dessin Direct2D reçoivent le contexte, la
+// géométrie et les couleurs en paramètres séparés plutôt qu'en structure à construire à chaque image ; les types
+// de retour des API Win32 sont longs ; les variantes d'énumérations reprennent le vocabulaire de l'interface.
+// Les boucles indexées de rendu.rs lisent deux tableaux parallèles (entrées et pastilles) : un itérateur
+// zippé y serait moins lisible.
+#![allow(
+    clippy::too_many_arguments,
+    clippy::type_complexity,
+    clippy::enum_variant_names,
+    clippy::needless_range_loop
+)]
 
 mod apercu;
 mod app;
 mod assistant;
+mod atomique;
 mod arbre;
 mod accessibilite;
 mod comparaison;
@@ -12,6 +24,8 @@ mod ocr;
 mod panneau;
 mod rangement;
 mod archive;
+mod pages;
+mod webvue;
 mod barre;
 mod conflit;
 mod coquille;
@@ -193,6 +207,7 @@ fn main() -> Result<()> {
             lot: None,
             galerie: None,
             galerie_numero: 0,
+            galerie_glisse: None,
             avaler_caractere: false,
             menu: None,
             avaler_clic: false,
@@ -233,7 +248,7 @@ fn main() -> Result<()> {
             w!("SpaceFiles"),
             // Sans WS_SYSMENU : DWM ne dessine pas ses boutons par-dessus les nôtres,
             // tout en gardant Snap, l'ombre et les animations de réduction
-            WS_SYSMENU | WS_THICKFRAME | WS_MINIMIZEBOX | WS_MAXIMIZEBOX,
+            WS_SYSMENU | WS_THICKFRAME | WS_MINIMIZEBOX | WS_MAXIMIZEBOX | WS_CLIPCHILDREN,
             CW_USEDEFAULT,
             CW_USEDEFAULT,
             1200,
@@ -258,12 +273,6 @@ fn main() -> Result<()> {
                 a.charger(hwnd);
             }
             f.app.charger_disques(hwnd);
-            // Mode essai (`SPACEFILES_PALETTE_OUVERTE=1`, avec `SPACEFILES_SANS_REGISTRE=1`) : palette ouverte au lancement, pour les captures.
-            // Sans `index::demarrer` (qu'`ouvrir_palette` lance) : le parcours du disque fausserait la mesure du processeur au repos.
-            if palette::ouverte_par_essai() {
-                f.palette = Some(Palette::nouvelle());
-                f.remplir_palette();
-            }
         }
         let depot = coquille::Depot::nouveau(
             hwnd,

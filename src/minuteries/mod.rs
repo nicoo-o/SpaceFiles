@@ -261,7 +261,7 @@ pub(crate) unsafe fn timer_annonce(hwnd: HWND) -> LRESULT {
     if let Some(f) = etat_de(hwnd) {
         // Pastilles de fin (5 s), d'erreur et d'annulation (10 s) : elles s'effacent par cette même minuterie, tant qu'il en reste
         let temporaires = f.pastilles_temporaires();
-        if f.app.annonce.as_ref().map_or(true, |(_, _, t)| t.elapsed() >= app::DUREE_ANNONCE) {
+        if f.app.annonce.as_ref().is_none_or(|(_, _, t)| t.elapsed() >= app::DUREE_ANNONCE) {
             f.app.annonce = None;
         }
         if f.app.annonce.is_none() && !temporaires {

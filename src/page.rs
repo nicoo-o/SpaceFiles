@@ -240,7 +240,7 @@ pub fn lignes(r: &Reglages, detectes: &[Lieu], ajoutes: &[Lieu], par_defaut: boo
     let theme = THEMES_SEGMENTS.iter().position(|&t| t == r.theme).unwrap_or(0);
     l(Element::Theme, "Thème", "Auto suit l'avis partagé par les autres applications, sinon sombre. Système suit Windows.", segments(&THEMES_SEGMENTS.map(ChoixTheme::libelle), theme));
     // Rang 0 = Confort (40 DIP) : `taille_lignes` vaut 1 pour Confort dans le fichier de réglages
-    l(Element::TailleLignes, "Densité", "Hauteur des lignes de la liste : confort 40 DIP, compact 30 DIP.", segments(&["Confort", "Compact"], usize::from(r.taille_lignes == 0)));
+    l(Element::TailleLignes, "Densité", "Hauteur des lignes de la liste : confort 40 px, compact 30 px.", segments(&["Confort", "Compact"], usize::from(r.taille_lignes == 0)));
     l(Element::Contraste, "Contraste renforcé", "Textes, traits et survols plus francs ; suivi automatiquement sous le thème Contraste élevé de Windows.", oui(r.contraste));
     l(Element::Mouvement, "Mouvement", "Réduit coupe les ressorts, le reflet et les dissolutions.", segments(&["Complet", "Réduit"], usize::from(r.mouvement_reduit)));
     l(Element::Trame, "Trame de points", "Le motif discret derrière la fenêtre.", oui(r.trame));
@@ -262,7 +262,9 @@ pub fn lignes(r: &Reglages, detectes: &[Lieu], ajoutes: &[Lieu], par_defaut: boo
         l(Element::Ajoute(a.ajoute.unwrap_or(i)), &a.nom, &format!("{sorte} · {} · Suppr pour retirer", a.detail), Valeur::Bouton("Ouvrir"));
     }
     let genres = if r.experimental { "Serveur ZimaOS, partage Windows, WebDAV / Nextcloud, SFTP, dossier ou lecteur" } else { "Serveur ZimaOS, partage Windows, dossier ou lecteur" };
-    l(Element::Ajouter, "Ajouter un stockage", genres, Valeur::Bouton("+ Ajouter"));
+    // Page sans aucun stockage : dire pourquoi elle est vide au lieu de laisser une seule ligne seule (audit P2-08)
+    let genres = if detectes.is_empty() && ajoutes.is_empty() { format!("Aucun stockage pour l'instant. {genres}") } else { genres.to_string() };
+    l(Element::Ajouter, "Ajouter un stockage", &genres, Valeur::Bouton("+ Ajouter"));
 
     l(Element::Section(CATEGORIES[2]), "", "", Valeur::Rien);
     l(Element::Depart, "Dossier d'ouverture", "Quand SpaceFiles s'ouvre sans dossier précis.", Valeur::Choix(r.depart.libelle().into()));
@@ -545,7 +547,7 @@ impl Page {
     pub fn extreme(&mut self, lignes: &[Ligne], debut: bool) {
         let p = plage(lignes, self.categorie);
         let mut it = p.filter(|&k| lignes[k].element.choisissable());
-        if let Some(k) = if debut { it.next() } else { it.last() } {
+        if let Some(k) = if debut { it.next() } else { it.next_back() } {
             self.focus = k;
         }
     }
@@ -736,7 +738,8 @@ mod tests {
             Animations | Sons | PoidsSonore => 10,
             Fichier | Exporter | Importer | Reinitialiser | Version => 11,
             Info => usize::MAX,
-            Section(_) => unreachable!(),
+            // Une section n'est pas un réglage : le test appelant ne la passe jamais ici
+            Section(_) => usize::MAX - 1,
         }
     }
 

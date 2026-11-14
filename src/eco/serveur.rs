@@ -57,7 +57,7 @@ impl Connexion<'_> {
 
     /// Octets déjà arrivés dans le tube (une nouvelle requête attend), ou client parti
     pub fn requete_en_attente(&self) -> bool {
-        octets_en_attente(self.h).map_or(true, |n| n > 0)
+        octets_en_attente(self.h).is_none_or(|n| n > 0)
     }
 }
 

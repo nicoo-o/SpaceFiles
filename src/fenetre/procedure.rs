@@ -190,11 +190,19 @@ pub(crate) extern "system" fn procedure(hwnd: HWND, msg: u32, wparam: WPARAM, lp
             }
 
             WM_GALERIE => {
-                let b = Box::from_raw(lparam.0 as *mut (u64, Option<Image>));
+                let b = Box::from_raw(lparam.0 as *mut crate::apercu::PageGalerie);
                 if let Some(f) = etat_de(hwnd) {
-                    let (n, img) = *b;
-                    if let Some(g) = f.galerie.as_mut().filter(|g| g.numero == n) {
-                        g.image = img;
+                    let s = *b;
+                    // Une page dépassée (on a tourné plus vite que le décodage) est ignorée ; une page demandée au-delà de la fin
+                    // est ramenée dans les bornes par le fil, ce que `g.page >= s.pages` reconnaît
+                    // Une image rendue à une autre échelle que la dernière demandée (le zoom a bougé depuis) est ignorée aussi
+                    if let Some(g) = f.galerie.as_mut().filter(|g| g.numero == s.numero && (g.page == s.page || g.page >= s.pages) && s.echelle == g.echelle_demandee) {
+                        g.echelle = s.echelle;
+                        g.image = s.image;
+                        g.page = s.page;
+                        g.pages = s.pages;
+                        g.nature = s.nature;
+                        g.version = g.version.wrapping_add(1);
                         g.charge = true;
                         let _ = InvalidateRect(hwnd, None, false);
                     }
@@ -299,6 +307,11 @@ pub(crate) extern "system" fn procedure(hwnd: HWND, msg: u32, wparam: WPARAM, lp
                         a.fin_operation(hwnd, *b);
                         entree = a.palette_entree.take();
                     }
+                    // Une opération de la palette qui attendait dans la file et qui n'est jamais partie (Échap a vidé la file, tout ignoré) :
+                    // plus rien ne tourne, la palette le dit au lieu de rester en progression
+                    if resultat.is_none() {
+                        synchroniser_palette(f);
+                    }
                     if let Some(r) = resultat {
                         let r = r.avec_entree(genre, entree);
                         if let Some(p) = f.palette.as_mut() {
@@ -375,6 +388,20 @@ pub(crate) extern "system" fn procedure(hwnd: HWND, msg: u32, wparam: WPARAM, lp
                     }
                     // Palette ouverte : elle seule reçoit la souris (survol d'une ligne = ligne choisie), rien ne survole dessous.
                     // Tiroir Historique : même chose sous son rectangle. Un lasso en cours garde son capteur.
+                    // Coup d'œil (carte flottante sur voile) : modal, rien ne survole l'explorateur dessous, bulle d'étiquette comprise
+                    if f.galerie.is_some() {
+                        // Glissement : l'image zoomée suit le pointeur
+                        if let Some((px, py)) = f.galerie_glisse {
+                            deplacer_galerie(hwnd, f, x - px, y - py);
+                            f.galerie_glisse = Some((x, y));
+                            let _ = InvalidateRect(hwnd, None, false);
+                            return LRESULT(0);
+                        }
+                        if efface_survol(f) {
+                            let _ = InvalidateRect(hwnd, None, false);
+                        }
+                        return LRESULT(0);
+                    }
                     if f.app.lasso.is_none() {
                         let dest = destinataire(f, x, y);
                         if dest != DestSouris::Explorateur {
@@ -411,6 +438,17 @@ pub(crate) extern "system" fn procedure(hwnd: HWND, msg: u32, wparam: WPARAM, lp
                         return LRESULT(0);
                     }
                     let c = cible_sous(hwnd, f, x_lparam(lparam), y_lparam(lparam));
+                    // Carrés d'étiquette : la bulle ne change pas la cible (le clic reste celui de la ligne), mais un repaint s'impose
+                    let sous_etiquette = if f.second.is_none() && matches!(c, Cible::Ligne(_)) {
+                        f.rendu.zones_etiquettes.borrow().iter().find(|(r, _)| x >= r.left && x < r.right && y >= r.top && y < r.bottom).map(|&(r, n)| (r, n))
+                    } else {
+                        None
+                    };
+                    let etiquette_change = sous_etiquette.map(|e| e.1) != f.app.survol_etiquette.map(|e| e.1) || sous_etiquette.is_some() != f.app.survol_etiquette.is_some();
+                    f.app.survol_etiquette = sous_etiquette;
+                    if etiquette_change && c == f.app.survol {
+                        let _ = InvalidateRect(hwnd, None, false);
+                    }
                     if c != f.app.survol {
                         // Le fondu et le ressort de survol sont suivis au dessin (`mouvement::Survols`), qui arme la minuterie
                         f.app.survol = c;
@@ -457,8 +495,8 @@ pub(crate) extern "system" fn procedure(hwnd: HWND, msg: u32, wparam: WPARAM, lp
                     f.pointeur = None;
                     f.suivre_regard(hwnd);
                     f.survol_appui = false;
-                    if f.app.survol != Cible::Rien {
-                        f.app.survol = Cible::Rien;
+                    // `efface_survol` retire aussi la bulle d'étiquette : sinon elle reste peinte après la sortie du pointeur
+                    if efface_survol(f) {
                         let _ = InvalidateRect(hwnd, None, false);
                     } else {
                         invalider_reflet(hwnd, f);
@@ -549,6 +587,17 @@ pub(crate) extern "system" fn procedure(hwnd: HWND, msg: u32, wparam: WPARAM, lp
                                 return LRESULT(0);
                             }
                             rendu::CibleHistorique::Dehors => {}
+                        }
+                    }
+                    // Coup d'œil : un clic dans la carte commence un glissement (déplace l'image zoomée), un clic dehors le ferme
+                    if f.galerie.is_some() {
+                        let (l, h) = taille_client(hwnd);
+                        let [cx, cy, cw, ch] = rendu::Rendu::rect_galerie(f.dip(l as i32), f.dip(h as i32));
+                        let (x, y) = (f.dip(x_lparam(lparam)), f.dip(y_lparam(lparam)));
+                        if x >= cx && x < cx + cw && y >= cy && y < cy + ch {
+                            f.galerie_glisse = Some((x, y));
+                            SetCapture(hwnd);
+                            return LRESULT(0);
                         }
                     }
                     // Un clic ferme le coup d'œil (le renommage par lot se ferme avec Échap)
@@ -667,7 +716,7 @@ pub(crate) extern "system" fn procedure(hwnd: HWND, msg: u32, wparam: WPARAM, lp
                                 }
                             }
                             if let Some(f) = etat_de(hwnd) {
-                                f.app.survol = Cible::Rien;
+                                efface_survol(f);
                             }
                             let _ = InvalidateRect(hwnd, None, false);
                         }
@@ -783,6 +832,10 @@ pub(crate) extern "system" fn procedure(hwnd: HWND, msg: u32, wparam: WPARAM, lp
             WM_LBUTTONUP => {
                 if let Some(f) = etat_de(hwnd) {
                     f.survol_appui = false;
+                    if f.galerie_glisse.take().is_some() {
+                        let _ = ReleaseCapture();
+                        return LRESULT(0);
+                    }
                     // Relâchement sur un élément chrome encore survolé : il remonte de 2 DIP au ressort (suivi au dessin)
                     if f.app.survol.est_chrome() {
                         let _ = InvalidateRect(hwnd, None, false);
@@ -862,6 +915,13 @@ pub(crate) extern "system" fn procedure(hwnd: HWND, msg: u32, wparam: WPARAM, lp
                         Cible::Note => ouvrir_note(f),
                         Cible::Puce(k) => f.app.ajouter_jeton(crate::rendu::PUCES_FILTRE[k.min(crate::rendu::PUCES_FILTRE.len() - 1)]),
                         Cible::Corbeille => f.app.naviguer(hwnd, Emplacement::Corbeille),
+                        Cible::StockageCePc(k) => {
+                            let emp = f.app.nuages.iter().chain(&f.app.serveurs).nth(k).map(|l| l.emplacement.clone());
+                            if let Some(emp) = emp {
+                                f.app.naviguer(hwnd, emp);
+                            }
+                        }
+                        Cible::AjouterStockage => crate::commandes::formulaire_stockage(hwnd, f),
                         Cible::Statut => {
                             menu_statut(hwnd, f, f.dip(x_lparam(lparam)), f.dip(y_lparam(lparam)));
                             return LRESULT(0);
@@ -879,7 +939,7 @@ pub(crate) extern "system" fn procedure(hwnd: HWND, msg: u32, wparam: WPARAM, lp
                             } else {
                                 reglages::modifier(|r| r.taille_lignes = lignes);
                             }
-                            f.app.annoncer(if confort { "DENSITE CONFORT · 40 DIP" } else { "DENSITE COMPACT · 30 DIP" }, false);
+                            f.app.annoncer(if confort { "DENSITÉ CONFORT · LIGNES DE 40 PX" } else { "DENSITÉ COMPACTE · LIGNES DE 30 PX" }, false);
                         }
                         Cible::Reglage(k) => {
                             f.page.focus = k;
@@ -955,7 +1015,18 @@ pub(crate) extern "system" fn procedure(hwnd: HWND, msg: u32, wparam: WPARAM, lp
                 if let Some(f) = etat_de(hwnd) {
                     let crans = ((wparam.0 >> 16) & 0xFFFF) as i16 as f32 / 120.0;
                     let ctrl = wparam.0 & 0x0008 != 0; // MK_CONTROL
-                    if let Some(l) = &mut f.lot {
+                    if f.galerie.is_some() {
+                        // Coup d'œil : Ctrl + molette = zoom autour du pointeur ; molette seule = pages (un cran = une page)
+                        if ctrl {
+                            let mut p = POINT { x: x_lparam(lparam), y: y_lparam(lparam) };
+                            let _ = ScreenToClient(hwnd, &mut p);
+                            zoomer_galerie(hwnd, f, 1.25f32.powf(crans), Some((f.dip(p.x), f.dip(p.y))));
+                        } else if crans != 0.0 {
+                            let sens: i64 = if crans > 0.0 { -1 } else { 1 };
+                            page_galerie(hwnd, f, |p, n| (p as i64 + sens).clamp(0, n as i64 - 1) as u32);
+                        }
+                        let _ = InvalidateRect(hwnd, None, false);
+                    } else if let Some(l) = &mut f.lot {
                         l.defilement = (l.defilement as i64 - (crans * 3.0) as i64).clamp(0, l.noms.len().saturating_sub(1) as i64) as usize;
                     } else if let Some(p) = &mut f.palette {
                         p.deplacer(-(crans as i64));
@@ -1032,12 +1103,6 @@ pub(crate) extern "system" fn procedure(hwnd: HWND, msg: u32, wparam: WPARAM, lp
                 LRESULT(0)
             }
 
-            // Mode essai : le relâchement d'un modificateur posté (voir `noter_modificateur_essai`)
-            WM_KEYUP | WM_SYSKEYUP => {
-                noter_modificateur_essai(wparam.0 as u16, false);
-                DefWindowProcW(hwnd, msg, wparam, lparam)
-            }
-
             WM_KEYDOWN | WM_SYSKEYDOWN => {
                 let Some(f) = etat_de(hwnd) else { return LRESULT(0) };
                 // Une touche enlève le reflet : la position du curseur ne dit rien d'un élément qui a le focus clavier
@@ -1049,6 +1114,7 @@ pub(crate) extern "system" fn procedure(hwnd: HWND, msg: u32, wparam: WPARAM, lp
                     f.focus_clavier = true;
                 }
                 if !modificateur && f.pointeur.take().is_some() {
+                    f.app.survol_etiquette = None;
                     invalider_reflet(hwnd, f);
                     // Plus de pointeur : les yeux de Pixel reviennent droit devant
                     f.suivre_regard(hwnd);
@@ -1056,7 +1122,6 @@ pub(crate) extern "system" fn procedure(hwnd: HWND, msg: u32, wparam: WPARAM, lp
                 if nouveau_focus {
                     let _ = InvalidateRect(hwnd, None, false);
                 }
-                noter_modificateur_essai(wparam.0 as u16, true);
                 let vk = VIRTUAL_KEY(wparam.0 as u16);
                 let alt = msg == WM_SYSKEYDOWN || touche(VK_MENU);
                 let ctrl = touche(VK_CONTROL);
@@ -1095,7 +1160,7 @@ pub(crate) extern "system" fn procedure(hwnd: HWND, msg: u32, wparam: WPARAM, lp
                     return LRESULT(0);
                 }
                 if f.galerie.is_some() {
-                    touche_galerie(hwnd, f, vk);
+                    touche_galerie(hwnd, f, vk, ctrl);
                     animer(hwnd, f);
                     return LRESULT(0);
                 }
@@ -1637,6 +1702,7 @@ pub(crate) extern "system" fn procedure(hwnd: HWND, msg: u32, wparam: WPARAM, lp
                     glyph::progression(hwnd, op);
 
                     montrer_dossier_arbre(hwnd, f);
+                    synchroniser_web(hwnd, f);
                     // Capture sans souris (mode essai seulement) : `SPACEFILES_REFLET=x,y` pose le pointeur et la cible survolée
                     if let Some((ex, ey)) = reflet::pointeur_d_essai() {
                         let cible = cible_sous(hwnd, f, (ex * f.dpi / 96.0) as i32, (ey * f.dpi / 96.0) as i32);
@@ -1675,6 +1741,7 @@ pub(crate) extern "system" fn procedure(hwnd: HWND, msg: u32, wparam: WPARAM, lp
                     let soulevements = {
                         let mut m = f.rendu.mouvements.borrow_mut();
                         m.survols.maj(f.app.survol, f.survol_appui, t_maj, animer);
+                        m.survols.maj_etiquette(f.app.survol_etiquette.map(|e| e.1), t_maj);
                         m.survols.soulevements(t_maj)
                     };
                     // La page des Réglages qu'on vient de quitter reste dessinée 160 ms (fondu de sortie)
@@ -1832,6 +1899,8 @@ pub(crate) extern "system" fn procedure(hwnd: HWND, msg: u32, wparam: WPARAM, lp
             }
 
             WM_DESTROY => {
+                // Le contrôle WebView2 se ferme avec la fenêtre vivante, pas au destructeur du fil (après la boucle de messages)
+                crate::webvue::fermer(hwnd);
                 let _ = RevokeDragDrop(hwnd);
                 // L'abonnement au dossier Téléchargements est coupé avec la fenêtre : le fil s'arrête dès qu'il le voit (une lecture en
                 // cours peut finir, son résultat est jeté par la génération)

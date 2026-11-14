@@ -315,9 +315,100 @@ pub(crate) unsafe fn ouvrir_galerie(hwnd: HWND, f: &mut Fenetre) {
         _ => format!("{} · {}", icones::nom_type(&e), systeme::date(e.modif)),
     };
     let chemin = f.app.chemin_de(&e);
-    let fichier = matches!(e.genre, dossier::Genre::Fichier) && e.nuage != dossier::Nuage::EnLigne && !f.app.non_fiable;
-    f.galerie = Some(Galerie { numero, nom: e.nom.clone(), detail, icone: icones::pour(&e), image: None, charge: !fichier || chemin.is_none() });
-    if let (true, Some(c)) = (fichier, chemin) {
-        apercu::charger_galerie(hwnd, numero, c);
+    // Le drapeau du dossier ouvert ne couvre pas les résultats de recherche, les Récents ni les Groupes : tester le chemin lui-même
+    let fichier = matches!(e.genre, dossier::Genre::Fichier)
+        && e.nuage != dossier::Nuage::EnLigne
+        && !f.app.non_fiable
+        && !chemin.as_deref().is_some_and(|c| reglages::non_fiable(dossier::dossier_de(c)));
+    let chemin = chemin.filter(|_| fichier);
+    let mut g = Galerie::vierge(numero, e.nom.clone(), detail, icones::pour(&e), chemin.clone(), e.ext.clone());
+    // HTML, SVG… : la visionneuse web (scripts et réseau coupés) montre la page ; sans runtime WebView2, l'aperçu texte habituel
+    g.web = chemin.is_some() && crate::webvue::est_web(&e.ext) && crate::webvue::disponible();
+    let web = g.web;
+    f.galerie = Some(g);
+    if let (Some(c), false) = (chemin, web) {
+        apercu::charger_galerie(hwnd, numero, c, e.ext.clone(), 0, 1);
+    }
+}
+
+/// Visionneuse web du coup d'œil : pose le contrôle WebView2 sur la zone d'image quand l'élément est une page web, le détruit
+/// sinon. Appelé à chaque peinture ; si la création échoue (runtime absent ou cassé), l'aperçu texte prend le relais.
+pub(crate) unsafe fn synchroniser_web(hwnd: HWND, f: &mut Fenetre) {
+    let Some(g) = f.galerie.as_mut().filter(|g| g.web) else {
+        crate::webvue::fermer(hwnd);
+        return;
+    };
+    if crate::webvue::a_echoue() {
+        g.web = false;
+        let (numero, ext, chemin) = (g.numero, g.ext.clone(), g.chemin.clone());
+        crate::webvue::fermer(hwnd);
+        if let Some(c) = chemin {
+            apercu::charger_galerie(hwnd, numero, c, ext, 0, 1);
+        }
+        return;
+    }
+    let Some(chemin) = g.chemin.clone() else { return };
+    let (l, h) = crate::fenetre::taille_client(hwnd);
+    let [x, y, w, hz] = crate::rendu::Rendu::zone_image_galerie(f.dip(l as i32), f.dip(h as i32));
+    let k = f.dpi / 96.0;
+    let rect = RECT { left: (x * k).round() as i32, top: (y * k).round() as i32, right: ((x + w) * k).round() as i32, bottom: ((y + hz) * k).round() as i32 };
+    crate::webvue::synchroniser(hwnd, Some((chemin.as_str(), rect)));
+}
+
+/// Coup d'œil : tourne les pages, `vers(page, pages)` donnant la nouvelle ; sans effet s'il n'y en a qu'une
+pub(crate) unsafe fn page_galerie(hwnd: HWND, f: &mut Fenetre, vers: impl Fn(u32, u32) -> u32) {
+    let Some(g) = f.galerie.as_mut() else { return };
+    let (Some(chemin), true) = (g.chemin.clone(), g.pages > 1) else { return };
+    let nouvelle = vers(g.page, g.pages).min(g.pages - 1);
+    if nouvelle != g.page {
+        // L'ancienne page reste affichée jusqu'à l'arrivée de la nouvelle : pas de clignotement
+        g.page = nouvelle;
+        apercu::charger_galerie(hwnd, g.numero, chemin, g.ext.clone(), nouvelle, g.echelle_demandee);
+    }
+}
+
+/// Zone de l'image du coup d'œil en DIP (largeur, hauteur) et son centre (x, y) : ce que le zoom et le déplacement mesurent
+unsafe fn zone_galerie(hwnd: HWND, f: &Fenetre) -> ((f32, f32), (f32, f32)) {
+    let (l, h) = crate::fenetre::taille_client(hwnd);
+    let [x, y, w, hz] = crate::rendu::Rendu::zone_image_galerie(f.dip(l as i32), f.dip(h as i32));
+    ((w, hz), (x + w / 2.0, y + hz / 2.0))
+}
+
+/// Coup d'œil : zoom ×`facteur` autour du point `pointeur` (DIP de la fenêtre ; le centre de la zone si absent). Redemande l'image à
+/// une plus grande échelle quand le zoom l'exige : le texte, le PDF et les images restent nets.
+pub(crate) unsafe fn zoomer_galerie(hwnd: HWND, f: &mut Fenetre, facteur: f32, pointeur: Option<(f32, f32)>) {
+    let (zone, centre) = zone_galerie(hwnd, f);
+    let Some(g) = f.galerie.as_mut() else { return };
+    let Some(img) = g.image.as_ref().map(|i| (i.largeur, i.hauteur)) else { return };
+    let curseur = pointeur.map_or((0.0, 0.0), |(x, y)| (x - centre.0, y - centre.1));
+    g.zoomer(facteur, curseur, img, zone);
+    redemander_echelle(hwnd, g);
+}
+
+/// Coup d'œil : revient à l'ajustement (zoom 1, centré)
+pub(crate) unsafe fn ajuster_galerie(hwnd: HWND, f: &mut Fenetre) {
+    let Some(g) = f.galerie.as_mut() else { return };
+    g.zoom = 1.0;
+    g.decalage = (0.0, 0.0);
+    redemander_echelle(hwnd, g);
+}
+
+/// Coup d'œil : déplace l'image zoomée de (dx, dy) DIP
+pub(crate) unsafe fn deplacer_galerie(hwnd: HWND, f: &mut Fenetre, dx: f32, dy: f32) {
+    let (zone, _) = zone_galerie(hwnd, f);
+    let Some(g) = f.galerie.as_mut() else { return };
+    let Some(img) = g.image.as_ref().map(|i| (i.largeur, i.hauteur)) else { return };
+    g.decalage = (g.decalage.0 + dx, g.decalage.1 + dy);
+    g.borner(img, zone);
+}
+
+/// Demande au fil du coup d'œil la même page à l'échelle que le zoom exige, si ce n'est pas déjà fait
+unsafe fn redemander_echelle(hwnd: HWND, g: &mut Galerie) {
+    let voulue = g.echelle_voulue();
+    if voulue != g.echelle_demandee {
+        g.echelle_demandee = voulue;
+        if let Some(c) = g.chemin.clone() {
+            apercu::charger_galerie(hwnd, g.numero, c, g.ext.clone(), g.page, voulue);
+        }
     }
 }

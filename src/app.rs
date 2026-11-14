@@ -230,6 +230,10 @@ pub enum Cible {
     Note,
     /// Corbeille en points de la vue Ce PC (clic : l'ouvrir)
     Corbeille,
+    /// Ligne CLOUD ou SERVEURS de la vue Ce PC (rang dans `nuages` puis `serveurs` mis bout à bout ; clic : l'ouvrir)
+    StockageCePc(usize),
+    /// « + AJOUTER UN STOCKAGE » en bas de la vue Ce PC (clic : formulaire des réglages)
+    AjouterStockage,
     /// Bouton « réglages » en haut à droite
     Reglages,
     /// Croix du panneau Réglages
@@ -318,6 +322,8 @@ pub struct Zones {
     pub note: Option<D2D_RECT_F>,
     /// Corbeille en points, dans la vue Ce PC
     pub corbeille: Option<D2D_RECT_F>,
+    /// Lignes CLOUD et SERVEURS de la vue Ce PC, plus « + Ajouter un stockage » (maquette `renderPC`)
+    pub stockages: Vec<(D2D_RECT_F, Cible)>,
     /// Puces du champ de filtre, quand il est assez ouvert pour les montrer
     pub puces: Vec<D2D_RECT_F>,
 }
@@ -417,6 +423,8 @@ struct Attente {
     dest: Option<String>,
     trace: Trace,
     apres: Vec<(String, String)>,
+    /// C'est l'opération de la palette (marque posée par `armer_palette`) : elle la reprend en partant, pas une autre de la file
+    palette: bool,
 }
 
 /// Sélection au lasso : rectangle tiré à la souris depuis le vide de la liste.
@@ -530,6 +538,8 @@ pub struct App {
     /// Point de départ d'une sélection avec Maj
     ancre: usize,
     pub survol: Cible,
+    /// Carrés d'étiquette sous le pointeur (zone, nombre) : la bulle « ÉTIQUETTE N ». Le clic reste celui de la ligne (`survol` inchangé).
+    pub survol_etiquette: Option<(D2D_RECT_F, u8)>,
     /// Bouton de la barre dont le menu est ouvert (dessiné enfoncé, sans bulle)
     pub menu_barre: Option<crate::barre::Outil>,
     /// Colonne, croissant, fichiers et dossiers mélangés
@@ -545,6 +555,9 @@ pub struct App {
     pub zones: Zones,
     /// Hauteur visible de la liste, en DIP (mise à jour au dessin)
     pub hauteur_liste: f32,
+    /// Hauteur de ce que la vue Ce PC pose sous ses disques (cartes, sections CLOUD et SERVEURS), mise à jour au dessin :
+    /// le défilement doit pouvoir l'atteindre
+    pub pied_ce_pc: f32,
     pub favoris: Vec<Favori>,
     pub disques: Vec<Entree>,
     /// Cloud détecté et stockages ajoutés (volet)
@@ -637,6 +650,7 @@ impl App {
             marques: HashSet::new(),
             ancre: 0,
             survol: Cible::Rien,
+            survol_etiquette: None,
             menu_barre: None,
             tri: (Colonne::Nom, true, false),
             generation: 0,
@@ -648,6 +662,7 @@ impl App {
             renommer_apres: None,
             zones: Zones::default(),
             hauteur_liste: 400.0,
+            pied_ce_pc: 0.0,
             favoris: Vec::new(),
             disques: Vec::new(),
             nuages: Vec::new(),
@@ -690,8 +705,7 @@ impl App {
             saisie_chemin: None,
             completion: None,
             filtre: String::new(),
-            // Mode essai (captures sans clavier) : champ de filtre ouvert dès le lancement, comme après Ctrl+F sur un filtre vide
-            filtre_ouvert: ouvert_par_essai(),
+            filtre_ouvert: false,
             tout: Vec::new(),
             apparition: None,
             epingles: Vec::new(),
@@ -778,7 +792,7 @@ impl App {
         self.chargement = true;
         self.edition = None;
         self.filtre.clear();
-        self.filtre_ouvert = ouvert_par_essai();
+        self.filtre_ouvert = false;
         if let Emplacement::Dossier(c) = &self.emplacement {
             self.tri = crate::reglages::tri_du_dossier(c);
             // Un dossier qu'on vient d'ouvrir reprend sa vue et ses colonnes ; une actualisation n'y touche pas
@@ -992,7 +1006,7 @@ impl App {
             self.annoncer(format!("EXTRACTION DE {}…", e.nom.to_uppercase()), false);
             tache(hwnd, move || {
                 let dest = crate::archive::dossier_temporaire(&fichier);
-                let bruts = crate::archive::bruts(&fichier, &[membre.clone()]);
+                let bruts = crate::archive::bruts(&fichier, std::slice::from_ref(&membre));
                 match crate::archive::extraire(&fichier, &bruts, &dest) {
                     Ok(()) => Fini { message: "OUVERT DEPUIS L'ARCHIVE (COPIE TEMPORAIRE)".into(), erreur: false, copier: None, lancer: Some(dossier::joindre(&dest, &membre.replace('/', "\\"))) },
                     Err(e) => Fini { message: e, erreur: true, copier: None, lancer: None },
@@ -1046,6 +1060,9 @@ impl App {
 
     fn defilement_max(&self) -> f32 {
         let (par, h) = self.pas();
+        if self.emplacement == Emplacement::CePC {
+            return (crate::theme::hauteur_defilable(self.nb_rangs().div_ceil(par), h) + self.pied_ce_pc - self.hauteur_liste).max(0.0);
+        }
         defilement_maximal(self.nb_rangs().div_ceil(par), h, self.hauteur_liste)
     }
 
@@ -1096,7 +1113,7 @@ impl App {
         let mut entrees = Vec::with_capacity(v.len());
         let mut courante: Option<usize> = None;
         for &k in &ordre {
-            if courante.map_or(true, |c| cles[c] != cles[k]) {
+            if courante.is_none_or(|c| cles[c] != cles[k]) {
                 courante = Some(k);
                 let titre = cles[k].1.clone();
                 let replie = self.replies.contains(&titre);
@@ -1313,7 +1330,12 @@ impl App {
                 self.saisie_chemin = None;
                 return Some(brut.trim().to_string());
             }
-            None => self.annoncer(format!("CHEMIN INTROUVABLE : {}", t.to_uppercase()), true),
+            // La barre d'état coupe un long chemin au milieu du mot : on garde la fin, qui distingue les chemins (audit P2-05)
+            None => {
+                let m: Vec<char> = t.to_uppercase().chars().collect();
+                let vu = if m.len() > 36 { format!("…{}", m[m.len() - 35..].iter().collect::<String>()) } else { m.iter().collect() };
+                self.annoncer(format!("CHEMIN INTROUVABLE : {vu}"), true)
+            }
         }
         None
     }
@@ -1734,6 +1756,25 @@ impl App {
         Ok(id)
     }
 
+    /// Palette à étapes : un raccourci `.lnk` vers chaque élément, dans `dest` (API shell `IShellLink`, sur le fil d'interface : un
+    /// `.lnk` est minuscule, et la palette refuse les destinations réseau). Rend l'entrée d'historique, qui le défait par la corbeille.
+    pub fn creer_raccourcis_vers(&mut self, hwnd: HWND, chemins: &[String], dest: &str) -> Result<(usize, u64), String> {
+        let (crees, erreur) = unsafe { crate::coquille::raccourcis_partiels(chemins, dest) };
+        let n = crees.len();
+        if n == 0 {
+            return Err(erreur.map_or_else(|| "Aucun raccourci créé".to_string(), |e| operations::message_com(&e)));
+        }
+        // Même si l'un a échoué, ceux qui existent déjà sont notés : Ctrl+Z les défait
+        let id = historique::noter(Action::Raccourcis { crees });
+        if self.dossier().is_some_and(|o| o.eq_ignore_ascii_case(dest.trim_end_matches('\\'))) {
+            self.actualiser(hwnd);
+        }
+        match erreur {
+            Some(e) => Err(format!("{n} raccourci(s) créé(s), puis : {}", operations::message_com(&e))),
+            None => Ok((n, id)),
+        }
+    }
+
     /// Palette à étapes : compresse ces éléments (tous du même dossier) en .zip dans `dest`, en tâche de fond ; le message revient par `Fini`
     pub fn compresser_vers(&mut self, hwnd: HWND, chemins: Vec<String>, dest: String, dossier_seul: bool) {
         let Some(premier) = chemins.first() else { return };
@@ -1783,7 +1824,9 @@ impl App {
     /// Pareil, puis sort `apres` de la corbeille une fois fini
     fn lancer_puis(&mut self, hwnd: HWND, genre: operations::Genre, sources: Vec<String>, dest: Option<String>, trace: Trace, apres: Vec<(String, String)>) {
         if self.operation.is_some() || self.conflits.is_some() {
-            self.file.push_back(Attente { genre, sources, dest, trace, apres });
+            // La marque de la palette suit l'opération dans la file : la première à partir ensuite ne doit pas la recevoir à sa place
+            let palette = std::mem::take(&mut self.palette_arme);
+            self.file.push_back(Attente { genre, sources, dest, trace, apres, palette });
             self.annoncer(format!("{} EN FILE D'ATTENTE ({})", genre.libelle(), self.file.len()), false);
             return;
         }
@@ -1843,6 +1886,7 @@ impl App {
     fn suivante(&mut self, hwnd: HWND) {
         if self.operation.is_none() && self.conflits.is_none() {
             if let Some(a) = self.file.pop_front() {
+                self.palette_arme = a.palette;
                 self.lancer_puis(hwnd, a.genre, a.sources, a.dest, a.trace, a.apres);
             }
         }
@@ -2099,7 +2143,7 @@ impl App {
                     inverse(Action::DossierRetire { chemin });
                     Ok(())
                 }
-                Err(_) => Err("LE DOSSIER N'EST PLUS VIDE : LAISSE EN PLACE".to_string()),
+                Err(_) => Err("LE DOSSIER N'EST PLUS VIDE : LAISSÉ EN PLACE".to_string()),
             },
             Action::DossierRetire { chemin } => match std::fs::create_dir(&chemin) {
                 Ok(()) => {
@@ -2110,6 +2154,11 @@ impl App {
             },
             Action::Copie { crees, remplaces } => {
                 self.lancer_puis(hwnd, operations::Genre::Corbeille, crees, None, trace, remplaces);
+                Ok(())
+            }
+            // Les `.lnk` créés vont à la corbeille, comme une copie défaite : Ctrl+Y (ou « Annuler » de la corbeille) les remet en place
+            Action::Raccourcis { crees } => {
+                self.lancer_puis(hwnd, operations::Genre::Corbeille, crees, None, trace, Vec::new());
                 Ok(())
             }
             Action::Deplacement { paires, remplaces } => {
@@ -2377,8 +2426,8 @@ impl App {
         self.tout
             .iter()
             .filter(|e| analyse.est_vide() || analyse.accepte(e, maintenant))
-            .filter(|e| analyse.etiquette().map_or(true, |n| self.chemin_de(e).and_then(|c| crate::etiquettes::de(&c)) == Some(n)))
-            .filter(|e| self.jour.map_or(true, |j| crate::systeme::numero_jour(e.date_colonne()) == j))
+            .filter(|e| analyse.etiquette().is_none_or(|n| self.chemin_de(e).and_then(|c| crate::etiquettes::de(&c)) == Some(n)))
+            .filter(|e| self.jour.is_none_or(|j| crate::systeme::numero_jour(e.date_colonne()) == j))
             .filter(|e| !essentiel || e.date_colonne() >= limite || self.chemin_de(e).is_some_and(|c| epingles.contains(&c.trim_end_matches('\\').to_lowercase())))
             .cloned()
             .collect()
@@ -2598,11 +2647,10 @@ impl App {
                 lot.push((c.to_lowercase(), Arc::new(m)));
                 let fin = k + 1 == total;
                 // Par lots de 40 : la liste se remplit au fil de la lecture
-                if lot.len() >= 40 || fin {
-                    if !poster(fenetre, WM_FOND, MessageFond { numero: n, quoi: Fond::Metas(std::mem::take(&mut lot), fin) }) {
+                if (lot.len() >= 40 || fin)
+                    && !poster(fenetre, WM_FOND, MessageFond { numero: n, quoi: Fond::Metas(std::mem::take(&mut lot), fin) }) {
                         return;
                     }
-                }
             }
         });
     }
@@ -3015,7 +3063,7 @@ impl App {
         let nom = e.nom.to_uppercase();
         self.annoncer(format!("SHA-256 DE {nom}…"), false);
         tache(hwnd, move || match outils::empreinte(&chemin) {
-            Ok(h) => Fini { message: format!("SHA-256 COPIE · {nom} · {}…", &h[..16].to_uppercase()), erreur: false, copier: Some(h), lancer: None },
+            Ok(h) => Fini { message: format!("SHA-256 COPIE · {nom} · {}…", h[..16].to_uppercase()), erreur: false, copier: Some(h), lancer: None },
             Err(e) => Fini { message: e, erreur: true, copier: None, lancer: None },
         });
     }
@@ -3326,6 +3374,22 @@ mod tests {
         assert!(app.est_palette(42) && !app.est_palette(43));
     }
 
+    /// Une opération de la palette mise en file garde sa marque : la première opération de fond qui part ensuite ne la reçoit pas
+    #[test]
+    fn la_marque_de_la_palette_suit_l_operation_en_file() {
+        let mut app = App::nouveau(Emplacement::CePC);
+        app.conflits = Some(crate::conflit::preparer(operations::Genre::Copier, &[], r"C:\", Trace::Aucune));
+        // Opération de la palette arrivée pendant qu'une autre attend : elle prend la marque avec elle dans la file
+        app.armer_palette();
+        app.lancer_puis(HWND::default(), operations::Genre::Corbeille, vec![r"C:\a.txt".into()], None, Trace::Aucune, Vec::new());
+        assert!(!app.palette_arme, "la marque est dans la file, pas sur l'onglet");
+        // Une opération de fond arrive ensuite : pas de marque
+        app.lancer_puis(HWND::default(), operations::Genre::Corbeille, vec![r"C:\b.txt".into()], None, Trace::Aucune, Vec::new());
+        assert_eq!(app.en_file(), 2);
+        let marques: Vec<bool> = app.file.iter().map(|a| a.palette).collect();
+        assert_eq!(marques, [true, false]);
+    }
+
     #[test]
     fn surlignage_cherche_le_motif_de_la_recherche_et_le_filtre() {
         let mut app = App::nouveau(Emplacement::CePC);
@@ -3334,10 +3398,4 @@ mod tests {
         app.emplacement = Emplacement::Recherche { racine: r"C:\".into(), motif: "contrat".into() };
         assert_eq!(app.texte_surlignage().trim(), "contrat plan");
     }
-}
-
-/// Mode essai seulement (`SPACEFILES_SANS_REGISTRE=1` et `SPACEFILES_FILTRE_OUVERT=1`) : le champ de filtre est ouvert à vide, pour les
-/// captures faites sans clavier (Ctrl+F ne peut pas être posté : il lit l'état réel des touches). Faux en usage normal.
-fn ouvert_par_essai() -> bool {
-    crate::defaut::sans_registre() && std::env::var("SPACEFILES_FILTRE_OUVERT").is_ok_and(|v| v.trim() == "1")
 }

@@ -138,9 +138,12 @@ pub fn genre_adresse(adresse: &str) -> Option<Experimentale> {
     let bas = t.to_ascii_lowercase();
     if bas.starts_with("sftp://") || bas.starts_with("sftp:\\\\") {
         Some(Experimentale::Sftp)
-    } else if bas.starts_with("http://") || bas.starts_with("https://") || bas.starts_with("http:\\\\") || bas.starts_with("https:\\\\") {
-        Some(Experimentale::WebDav)
-    } else if t.strip_prefix("\\\\").is_some_and(|r| r.split('\\').next().unwrap_or("").contains('@')) {
+    } else if bas.starts_with("http://")
+        || bas.starts_with("https://")
+        || bas.starts_with("http:\\\\")
+        || bas.starts_with("https:\\\\")
+        || t.strip_prefix("\\\\").is_some_and(|r| r.split('\\').next().unwrap_or("").contains('@'))
+    {
         Some(Experimentale::WebDav)
     } else {
         None
@@ -810,7 +813,7 @@ pub const FICHIER_EXPORT: &str = "reglages-spacefiles.toml";
 /// d'identifiants de Windows (stockages.rs), un stockage importé demandera donc à être reconnecté.
 pub fn exporter(dossier: &std::path::Path) -> Result<std::path::PathBuf, String> {
     let c = dossier.join(FICHIER_EXPORT);
-    std::fs::write(&c, ecrire(&actuels())).map_err(|e| format!("EXPORT IMPOSSIBLE : {e}"))?;
+    crate::atomique::ecrire(&c, ecrire(&actuels()).as_bytes()).map_err(|e| format!("EXPORT IMPOSSIBLE : {e}"))?;
     Ok(c)
 }
 
@@ -838,20 +841,46 @@ pub fn reinitialiser() {
 
 fn enregistrer(r: &Reglages) {
     let Some(c) = chemin_fichier() else { return };
-    if let Some(d) = c.parent() {
-        let _ = std::fs::create_dir_all(d);
+    // Un fichier écrit par une version plus récente n'est jamais écrasé : il contient peut-être des clés que cette
+    // version ne sait pas relire, donc les réécrire les ferait disparaître
+    let existant = std::fs::read_to_string(&c).ok();
+    match existant.as_deref().map(format_du_texte) {
+        Some(Some(v)) if v > FORMAT => {
+            crate::journal::ecrire(crate::journal::Niveau::Erreur, "reglages", &format!("format {v} plus récent que {FORMAT} : réglages non enregistrés, mettre SpaceFiles à jour"));
+            return;
+        }
+        // Premier passage sur un fichier d'avant le versionnage : une copie avant de le réécrire
+        Some(None) if existant.as_deref().is_some_and(|t| !t.trim().is_empty()) => {
+            let copie = c.with_file_name("reglages.avant-format.toml");
+            if !copie.exists() {
+                let _ = std::fs::copy(&c, copie);
+            }
+        }
+        _ => {}
     }
-    // Écrit à côté, forcé sur le disque (sync_all), puis remplace : après une coupure de courant,
-    // le fichier est l'ancien ou le nouveau, jamais un fichier vide
-    let tmp = c.with_extension("toml.tmp");
-    let ecrit = std::fs::File::create(&tmp).and_then(|mut f| {
-        use std::io::Write;
-        f.write_all(ecrire(r).as_bytes())?;
-        f.sync_all()
-    });
-    if ecrit.is_ok() {
-        let _ = std::fs::rename(&tmp, &c);
+    // Écriture atomique commune (temporaire unique, sync_all, renommage vérifié) : après une coupure de courant,
+    // le fichier est l'ancien ou le nouveau, jamais un fichier vide ; un échec est journalisé
+    crate::atomique::ecrire_journalise(&c, ecrire(r).as_bytes(), "reglages");
+}
+
+/// Version du format du fichier de réglages. À monter quand une clé change de sens ou disparaît (pas quand on en ajoute :
+/// une clé inconnue est ignorée à la lecture).
+const FORMAT: u32 = 1;
+
+/// Numéro de format déclaré par `format = N` avant la première table ; `None` pour un fichier d'avant le versionnage
+fn format_du_texte(texte: &str) -> Option<u32> {
+    for ligne in texte.lines() {
+        let ligne = ligne.trim();
+        if ligne.starts_with("[[") {
+            return None;
+        }
+        if let Some((cle, valeur)) = ligne.split_once('=') {
+            if cle.trim() == "format" {
+                return valeur.trim().parse().ok();
+            }
+        }
     }
+    None
 }
 
 // ── Format ──
@@ -874,6 +903,7 @@ fn texte_toml(s: &str) -> String {
 
 fn ecrire(r: &Reglages) -> String {
     let mut s = String::from("# Réglages de SpaceFiles (modifiables ici ou avec Ctrl+, dans l'application)\n\n");
+    s += &format!("format = {FORMAT}\n");
     s += &format!("depart = {}\n", texte_toml(r.depart.cle()));
     s += &format!("restaurer_onglets = {}\n", r.restaurer_onglets);
     s += &format!("fichiers_caches = {}\n", r.caches);
@@ -1251,6 +1281,24 @@ sons = false
         // Un dossier au nom qui commence pareil n'est pas un sous-dossier
         assert!(!est_sous(r"C:\Telechargements\suspect2", &l));
         assert!(!est_sous(r"C:\Telechargements", &l));
+    }
+
+    #[test]
+    fn format_declare_et_relu() {
+        assert_eq!(format_du_texte(&ecrire(&Reglages::default())), Some(FORMAT));
+        assert_eq!(format_du_texte("# c\nformat = 7\nsons = true\n"), Some(7));
+        assert_eq!(format_du_texte("sons = true\n"), None, "fichier d'avant le versionnage");
+        assert_eq!(format_du_texte("[[stockage]]\nformat = 9\n"), None, "une clé de table n'est pas le format du fichier");
+        assert_eq!(format_du_texte("format = abc\n"), None);
+    }
+
+    #[test]
+    fn un_fichier_sans_format_se_relit_comme_avant() {
+        let r = lire("sons = false\nressort_ms = 1200\n");
+        assert!(!r.sons);
+        assert_eq!(r.ressort_ms, 1200);
+        let r2 = lire(&ecrire(&r));
+        assert!(!r2.sons && r2.ressort_ms == 1200, "la clé format ne doit rien déranger à la lecture");
     }
 
     #[test]

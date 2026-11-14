@@ -44,6 +44,16 @@ pub(crate) unsafe fn ouvrir_reglages(hwnd: HWND, f: &mut Fenetre) {
     }
 }
 
+/// « + Ajouter un stockage » de Ce PC : la page Stockages des réglages, formulaire ouvert
+pub(crate) unsafe fn formulaire_stockage(hwnd: HWND, f: &mut Fenetre) {
+    ouvrir_reglages(hwnd, f);
+    let lignes = f.lignes();
+    if let Some(k) = crate::page::CATEGORIES.iter().position(|&c| c == "Stockages") {
+        f.page.aller_categorie(&lignes, k);
+    }
+    f.page.formulaire = Some(Formulaire::nouveau());
+}
+
 /// Quitte la page des réglages (Échap) : retour au dossier précédent
 pub(crate) unsafe fn quitter_reglages(hwnd: HWND, f: &mut Fenetre) {
     if f.app.peut_reculer() {
