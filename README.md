@@ -38,12 +38,8 @@
 </p>
 
 <p align="center">
-  <img src="docs/readme/vitrine-sombre-palette.png" alt="SpaceFiles command palette, dark theme" width="880">
-</p>
-
-<p align="center">
   <img src="docs/readme/demo.gif" alt="Tour: list, grid, dual pane, command palette, quick look" width="880"><br>
-  <sub>A tour of five views (list, grid, dual pane, palette, quick look), assembled from real screenshots of a demo folder.</sub>
+  <sub>The real app, recorded on a demo folder: list, grid, dual pane, command palette (<kbd>Ctrl</kbd>+<kbd>K</kbd>), quick look (<kbd>Space</kbd>).</sub>
 </p>
 
 ---
@@ -117,15 +113,11 @@ List, grid, Miller columns. Dark, light or auto. Reduced motion switches every a
 
 ## See it
 
-<p align="center">
-  <img src="docs/readme/vitrine-sombre-liste.png" alt="List view, dark" width="430">
-  <img src="docs/readme/vitrine-clair-liste.png" alt="List view, light" width="430">
-  <img src="docs/readme/vitrine-sombre-grille.png" alt="Grid view, dark" width="430">
-  <img src="docs/readme/vitrine-sombre-double.png" alt="Dual pane, dark" width="430">
-  <img src="docs/readme/vitrine-sombre-apercu.png" alt="Quick look on an image, dark" width="430">
-  <img src="docs/readme/vitrine-clair-double.png" alt="Dual pane, light" width="430">
-</p>
-<p align="center"><sub>A demo folder with made-up files. The interface is in French (see the known limits).</sub></p>
+<table>
+<tr><td width="50%"><img src="docs/readme/vitrine-clair-liste.png" alt="List view, light" width="100%"></td><td width="50%"><img src="docs/readme/vitrine-clair-grille.png" alt="Grid view, light" width="100%"></td></tr>
+<tr><td width="50%"><img src="docs/readme/vitrine-clair-double.png" alt="Dual pane, light" width="100%"></td><td width="50%"><img src="docs/readme/vitrine-clair-apercu.png" alt="Quick look on an image, light" width="100%"></td></tr>
+</table>
+<p align="center"><sub>The light theme, on a demo folder with made-up files. The interface is in French (see the known limits).</sub></p>
 
 ## Versus File Explorer
 

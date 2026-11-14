@@ -38,12 +38,8 @@
 </p>
 
 <p align="center">
-  <img src="docs/readme/vitrine-sombre-palette.png" alt="Palette de commandes de SpaceFiles, thème sombre" width="880">
-</p>
-
-<p align="center">
   <img src="docs/readme/demo.gif" alt="Tour : liste, grille, double panneau, palette, coup d'œil" width="880"><br>
-  <sub>Un tour de cinq vues (liste, grille, double panneau, palette, coup d'œil), assemblé à partir de vraies captures d'un dossier de démonstration.</sub>
+  <sub>L'appli réelle, filmée sur un dossier de démonstration : liste, grille, double panneau, palette (<kbd>Ctrl</kbd>+<kbd>K</kbd>), coup d'œil (<kbd>Espace</kbd>).</sub>
 </p>
 
 ---
@@ -117,15 +113,11 @@ Liste, grille, colonnes Miller. Sombre, clair ou auto. Le mouvement réduit coup
 
 ## Voir
 
-<p align="center">
-  <img src="docs/readme/vitrine-sombre-liste.png" alt="Vue liste, sombre" width="430">
-  <img src="docs/readme/vitrine-clair-liste.png" alt="Vue liste, clair" width="430">
-  <img src="docs/readme/vitrine-sombre-grille.png" alt="Vue grille, sombre" width="430">
-  <img src="docs/readme/vitrine-sombre-double.png" alt="Double panneau, sombre" width="430">
-  <img src="docs/readme/vitrine-sombre-apercu.png" alt="Coup d'œil sur une image, sombre" width="430">
-  <img src="docs/readme/vitrine-clair-double.png" alt="Double panneau, clair" width="430">
-</p>
-<p align="center"><sub>Un dossier de démonstration avec des fichiers inventés.</sub></p>
+<table>
+<tr><td width="50%"><img src="docs/readme/vitrine-clair-liste.png" alt="Vue liste, clair" width="100%"></td><td width="50%"><img src="docs/readme/vitrine-clair-grille.png" alt="Vue grille, clair" width="100%"></td></tr>
+<tr><td width="50%"><img src="docs/readme/vitrine-clair-double.png" alt="Double panneau, clair" width="100%"></td><td width="50%"><img src="docs/readme/vitrine-clair-apercu.png" alt="Coup d'œil sur une image, clair" width="100%"></td></tr>
+</table>
+<p align="center"><sub>Le thème clair, sur un dossier de démonstration aux fichiers inventés.</sub></p>
 
 ## Face à l'Explorateur Windows
 
