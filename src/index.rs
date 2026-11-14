@@ -229,9 +229,19 @@ fn construire() -> Index {
     index
 }
 
+/// Version du format de `index.bin` : les quatre derniers chiffres de l'en-tête `NEIX0001`. À augmenter à chaque changement de
+/// la disposition des octets ; une version inconnue est refusée à la lecture (l'index se reconstruit) et jamais écrasée.
+const VERSION_INDEX: u32 = 1;
+
+/// Version écrite dans l'en-tête d'un fichier d'index (`NEIX` + 4 chiffres), `None` si ce n'en est pas un
+fn version_de(octets: &[u8]) -> Option<u32> {
+    let chiffres = octets.strip_prefix(b"NEIX")?.get(..4)?;
+    std::str::from_utf8(chiffres).ok()?.parse().ok()
+}
+
 fn encoder(index: &Index) -> Vec<u8> {
     let mut octets = Vec::with_capacity(index.noeuds.len() * 27 + index.noms.len() + 32);
-    octets.extend_from_slice(b"NEIX0001");
+    octets.extend_from_slice(format!("NEIX{VERSION_INDEX:04}").as_bytes());
     octets.extend_from_slice(&index.construit.to_le_bytes());
     octets.extend_from_slice(&(index.noeuds.len() as u64).to_le_bytes());
     octets.extend_from_slice(&(index.noms.len() as u64).to_le_bytes());
@@ -249,6 +259,14 @@ fn encoder(index: &Index) -> Vec<u8> {
 
 fn enregistrer(index: &Index) {
     let Some(f) = fichier_index() else { return };
+    // Fichier écrit par une version plus récente : on ne l'écrase pas (même règle que marques.txt)
+    if let Ok(mut fichier) = std::fs::File::open(&f) {
+        let mut tete = [0u8; 8];
+        if fichier.read_exact(&mut tete).is_ok() && version_de(&tete).is_some_and(|v| v > VERSION_INDEX) {
+            crate::journal::ecrire(crate::journal::Niveau::Erreur, "index", "index.bin plus récent que ce programme : non enregistré, mettre SpaceFiles à jour");
+            return;
+        }
+    }
     let octets = encoder(index);
     // Écriture atomique commune : une autre fenêtre ne lit jamais un fichier à moitié écrit
     crate::atomique::ecrire_journalise(&f, &octets, "index");
@@ -261,7 +279,7 @@ fn charger() -> Option<Index> {
 }
 
 fn decoder(octets: &[u8]) -> Option<Index> {
-    if octets.len() < 32 || &octets[..8] != b"NEIX0001" {
+    if octets.len() < 32 || version_de(octets) != Some(VERSION_INDEX) {
         return None;
     }
     let u64_ = |p: usize| u64::from_le_bytes(octets[p..p + 8].try_into().unwrap());
@@ -561,6 +579,16 @@ pub fn taille_dossier(chemin: &str) -> Option<u64> {
     Some(total)
 }
 
+/// Délai minimal entre deux reconstructions provoquées par un débordement du tampon de surveillance
+const PAUSE_DEBORDEMENT_S: u64 = 300;
+/// Instant (secondes) du dernier débordement traité ; 0 = jamais
+static DERNIER_DEBORDEMENT: AtomicU64 = AtomicU64::new(0);
+
+/// Faut-il reconstruire après un débordement à `maintenant` ? Non si le précédent date de moins de la pause
+fn debordement_a_traiter(maintenant: u64, dernier: u64) -> bool {
+    dernier == 0 || maintenant.saturating_sub(dernier) >= PAUSE_DEBORDEMENT_S
+}
+
 /// Surveillance récursive d'un disque : ajouts et retraits gardés à part, fusionnés à la recherche
 fn surveiller(racine: String, numero: u64) {
     unsafe {
@@ -600,7 +628,13 @@ fn surveiller(racine: String, numero: u64) {
                 break;
             }
             if lus == 0 {
-                continue; // trop de changements d'un coup : ils sont perdus, tant pis
+                // Tampon débordé (extraction, compilation) : Windows a jeté les changements, l'index ne les verra
+                // jamais. On le reconstruit, au plus une fois par PAUSE_DEBORDEMENT_S pour ne pas tourner en boucle
+                if debordement_a_traiter(secondes(), DERNIER_DEBORDEMENT.load(Ordering::Relaxed)) {
+                    DERNIER_DEBORDEMENT.store(secondes(), Ordering::Relaxed);
+                    reconstruire();
+                }
+                continue;
             }
             let octets = std::slice::from_raw_parts(buf.as_ptr() as *const u8, lus as usize);
             let mut p = 0usize;
@@ -851,6 +885,7 @@ pub fn chercher_dans(index: &Index, motif: &str, max: usize, annule: &dyn Fn() -
     let exclus = crate::reglages::actuels().exclus;
     let mut v = Vec::new();
     let mut lus_contenu = 0usize;
+    let mut octets_contenu = 0u64;
     let ajouts = AJOUTS.lock().unwrap_or_else(|e| e.into_inner()).clone();
     let deja: HashSet<String> = ajouts.iter().map(|a| a.0.to_lowercase()).collect();
     // `de_l_index` : un élément déjà vu par la surveillance n'est pas compté deux fois
@@ -864,11 +899,13 @@ pub fn chercher_dans(index: &Index, motif: &str, max: usize, annule: &dyn Fn() -
             return true;
         }
         if let Some(t) = &r.contenu {
-            // Lecture du contenu : bornée (fichiers de moins de 20 Mo, 4000 fichiers au plus)
-            if dossier || taille > 20 << 20 || lus_contenu >= 4000 {
+            // Lecture du contenu : bornée (fichiers de moins de 20 Mo, 4000 fichiers et 2 Go au plus : mesuré à 237-445 Mo/s
+            // à cache chaud, le pire cas 4000 × 20 Mo = 80 Go aurait pris plusieurs minutes, 2 Go en prennent 5 à 9)
+            if dossier || taille > 20 << 20 || lus_contenu >= 4000 || octets_contenu + taille > 2 << 30 {
                 return true;
             }
             lus_contenu += 1;
+            octets_contenu += taille;
             if !fichier_contient(&c, t) {
                 return true;
             }
@@ -924,7 +961,47 @@ pub fn etat() -> String {
 
 #[cfg(test)]
 mod tests {
+    /// Mesure N-04 (lancer avec `--ignored --nocapture`) : coût de la lecture de contenu au plafond de 4 000 fichiers
+    #[test]
+    #[ignore]
+    fn mesure_recherche_de_contenu() {
+        let d = std::env::temp_dir().join(format!("sf_mesure_contenu_{}", std::process::id()));
+        std::fs::create_dir_all(&d).unwrap();
+        let bloc: Vec<u8> = (0..65_536u32).map(|i| b'a' + (i % 23) as u8).collect();
+        for (taille, n) in [(50 << 10, 4000usize), (1 << 20, 400)] {
+            let mut chemins = Vec::new();
+            for i in 0..n {
+                let c = d.join(format!("f{taille}_{i}.txt"));
+                let mut o = Vec::with_capacity(taille);
+                while o.len() < taille {
+                    o.extend_from_slice(&bloc[..bloc.len().min(taille - o.len())]);
+                }
+                std::fs::write(&c, &o).unwrap();
+                chemins.push(c.to_string_lossy().into_owned());
+            }
+            let t = std::time::Instant::now();
+            let mut trouves = 0;
+            for c in &chemins {
+                if super::fichier_contient(c, "zzzzqq") {
+                    trouves += 1;
+                }
+            }
+            let ms = t.elapsed().as_millis();
+            let mo = (taille * n) as f64 / 1_048_576.0;
+            println!("MESURE contenu : {n} fichiers de {} Ko = {mo:.0} Mo lus en {ms} ms ({:.0} Mo/s), trouvés {trouves}", taille >> 10, mo * 1000.0 / ms.max(1) as f64);
+        }
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
     use super::*;
+
+    #[test]
+    fn debordement_reconstruit_au_plus_une_fois_par_pause() {
+        assert!(debordement_a_traiter(1_000, 0), "jamais traité : on reconstruit");
+        assert!(!debordement_a_traiter(1_000 + PAUSE_DEBORDEMENT_S - 1, 1_000), "trop tôt");
+        assert!(debordement_a_traiter(1_000 + PAUSE_DEBORDEMENT_S, 1_000), "pause écoulée");
+        assert!(!debordement_a_traiter(500, 1_000), "horloge reculée : on attend");
+    }
 
     #[test]
     fn disques_externes() {
@@ -1002,5 +1079,22 @@ mod tests {
         let mut enorme = bon;
         enorme[16..24].copy_from_slice(&u64::MAX.to_le_bytes());
         assert!(decoder(&enorme).is_none());
+    }
+
+    #[test]
+    fn version_du_fichier() {
+        let mut i = Index::default();
+        i.ajouter("C:", DOSSIER_RACINE, true, 0, 0);
+        let bon = encoder(&i);
+        assert_eq!(&bon[..8], b"NEIX0001");
+        assert_eq!(version_de(&bon), Some(1));
+        // Version future, en-tête abîmé ou autre fichier : refusés sans panique
+        let mut futur = bon.clone();
+        futur[..8].copy_from_slice(b"NEIX0002");
+        assert_eq!(version_de(&futur), Some(2));
+        assert!(decoder(&futur).is_none());
+        for mauvais in [&b"NEIX00"[..], b"NEIXabcd", b"", b"PK...."] {
+            assert_eq!(version_de(mauvais), None);
+        }
     }
 }

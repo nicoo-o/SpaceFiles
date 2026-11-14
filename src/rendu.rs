@@ -83,62 +83,11 @@ pub struct VueHistorique<'a> {
     pub maintenant: String,
 }
 
-/// Tiroir Historique (`.hist` de la maquette) : 340 DIP de large, du haut de la zone de contenu au pied (`top:54px; bottom:40px`),
-/// marge de 16, entrées de 51 DIP (9 + 33 + 9, filet de 1), bouton « Annuler » de 64 × 26
-pub const TIROIR_L: f32 = 340.0;
-const HIST_PAD: f32 = 16.0;
-pub const HIST_RANG: f32 = 51.0;
-const HIST_ENTETE: f32 = 48.0;
-const HIST_NOTE_H: f32 = 28.0;
-const HIST_BOUTON_L: f32 = 64.0;
-const HIST_BOUTON_H: f32 = 26.0;
-const HIST_TEMPS_L: f32 = 40.0;
-
-/// Le tiroir sorti (sans décalage) dans une fenêtre de `l` × `h` DIP
-pub fn zone_tiroir(l: f32, h: f32) -> D2D_RECT_F {
-    rect(l - TIROIR_L, HAUTEUR_TITRE + 1.0, TIROIR_L, (h - STATUT_H - HAUTEUR_TITRE - 1.0).max(0.0))
-}
-
-/// Le bas de la liste : au-dessus de la marge, et de la note « session » quand elle est là
-fn hist_bas_liste(zone: &D2D_RECT_F, avec_note: bool) -> f32 {
-    zone.bottom - HIST_PAD - if avec_note { HIST_NOTE_H } else { 0.0 }
-}
-
-/// Défilement le plus bas du tiroir pour `n` entrées (DIP) ; 0 quand tout tient
-pub fn historique_defilement_max(n: usize, zone: &D2D_RECT_F, avec_note: bool) -> f32 {
-    let visible = hist_bas_liste(zone, avec_note) - (zone.top + HIST_ENTETE);
-    (n as f32 * HIST_RANG - visible).max(0.0)
-}
-
-/// Où tombe un clic dans le tiroir
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum CibleHistorique {
-    /// Le bouton « Annuler » de l'entrée d'identifiant `id`
-    Annuler(u64),
-    /// Ailleurs dans le tiroir
-    Tiroir,
-    /// Hors du tiroir (ou tiroir rentré)
-    Dehors,
-}
-
-/// Zones de clic du tiroir au dernier dessin, décalage du glissement compris
-#[derive(Clone, Default)]
-pub struct ZonesHistorique {
-    tiroir: Option<D2D_RECT_F>,
-    boutons: Vec<(D2D_RECT_F, u64)>,
-}
-
-impl ZonesHistorique {
-    pub fn cible(&self, x: f32, y: f32) -> CibleHistorique {
-        if let Some((_, id)) = self.boutons.iter().find(|(r, _)| dedans(r, x, y)) {
-            return CibleHistorique::Annuler(*id);
-        }
-        match self.tiroir {
-            Some(r) if dedans(&r, x, y) => CibleHistorique::Tiroir,
-            _ => CibleHistorique::Dehors,
-        }
-    }
-}
+mod historique;
+pub use historique::*;
+mod zones;
+pub use zones::*;
+use historique::{hist_bas_liste, HIST_BOUTON_H, HIST_BOUTON_L, HIST_ENTETE, HIST_PAD, HIST_TEMPS_L};
 
 /// Mélange de deux couleurs (déjà passées par le thème) : `k` = 0 donne `a`, 1 donne `b`
 fn melange_couleurs(a: &D2D1_COLOR_F, b: &D2D1_COLOR_F, k: f32) -> D2D1_COLOR_F {
@@ -228,31 +177,6 @@ impl ZonesPalette {
     }
 }
 
-/// Place réservée à Pixel dans la barre d'état avant le texte : sa boîte (26 DIP) et l'espace
-pub const PIXEL_DECALAGE: f32 = 36.0;
-
-/// Bord gauche de la grille (coordonnées du panneau)
-pub fn grille_x0() -> f32 {
-    largeur_volet() + MARGE_LISTE + 6.0
-}
-
-/// Vignette de la grille sous ce point (coordonnées du panneau)
-pub fn case_grille(app: &App, x: f32, y: f32) -> Option<usize> {
-    let (par, hr) = app.pas();
-    let pas_x = app.cote_grille + GRILLE_ECART;
-    if x < grille_x0() || y < LISTE_Y {
-        return None;
-    }
-    let col = ((x - grille_x0()) / pas_x) as usize;
-    let dans_x = (x - grille_x0()) % pas_x;
-    let rang = ((y - LISTE_Y + app.defilement) / hr) as usize;
-    let dans_y = (y - LISTE_Y + app.defilement) % hr;
-    if col >= par || dans_x > app.cote_grille || dans_y > app.cote_grille + GRILLE_NOM {
-        return None;
-    }
-    let i = rang * par + col;
-    (i < app.entrees.len()).then_some(i)
-}
 
 pub struct VuePage<'a> {
     pub lignes: &'a [Ligne],
@@ -260,69 +184,6 @@ pub struct VuePage<'a> {
     pub focus_clavier: bool,
 }
 
-/// Onglets puis bouton « + », dans la barre de titre, juste après le nom
-pub fn zones_onglets(l: f32, n: usize) -> Vec<(Cible, D2D_RECT_F)> {
-    let fin = zone_recherche_haut(l).left - 12.0;
-    let n = n.max(1);
-    let dispo = (fin - ONGLETS_X - BOUTON_HAUT - 8.0).max(0.0);
-    let ecart = ONGLET_ECART * n.saturating_sub(1) as f32;
-    let largeur = ((dispo - ecart) / n as f32).clamp(ONGLET_MIN, ONGLET_MAX);
-    let y = (HAUTEUR_TITRE - 34.0) / 2.0;
-    let mut v: Vec<(Cible, D2D_RECT_F)> = (0..n).map(|k| (Cible::Onglet(k), rect(ONGLETS_X + k as f32 * (largeur + ONGLET_ECART), y, largeur, 34.0))).collect();
-    let x = ONGLETS_X + n as f32 * (largeur + ONGLET_ECART);
-    if x + BOUTON_HAUT < fin {
-        v.push((Cible::NouvelOnglet, rect(x, y, BOUTON_HAUT, BOUTON_HAUT)));
-    }
-    v
-}
-
-/// Trois icônes de la barre haute, avant les contrôles système
-pub fn x_icones_haut(l: f32) -> f32 {
-    l - 3.0 * BOUTON_LARGEUR - MARGE_HAUT - 3.0 * BOUTON_HAUT - 2.0 * ECART_HAUT
-}
-
-pub fn zone_icone_haut(l: f32, rang: usize) -> D2D_RECT_F {
-    rect(x_icones_haut(l) + rang as f32 * (BOUTON_HAUT + ECART_HAUT), (HAUTEUR_TITRE - BOUTON_HAUT) / 2.0, BOUTON_HAUT, BOUTON_HAUT)
-}
-
-pub fn zone_recherche_haut(l: f32) -> D2D_RECT_F {
-    zone_icone_haut(l, 0)
-}
-
-pub fn zone_essentiel_haut(l: f32) -> D2D_RECT_F {
-    zone_icone_haut(l, 1)
-}
-
-pub fn zone_reglages_haut(l: f32) -> D2D_RECT_F {
-    zone_icone_haut(l, 2)
-}
-
-/// Bouton « >_ » à droite du chemin, avant les autres éléments de droite
-pub const TERMINAL_LARGEUR: f32 = 32.0;
-const TERMINAL_RESERVE: f32 = 40.0;
-
-pub fn zone_terminal(l: f32) -> D2D_RECT_F {
-    rect(l - MARGE_LISTE - TERMINAL_LARGEUR, NAV_Y + 3.0, TERMINAL_LARGEUR, BOUTON_HAUT)
-}
-
-/// Panneau terminal : 196 DIP au-dessus du pied, sur toute la largeur de la liste (l'aperçu reste à droite).
-pub const TERMINAL_PANNEAU_H: f32 = 196.0;
-
-pub fn zone_terminal_panneau(l: f32, h: f32) -> D2D_RECT_F {
-    let bas = h - STATUT_H;
-    let haut = (bas - TERMINAL_PANNEAU_H).max(HAUTEUR_TITRE + 1.0);
-    rect(largeur_volet() + 1.0, haut, (l - largeur_volet() - 1.0).max(0.0), (bas - haut).max(0.0))
-}
-
-pub fn zone_terminal_fermer(l: f32, h: f32) -> D2D_RECT_F {
-    let p = zone_terminal_panneau(l, h);
-    rect(p.right - 34.0, p.top + 8.0, 24.0, 24.0)
-}
-
-pub fn zone_terminal_action(l: f32, h: f32) -> D2D_RECT_F {
-    let p = zone_terminal_panneau(l, h);
-    rect((p.right - 20.0 - 236.0).max(p.left + 20.0), p.bottom - 40.0, 236.0, 28.0)
-}
 
 /// Carte du disque (O6) et Corbeille (O7) : blocs posés sous les disques de Ce PC
 const CARTE_BLOC_L: f32 = 360.0;
@@ -344,7 +205,7 @@ fn disques_carte(app: &App) -> impl Iterator<Item = (&str, u64, u64)> {
 }
 
 fn haut_carte(app: &App) -> f32 {
-    LISTE_Y + app.nb_rangs() as f32 * hauteur_ligne() - app.defilement + 26.0
+    liste_y() + app.nb_rangs() as f32 * hauteur_ligne() - app.defilement + 26.0
 }
 
 /// Sections CLOUD et SERVEURS de Ce PC, sous les cartes (maquette `renderPC` : titre, une ligne par lieu avec son mot d'état,
@@ -389,7 +250,7 @@ fn stockages_ce_pc(app: &App, l: f32, y0: f32) -> StockagesCePc {
 
 /// Centre de Pixel dans la barre d'état (coordonnées de la fenêtre, DIP)
 pub fn pixel_dans_statut(h: f32) -> (f32, f32) {
-    (largeur_volet() + MARGE_LISTE + pixel::LARGEUR / 2.0, h - STATUT_H / 2.0)
+    (largeur_volet() + MARGE_LISTE + pixel::LARGEUR / 2.0, h - statut_h() / 2.0)
 }
 
 /// Centre de Pixel dans la palette : à gauche du champ de saisie, là où était son point d'accent
@@ -542,6 +403,8 @@ enum Pose {
 struct Formats {
     code: IDWriteTextFormat,
     titre: IDWriteTextFormat,
+    /// Marque « SPACEFILES » de la barre de titre : garde 18 DIP quelle que soit « Taille du texte » (la barre fait 52 DIP et les onglets commencent à 190)
+    marque: IDWriteTextFormat,
     /// Nom de l'élément dans l'aperçu : Segoe UI 18, graisse moyenne (maquette v6)
     apercu_nom: IDWriteTextFormat,
     chemin: IDWriteTextFormat,
@@ -675,7 +538,7 @@ pub fn disposition_volet(app: &App) -> (Vec<(&'static str, f32, bool, usize)>, V
         ("GROUPES", app.groupes.len(), Cible::Groupe, volet_ligne()),
         ("CLOUD", app.nuages.len(), Cible::Nuage, volet_ligne()),
         ("SERVEURS", app.serveurs.len(), Cible::Serveur, volet_ligne()),
-        ("DISQUES", app.disques.len(), Cible::Disque, VOLET_DISQUE),
+        ("DISQUES", app.disques.len(), Cible::Disque, volet_disque()),
         ("ARBORESCENCE", arbre_n, Cible::Arbre, volet_ligne()),
     ];
     let essentiel = crate::app::ESSENTIEL.load(std::sync::atomic::Ordering::Relaxed);
@@ -692,7 +555,7 @@ pub fn disposition_volet(app: &App) -> (Vec<(&'static str, f32, bool, usize)>, V
             continue;
         }
         for i in 0..n {
-            let marge = if pas == VOLET_DISQUE { 4.0 } else { 2.0 };
+            let marge = if pas == volet_disque() { 4.0 } else { 2.0 };
             v.push((cible(i), rect(x, y + i as f32 * pas, w, pas - marge)));
         }
         y += n as f32 * pas + VOLET_ESPACE;
@@ -739,7 +602,7 @@ fn placer_jours(app: &App, l: f32, h: f32) -> Vec<(D2D_RECT_F, u32, usize)> {
     for e in &app.tout {
         *comptes.entry(systeme::numero_jour(e.date_colonne())).or_insert(0usize) += 1;
     }
-    let y = h - STATUT_H - CHRONO_H;
+    let y = h - statut_h() - CHRONO_H;
     (0..n)
         .map(|k| {
             let j = aujourdhui - (n - 1 - k);
@@ -839,11 +702,16 @@ fn composer(local: &Matrix3x2, base: &Matrix3x2) -> Matrix3x2 {
 }
 
 fn format_famille(dw: &IDWriteFactory, famille: &str, taille: f32, graisse: DWRITE_FONT_WEIGHT, align: DWRITE_TEXT_ALIGNMENT) -> Result<IDWriteTextFormat> {
+    format_famille_dans(dw, famille, None, taille, graisse, align)
+}
+
+/// `collection` None : polices du système ; Some : collection privée (police embarquée)
+fn format_famille_dans(dw: &IDWriteFactory, famille: &str, collection: Option<&IDWriteFontCollection>, taille: f32, graisse: DWRITE_FONT_WEIGHT, align: DWRITE_TEXT_ALIGNMENT) -> Result<IDWriteTextFormat> {
     let taille = taille * crate::reglages::echelle_texte();
     unsafe {
         let f = dw.CreateTextFormat(
             &HSTRING::from(famille),
-            None,
+            collection,
             graisse,
             DWRITE_FONT_STYLE_NORMAL,
             DWRITE_FONT_STRETCH_NORMAL,
@@ -863,7 +731,7 @@ fn format_famille(dw: &IDWriteFactory, famille: &str, taille: f32, graisse: DWRI
 
 /// Titres et marques : Doto
 fn format_texte(dw: &IDWriteFactory, taille: f32, graisse: DWRITE_FONT_WEIGHT, align: DWRITE_TEXT_ALIGNMENT) -> Result<IDWriteTextFormat> {
-    format_famille(dw, POLICE, taille, graisse, align)
+    format_famille_dans(dw, POLICE, collection_doto(dw).as_ref(), taille, graisse, align)
 }
 
 /// Interface (libellés, colonnes, états, valeurs) : Segoe UI Variable Text, comme la maquette v6 ; repli sur Segoe UI
@@ -879,29 +747,36 @@ fn format_sans(dw: &IDWriteFactory, taille: f32, graisse: DWRITE_FONT_WEIGHT, al
 thread_local! {
     /// JetBrains Mono embarquée, chargée une fois (None : le chargement a échoué, on retombe sur Cascadia Mono)
     static COLLECTION_MONO: RefCell<Option<Option<IDWriteFontCollection>>> = const { RefCell::new(None) };
+    /// Doto embarquée, chargée une fois (None : échec, on retombe sur la Doto installée dans Windows, sinon sur la police par défaut)
+    static COLLECTION_DOTO: RefCell<Option<Option<IDWriteFontCollection>>> = const { RefCell::new(None) };
 }
 
-/// Fichier de la police mono, embarqué dans l'exe : rien n'est installé sur la machine
+/// Fichiers des polices, embarqués dans l'exe : rien n'est installé sur la machine (Doto : police variable, licence OFL)
 static JETBRAINS_MONO: &[u8] = include_bytes!("../assets/fonts/JetBrainsMono-Regular.ttf");
+static DOTO: &[u8] = include_bytes!("../assets/fonts/Doto.ttf");
 
-/// Collection privée qui contient JetBrains Mono (chargeur de polices en mémoire de DirectWrite 5, Windows 10 1809+)
+/// Collection privée construite depuis une police embarquée (chargeur de polices en mémoire de DirectWrite 5, Windows 10 1809+)
+fn collection_embarquee(dw: &IDWriteFactory, octets: &'static [u8]) -> Option<IDWriteFontCollection> {
+    unsafe {
+        let f5: IDWriteFactory5 = dw.cast().ok()?;
+        let chargeur = f5.CreateInMemoryFontFileLoader().ok()?;
+        dw.RegisterFontFileLoader(&chargeur).ok()?;
+        // SAFETY: `octets` est 'static, donc vivant tant que le chargeur existe (il n'est jamais retiré)
+        let fichier = chargeur.CreateInMemoryFontFileReference(dw, octets.as_ptr() as *const _, octets.len() as u32, None).ok()?;
+        let b = f5.CreateFontSetBuilder().ok()?;
+        b.AddFontFile(&fichier).ok()?;
+        let jeu = b.CreateFontSet().ok()?;
+        let col: IDWriteFontCollection1 = f5.CreateFontCollectionFromFontSet(&jeu).ok()?;
+        col.cast().ok()
+    }
+}
+
 fn collection_mono(dw: &IDWriteFactory) -> Option<IDWriteFontCollection> {
-    COLLECTION_MONO.with(|c| {
-        c.borrow_mut()
-            .get_or_insert_with(|| unsafe {
-                let f5: IDWriteFactory5 = dw.cast().ok()?;
-                let chargeur = f5.CreateInMemoryFontFileLoader().ok()?;
-                dw.RegisterFontFileLoader(&chargeur).ok()?;
-                // SAFETY: JETBRAINS_MONO est 'static, donc vivant tant que le chargeur existe (il n'est jamais retiré)
-                let fichier = chargeur.CreateInMemoryFontFileReference(dw, JETBRAINS_MONO.as_ptr() as *const _, JETBRAINS_MONO.len() as u32, None).ok()?;
-                let b = f5.CreateFontSetBuilder().ok()?;
-                b.AddFontFile(&fichier).ok()?;
-                let jeu = b.CreateFontSet().ok()?;
-                let col: IDWriteFontCollection1 = f5.CreateFontCollectionFromFontSet(&jeu).ok()?;
-                col.cast().ok()
-            })
-            .clone()
-    })
+    COLLECTION_MONO.with(|c| c.borrow_mut().get_or_insert_with(|| collection_embarquee(dw, JETBRAINS_MONO)).clone())
+}
+
+fn collection_doto(dw: &IDWriteFactory) -> Option<IDWriteFontCollection> {
+    COLLECTION_DOTO.with(|c| c.borrow_mut().get_or_insert_with(|| collection_embarquee(dw, DOTO)).clone())
 }
 
 /// Format en police mono (noms, chemins, dates, texte courant) : une seule graisse, donc jamais de gras simulé
@@ -936,9 +811,9 @@ pub fn dedans(r: &D2D_RECT_F, x: f32, y: f32) -> bool {
 /// Rectangles des trois boutons de navigation
 pub fn boutons_nav() -> [(Cible, D2D_RECT_F); 3] {
     [
-        (Cible::Precedent, rect(nav_x(), NAV_Y + 4.0, NAV_BOUTON, NAV_H - 8.0)),
-        (Cible::Suivant, rect(nav_x() + NAV_BOUTON, NAV_Y + 4.0, NAV_BOUTON, NAV_H - 8.0)),
-        (Cible::Parent, rect(nav_x() + 2.0 * NAV_BOUTON, NAV_Y + 4.0, NAV_BOUTON, NAV_H - 8.0)),
+        (Cible::Precedent, rect(nav_x(), nav_y() + 4.0, NAV_BOUTON, nav_h() - 8.0)),
+        (Cible::Suivant, rect(nav_x() + NAV_BOUTON, nav_y() + 4.0, NAV_BOUTON, nav_h() - 8.0)),
+        (Cible::Parent, rect(nav_x() + 2.0 * NAV_BOUTON, nav_y() + 4.0, NAV_BOUTON, nav_h() - 8.0)),
     ]
 }
 
@@ -963,6 +838,7 @@ impl Rendu {
             let f = Formats {
                 code,
                 titre: format_texte(&dw, 18.0, DWRITE_FONT_WEIGHT_BOLD, g)?,
+                marque: format_texte(&dw, 18.0 / crate::reglages::echelle_texte(), DWRITE_FONT_WEIGHT_BOLD, g)?,
                 apercu_nom: format_sans(&dw, 18.0, DWRITE_FONT_WEIGHT_MEDIUM, g)?,
                 chemin: format_texte(&dw, 22.0, DWRITE_FONT_WEIGHT_BOLD, g)?,
                 // Libellés de l'interface : sans empattement, comme la maquette v6 (`--lab`, `.cols`, `.status`)
@@ -1265,7 +1141,7 @@ impl Rendu {
         let ll = largeur_liste(l, vue.apercu_visible);
         let lp = largeur_panneau(ll, autre.is_some());
         for (rang, a) in std::iter::once(&mut *app).chain(autre.as_deref_mut()).enumerate() {
-            a.hauteur_liste = (h - LISTE_Y - STATUT_H - if a.avec_chronologie() { CHRONO_H } else { 0.0 }).max(0.0);
+            a.hauteur_liste = (h - liste_y() - statut_h() - if a.avec_chronologie() { CHRONO_H } else { 0.0 }).max(0.0);
             a.zones.jours = if a.avec_chronologie() { placer_jours(a, lp, h) } else { Vec::new() };
             // Lot 14 : le champ de filtre s'ouvre (largeur 450 ms au ressort, opacité 200 ms) ; sa part est posée avant la mesure du chemin
             let pilule = self.mouvements.borrow_mut().pilule(rang, a.champ_filtre_visible(), mouvement::maintenant_ms(), crate::reglages::animations_actives());
@@ -1280,7 +1156,7 @@ impl Rendu {
             };
             a.zones.segments = self.placer_segments(a, lp - place);
             let wn = self.largeur_note(a, lp);
-            a.zones.note = (wn > 0.0 && a.saisie_chemin.is_none()).then(|| rect(lp - MARGE_LISTE - TERMINAL_RESERVE - (place - TERMINAL_RESERVE - wn - 8.0) - wn, NAV_Y + 9.0, wn, NAV_H - 18.0));
+            a.zones.note = (wn > 0.0 && a.saisie_chemin.is_none()).then(|| rect(lp - MARGE_LISTE - TERMINAL_RESERVE - (place - TERMINAL_RESERVE - wn - 8.0) - wn, nav_y() + 9.0, wn, nav_h() - 18.0));
             a.zones.barre = if a.emplacement == Emplacement::Reglages {
                 Vec::new()
             } else {
@@ -1297,7 +1173,7 @@ impl Rendu {
                 a.pied_ce_pc = 26.0 + st.bas - y0;
                 // Le dessin est coupé à la liste : une zone hors de la bande visible ne doit ni réagir au clic (barre d'état, chemin) ni
                 // s'allumer au survol
-                let (bande_haut, bande_bas) = (LISTE_Y, LISTE_Y + a.hauteur_liste);
+                let (bande_haut, bande_bas) = (liste_y(), liste_y() + a.hauteur_liste);
                 a.zones.stockages = st.lignes.into_iter().filter(|(r, _)| r.bottom > bande_haut && r.top < bande_bas).collect();
             } else {
                 a.zones.stockages.clear();
@@ -1339,18 +1215,26 @@ impl Rendu {
         let dispo = l - chemin_x() - 20.0;
         let mut debut = 0;
         let total = |lg: &[f32], d: usize| lg[d..].iter().sum::<f32>() + sep * (lg.len() - d - 1) as f32;
-        while debut + 1 < segs.len() && total(&largeurs, debut) > dispo {
+        // Ancêtres masqués : un segment « … » cliquable les remplace et mène au plus proche d'entre eux (le parent du premier segment
+        // visible) ; il prend sa place, plus un séparateur, dans la largeur disponible
+        let largeur_ellipse = self.mesurer_espace("…", &self.f.chemin) + 2.0 * CRUMB_MARGE;
+        let reserve = |d: usize| if d > 0 { largeur_ellipse + sep } else { 0.0 };
+        while debut + 1 < segs.len() && total(&largeurs, debut) + reserve(debut) > dispo {
             debut += 1;
         }
         if let Some(&dernier) = largeurs.last() {
-            let reste = (dispo - (total(&largeurs, debut) - dernier)).max(60.0);
+            let reste = (dispo - reserve(debut) - (total(&largeurs, debut) - dernier)).max(60.0);
             let n = largeurs.len();
             largeurs[n - 1] = dernier.min(reste);
         }
         let mut x = chemin_x() - CRUMB_MARGE;
         let mut v = Vec::new();
+        if debut > 0 {
+            v.push((rect(x, nav_y(), largeur_ellipse, nav_h()), segs[debut - 1].1.clone(), "…".to_string()));
+            x += largeur_ellipse + sep;
+        }
         for (i, (texte, emp)) in segs.into_iter().enumerate().skip(debut) {
-            v.push((rect(x, NAV_Y, largeurs[i], NAV_H), emp, texte));
+            v.push((rect(x, nav_y(), largeurs[i], nav_h()), emp, texte));
             x += largeurs[i] + sep;
         }
         v
@@ -1390,7 +1274,8 @@ impl Rendu {
         let cadre = D2D1_ROUNDED_RECT { rect: rect(x + 0.5, cy - h / 2.0 + 0.5, w - 1.0, h - 1.0), radiusX: TOUCHE_RAYON, radiusY: TOUCHE_RAYON };
         self.couleur(c, &BLANC_TRES_FAIBLE);
         c.rt.DrawRoundedRectangle(&cadre, &c.pinceau, 1.0, None);
-        self.couleur(c, if actif { &BLANC_FAIBLE } else { &BLANC_TRES_FAIBLE });
+        // Texte d'une touche : jamais sous 4,5:1 (audit de contraste) ; la touche active passe en encre secondaire
+        self.couleur(c, if actif { &BLANC_DOUX } else { &BLANC_FAIBLE });
         self.texte(c, &self.f.touche, texte, rect(x, cy - h / 2.0, w, h));
         x + w
     }
@@ -1435,15 +1320,12 @@ impl Rendu {
 
     /// État d'opération à droite du pied (pause, file) ; rien : les trois gestes restent affichés
     fn texte_operation(app: &App) -> Option<String> {
-        let etat = app.operation.as_ref().map(|op| {
-            let pause = if crate::operations::attend_reseau(op.numero) {
-                "RESEAU COUPE · REPRISE DES SON RETOUR"
-            } else if app.en_pause() {
-                "EN PAUSE"
-            } else if crate::operations::LIMITEE.load(std::sync::atomic::Ordering::Relaxed) {
-                "VITESSE LIMITEE"
-            } else {
-                ""
+        let etat = app.operation.as_ref().map(|_| {
+            let pause = match app.phase_operation() {
+                // Le pied garde sa phrase longue pour le réseau : elle dit aussi ce qui va se passer
+                Some(crate::pastilles::PhaseOp::Reseau) => "RESEAU OU LECTEUR COUPE · REPRISE DES SON RETOUR",
+                Some(phase) => phase.libelle().unwrap_or(""),
+                None => "",
             };
             let file = if app.en_file() > 0 { format!("+{} EN FILE", app.en_file()) } else { String::new() };
             [pause.to_string(), file].into_iter().filter(|t| !t.is_empty()).collect::<Vec<_>>().join(" · ")
@@ -1463,12 +1345,12 @@ impl Rendu {
     /// Chaque geste est une seule touche (`CTRL+,` ne se coupe pas en deux cadres).
     unsafe fn pied(&self, c: &Cible2D, droite: f32, ys: f32, couleur: &D2D1_COLOR_F) {
         let mut x = droite - self.largeur_pied();
-        let cy = ys + STATUT_H / 2.0;
+        let cy = ys + statut_h() / 2.0;
         for (touche, libelle) in Self::GROUPES_PIED {
             x = self.touche_unique(c, touche, x, cy, true) + Self::PIED_TOUCHE_LABEL;
             let w = self.mesurer(libelle, &self.f.petit);
             self.couleur(c, couleur);
-            self.texte(c, &self.f.petit, libelle, rect(x, ys, w + 2.0, STATUT_H));
+            self.texte(c, &self.f.petit, libelle, rect(x, ys, w + 2.0, statut_h()));
             x += w + Self::PIED_ECART;
         }
     }
@@ -1540,7 +1422,25 @@ impl Rendu {
     }
 
     /// Texte de l'aperçu avec ses couleurs (code coloré, Markdown mis en forme)
-    unsafe fn texte_teinte(&self, c: &Cible2D, texte: &str, teintes: &[(u32, u32, Teinte)], zone: D2D_RECT_F) {
+    unsafe fn texte_teinte(&self, c: &Cible2D, texte: &str, teintes: &[(u32, u32, Teinte)], numeroter: bool, zone: D2D_RECT_F) {
+        // Colonne de numéros : un texte à part (même police, sans retour à la ligne), le texte coloré garde ses positions.
+        // Un titre Markdown change la taille de la ligne et décalerait les numéros : jamais dans ce cas.
+        let mut zone = zone;
+        if numeroter && !texte.is_empty() && !teintes.iter().any(|t| t.2 == Teinte::Titre) {
+            let n = texte.lines().count().max(1);
+            let chiffres = n.to_string().len();
+            let numeros: Vec<u16> = (1..=n).map(|k| format!("{k:>chiffres$}")).collect::<Vec<_>>().join("\n").encode_utf16().collect();
+            if let Ok(ln) = self.dwrite.CreateTextLayout(&numeros, &self.f.code, 200.0, zone.bottom - zone.top) {
+                let mut m = DWRITE_TEXT_METRICS::default();
+                if ln.GetMetrics(&mut m).is_ok() {
+                    let ancien = c.pinceau.GetOpacity();
+                    c.pinceau.SetOpacity(0.4);
+                    c.rt.DrawTextLayout(D2D_POINT_2F { x: zone.left, y: zone.top }, &ln, &c.pinceau, D2D1_DRAW_TEXT_OPTIONS_CLIP);
+                    c.pinceau.SetOpacity(ancien);
+                    zone.left += m.width + 10.0;
+                }
+            }
+        }
         let u: Vec<u16> = texte.encode_utf16().collect();
         let Ok(mise) = self.dwrite.CreateTextLayout(&u, &self.f.code, zone.right - zone.left, zone.bottom - zone.top) else { return };
         let teinte = |t: Teinte| match t {
@@ -1790,7 +1690,7 @@ impl Rendu {
         let m = self.mesure_filtre(app, l);
         let w = m.plein * k;
         let droite = l - MARGE_LISTE - TERMINAL_RESERVE;
-        Some((rect(droite - w, NAV_Y + 5.0, w, NAV_H - 10.0), m, opacite))
+        Some((rect(droite - w, nav_y() + 5.0, w, nav_h() - 10.0), m, opacite))
     }
 
     /// Les trois puces dans la zone du champ (rangées de la gauche vers la droite, après le texte)
@@ -2035,9 +1935,9 @@ impl Rendu {
         let (gauche, largeur) = (x0 + 22.0, l - x0 - 44.0);
         let haut = HAUTEUR_TITRE + 1.0 + 20.0;
         self.couleur(c, &BLANC_FAIBLE);
-        self.texte(c, &f.petit, "APERÇU", rect(gauche, haut, largeur, 18.0));
+        self.texte(c, &f.petit, "APERÇU", rect(gauche, haut, largeur, 18.0 * crate::theme::elasticite()));
         let Some(a) = apercu else {
-            self.couleur(c, &BLANC_TRES_FAIBLE);
+            self.couleur(c, &BLANC_FAIBLE);
             self.texte(c, &f.petit, "…", rect(gauche, haut + 40.0, largeur, 30.0));
             return;
         };
@@ -2099,27 +1999,29 @@ impl Rendu {
 
         // Nom (Segoe 18) puis les informations : libellé 12, valeur 14, comme la maquette
         self.couleur(c, &BLANC);
-        self.texte(c, &f.apercu_nom, &a.nom, rect(gauche, y, largeur, 28.0));
-        y += 40.0;
+        // Au-delà de 150 % de texte, les hauteurs de ligne suivent (`theme::elasticite`) : plus de libellés superposés
+        let e = elasticite();
+        self.texte(c, &f.apercu_nom, &a.nom, rect(gauche, y, largeur, 28.0 * e));
+        y += 40.0 * e;
         for (libelle, valeur) in &a.infos {
-            if y > h - 60.0 {
+            if y > h - 60.0 * e {
                 break;
             }
             self.couleur(c, &BLANC_FAIBLE);
-            self.texte(c, &f.petit, libelle, rect(gauche, y, largeur, 18.0));
+            self.texte(c, &f.petit, libelle, rect(gauche, y, largeur, 18.0 * e));
             self.couleur(c, &BLANC);
             // Une valeur trop longue pour une ligne (statut de signature ou de disponibilité, emplacement) passe à la ligne, sur
             // deux lignes au plus, au lieu d'être coupée par « … » : on ne lisait plus le statut
             let w: Vec<u16> = valeur.encode_utf16().collect();
             let deux = self.mesurer(valeur, &f.liste) > largeur;
-            let layout = if deux { self.dwrite.CreateTextLayout(&w, &f.liste, largeur, 40.0).ok() } else { None };
+            let layout = if deux { self.dwrite.CreateTextLayout(&w, &f.liste, largeur, 40.0 * e).ok() } else { None };
             if let Some(layout) = layout {
                 let _ = layout.SetWordWrapping(DWRITE_WORD_WRAPPING_WRAP);
-                rt.DrawTextLayout(D2D_POINT_2F { x: gauche, y: y + 16.0 }, &layout, &c.pinceau, D2D1_DRAW_TEXT_OPTIONS_CLIP);
-                y += 44.0 + 20.0;
+                rt.DrawTextLayout(D2D_POINT_2F { x: gauche, y: y + 16.0 * e }, &layout, &c.pinceau, D2D1_DRAW_TEXT_OPTIONS_CLIP);
+                y += (44.0 + 20.0) * e;
             } else {
-                self.texte(c, &f.liste, valeur, rect(gauche, y + 16.0, largeur, 20.0));
-                y += 44.0;
+                self.texte(c, &f.liste, valeur, rect(gauche, y + 16.0 * e, largeur, 20.0 * e));
+                y += 44.0 * e;
             }
         }
 
@@ -2132,7 +2034,7 @@ impl Rendu {
                 self.couleur(c, &BLANC_DOUX);
                 let interieur = rect(zone.left + 10.0, zone.top + 8.0, zone.right - zone.left - 20.0, zone.bottom - zone.top - 16.0);
                 rt.PushAxisAlignedClip(&interieur, D2D1_ANTIALIAS_MODE_ALIASED);
-                self.texte_teinte(c, t, &a.teintes, interieur);
+                self.texte_teinte(c, t, &a.teintes, a.numeroter, interieur);
                 rt.PopAxisAlignedClip();
             }
         }
@@ -2178,13 +2080,13 @@ impl Rendu {
         if lignes.is_empty() {
             self.couleur(c, &BLANC_FAIBLE);
             self.texte(c, &self.f.petit, "AUCUNE OPERATION RECENTE", rect(p.left + 24.0, y0, p.right - p.left - 48.0, 20.0));
-            self.couleur(c, &BLANC_TRES_FAIBLE);
+            self.couleur(c, &BLANC_FAIBLE);
             self.texte(c, &self.f.petit, "COPIE, DEPLACEMENT, CORBEILLE ET RENOMMAGE S'INSCRIVENT ICI.", rect(p.left + 24.0, y0 + 22.0, p.right - p.left - 48.0, 20.0));
         } else {
             let place = ((p.bottom - 46.0 - y0) / 20.0).floor().max(0.0) as usize;
             for op in lignes.iter().rev().take(place).rev() {
                 let heure = op.heure();
-                self.couleur(c, &BLANC_TRES_FAIBLE);
+                self.couleur(c, &BLANC_FAIBLE);
                 self.texte(c, &self.f.petit_mono, heure, rect(p.left + 24.0, y0, 44.0, 20.0));
                 self.couleur(c, &ACCENT);
                 self.texte(c, &self.f.petit_mono, &op.action.to_uppercase(), rect(p.left + 72.0, y0, 86.0, 20.0));
@@ -2269,7 +2171,7 @@ impl Rendu {
                 rt.FillRectangle(&rect(lx + i as f32 * 7.0, ly + j as f32 * 7.0, 5.0, 5.0), &c.pinceau);
             }
         }
-        self.couleur(c, &BLANC);            self.texte(c, &f.titre, "SPACEFILES", rect(48.0, 0.0, largeur_volet() - 56.0, HAUTEUR_TITRE));
+        self.couleur(c, &BLANC);            self.texte(c, &f.marque, "SPACEFILES", rect(48.0, 0.0, largeur_volet() - 56.0, HAUTEUR_TITRE));
         self.dessiner_onglets(c, app, l, vue);
 
         // ── Loupe, Essentiel et Réglages, à droite avant les contrôles système ──
@@ -2382,18 +2284,19 @@ impl Rendu {
                 rt.DrawRoundedRectangle(&D2D1_ROUNDED_RECT { rect: r, radiusX: 7.0, radiusY: 7.0 }, &c.pinceau, 1.5, None);
             }
             if let Cible::Disque(i) = quoi {
+                let e = elasticite();
                 // Carte du disque (maquette v6) : contour, nom, jauge et place libre en toutes lettres
                 let carte = D2D1_ROUNDED_RECT { rect: r, radiusX: 14.0, radiusY: 14.0 };
                 self.couleur(c, &CHAMP_FOND);
                 rt.FillRoundedRectangle(&carte, &c.pinceau);
                 self.couleur(c, if actif { &ACCENT_BORD } else { &LIGNE });
                 rt.DrawRoundedRectangle(&carte, &c.pinceau, 1.0, None);
-                self.icone(c, Icone::Disque, r.left + 22.0, r.top + 24.0, false, 0.85);
+                self.icone(c, Icone::Disque, r.left + 22.0, r.top + 24.0 * e, false, 0.85);
                 self.couleur(c, &BLANC);
-                self.texte_espace(c, &f.volet_nom, &nom.to_uppercase(), rect(r.left + 44.0, r.top + 6.0, r.right - r.left - 56.0, 30.0));
+                self.texte_espace(c, &f.volet_nom, &nom.to_uppercase(), rect(r.left + 44.0, r.top + 6.0 * e, r.right - r.left - 56.0, 30.0 * e));
                 if let Genre::Disque { libre, total, .. } = app.disques[i].genre {
                     let rempli = if total > 0 { 1.0 - libre as f64 / total as f64 } else { 0.0 };
-                    let (mx, my, mw) = (r.left + 14.0, r.top + 44.0, r.right - r.left - 28.0);
+                    let (mx, my, mw) = (r.left + 14.0, r.top + 44.0 * e, r.right - r.left - 28.0);
                     self.couleur(c, &BLANC_TRES_FAIBLE);
                     rt.FillRoundedRectangle(&D2D1_ROUNDED_RECT { rect: rect(mx, my, mw, 4.0), radiusX: 2.0, radiusY: 2.0 }, &c.pinceau);
                     if rempli > 0.0 {
@@ -2407,11 +2310,11 @@ impl Rendu {
                         let place = r.right - r.left - 28.0 - 15.0;
                         let detail = crate::dossier::etiquette_disque(true, false, libre, &|t| self.mesurer(t, &f.petit) <= place);
                         self.couleur(c, &ERREUR);
-                        self.triangle_plein(c, x_texte + 4.5, r.top + 59.0, 4.5);
-                        self.texte(c, &f.petit, &detail, rect(x_texte + 15.0, r.top + 50.0, place, 18.0));
+                        self.triangle_plein(c, x_texte + 4.5, r.top + 59.0 * e, 4.5);
+                        self.texte(c, &f.petit, &detail, rect(x_texte + 15.0, r.top + 50.0 * e, place, 18.0 * e));
                     } else {
                         self.couleur(c, &BLANC_FAIBLE);
-                        self.texte(c, &f.petit, &crate::dossier::libres_sur(libre, total), rect(x_texte, r.top + 50.0, r.right - r.left - 28.0, 18.0));
+                        self.texte(c, &f.petit, &crate::dossier::libres_sur(libre, total), rect(x_texte, r.top + 50.0 * e, r.right - r.left - 28.0, 18.0 * e));
                     }
                 }
                 continue;
@@ -2423,7 +2326,7 @@ impl Rendu {
                 self.couleur(c, &Self::couleur_groupe(g.couleur));
                 rt.FillEllipse(&ellipse(r.left + 22.0, r.top + ligne_h / 2.0, 4.0), &c.pinceau);
                 if !actif {
-                    self.couleur(c, &BLANC_TRES_FAIBLE);
+                    self.couleur(c, &BLANC_FAIBLE);
                     self.texte(c, &f.petit_droite, &g.nombre.to_string(), rect(r.left, r.top, r.right - r.left - 12.0, ligne_h));
                 }
             } else {
@@ -2458,11 +2361,11 @@ impl Rendu {
         if crate::theme::largeur_apercu(l, vue.apercu_visible) > 0.5 {
             // L'aperçu s'arrête au-dessus du pied : celui-ci court sur toute la largeur de la fenêtre. Pendant son glissement le
             // contenu garde sa largeur finale, rogné par la colonne, et se fond en 250 ms (`.prev`)
-            let col = rect(ll, HAUTEUR_TITRE + 1.0, largeur_totale - ll, h - STATUT_H - HAUTEUR_TITRE - 1.0);
+            let col = rect(ll, HAUTEUR_TITRE + 1.0, largeur_totale - ll, h - statut_h() - HAUTEUR_TITRE - 1.0);
             rt.PushAxisAlignedClip(&col, D2D1_ANTIALIAS_MODE_ALIASED);
             let garde_apercu = self.flip_pousser(c, &mouvement::Decalage { dx: 0.0, dy: 0.0, echelle: 1.0, opacite: self.fondu_volets.get().1 }, (0.0, 0.0), col, &self.couche_opacite(c, self.fondu_volets.get().1));
             let x_plein = if crate::theme::largeur_apercu(l, vue.apercu_visible) < crate::theme::LARGEUR_APERCU { largeur_totale - crate::theme::LARGEUR_APERCU } else { ll };
-            self.dessiner_apercu(c, x_plein, largeur_totale, h - STATUT_H, vue.apercu);
+            self.dessiner_apercu(c, x_plein, largeur_totale, h - statut_h(), vue.apercu);
             self.flip_retirer(c, garde_apercu);
             rt.PopAxisAlignedClip();
             if x_plein != ll {
@@ -2504,16 +2407,16 @@ impl Rendu {
             let etat = self.mouvements.borrow().page.etat(t_image);
             if let Some((false, e)) = etat {
                 let d = mouvement::Decalage { dx: 0.0, dy: 0.0, echelle: e.echelle, opacite: e.opacite };
-                self.avec_decalage(c, &d, (ll / 2.0, (HAUTEUR_TITRE + h - STATUT_H) / 2.0), rect(0.0, HAUTEUR_TITRE, ll, h - HAUTEUR_TITRE), || self.dessiner_page(c, app, ll, h, sortie, true));
+                self.avec_decalage(c, &d, (ll / 2.0, (HAUTEUR_TITRE + h - statut_h()) / 2.0), rect(0.0, HAUTEUR_TITRE, ll, h - HAUTEUR_TITRE), || self.dessiner_page(c, app, ll, h, sortie, true));
             }
         }
         // ── Pied de la fenêtre : séparateur et gestes sur toute la largeur, aperçu compris ──
-        let ys = h - STATUT_H;
+        let ys = h - statut_h();
         self.couleur(c, &LIGNE);
         rt.FillRectangle(&rect(0.0, ys, largeur_totale, 1.0), &c.pinceau);
         match Self::texte_operation(app) {
             Some(t) => {
-                let zone = rect(largeur_totale - 400.0, ys, 400.0 - 20.0, STATUT_H);
+                let zone = rect(largeur_totale - 400.0, ys, 400.0 - 20.0, statut_h());
                 self.aide(c, &t, zone, Pose::Droite, &BLANC_FAIBLE);
             }
             None => self.pied(c, largeur_totale - 20.0, ys, &BLANC_FAIBLE),
@@ -2536,7 +2439,7 @@ impl Rendu {
             m.cartes.deploiements(vue.pastilles, vue.pastille_ouverte, t_image, animer)
         };
         let ks: Vec<f32> = deploiements.iter().map(|d| d.0).collect();
-        let disposition = pastilles::mettre_en_page_anime(l, largeur_volet(), h - STATUT_H - 8.0, vue.pastilles, &ks, largeur_touches("CTRL+Z"), self.mesurer("100 %", &self.f.volet).max(self.mesurer("PAUSE", &self.f.volet)).ceil(), &|t| self.mesurer(t, &self.f.volet));
+        let disposition = pastilles::mettre_en_page_anime(l, largeur_volet(), h - statut_h() - 8.0, vue.pastilles, &ks, largeur_touches("CTRL+Z"), self.mesurer("100 %", &self.f.volet).max(self.mesurer("PAUSE", &self.f.volet)).ceil(), &|t| self.mesurer(t, &self.f.volet));
         let decalages_cartes = self.mouvements.borrow_mut().cartes.image(&disposition, vue.pastilles, t_image, animer);
         self.dessiner_pastilles(c, &disposition, vue, app.survol, &decalages_cartes, &deploiements);
         {
@@ -2566,8 +2469,8 @@ impl Rendu {
         let source_galerie = Self::rect_ligne_choisie(app, ll, vue.galerie.map_or(0, |g| g.1), cible_galerie);
         let etat_galerie = self.mouvements.borrow_mut().morph_galerie.maj(vue.galerie.is_some(), source_galerie, cible_galerie, t_image, animer_cadres);
         if etat_galerie.visible {
-            // Carte flottante sur un voile, comme la palette : le dossier reste entrevu derrière
-            self.couleur(c, &rgba(0, 0, 0, 0.45));
+            // Carte flottante sur un voile quasi opaque : à 0,45 la liste transparaissait derrière l'aperçu (audit P2-03)
+            self.couleur(c, &rgba(0, 0, 0, 0.88));
             rt.FillRectangle(&rect(0.0, HAUTEUR_TITRE + 1.0, largeur_totale, h - HAUTEUR_TITRE - 1.0), &c.pinceau);
             if let Some(cadre) = etat_galerie.cadre {
                 self.carte(c, rect(cadre[0], cadre[1], cadre[2], cadre[3]));
@@ -2615,7 +2518,7 @@ impl Rendu {
         let cible_conflit = Self::rect_conflit(largeur_totale, h);
         let source_conflit = match self.zones_pastilles.borrow().places.first() {
             Some(p) => [p.zone.x, p.zone.y, p.zone.l, p.zone.h],
-            None => [largeur_totale / 2.0 - 100.0, h - STATUT_H - 8.0 - pastilles::HAUTEUR, 200.0, pastilles::HAUTEUR],
+            None => [largeur_totale / 2.0 - 100.0, h - statut_h() - 8.0 - pastilles::HAUTEUR, 200.0, pastilles::HAUTEUR],
         };
         let etat_conflit = self.mouvements.borrow_mut().morph_conflit.maj(vue.conflits.is_some(), source_conflit, cible_conflit, t_image, animer_cadres);
         if etat_conflit.visible {
@@ -2743,7 +2646,7 @@ impl Rendu {
                 if hl == 0.0 {
                     return None;
                 }
-                let (haut, bas) = (page::PAGE_Y, h - STATUT_H);
+                let (haut, bas) = (page::PAGE_Y, h - statut_h());
                 let y = haut + y0 - vp.page.defilement;
                 let clip = rect(REGLAGES_NAV + 2.0, haut, lp - REGLAGES_NAV - 2.0, bas - haut);
                 Some(CibleReflet { zone: page::rect_carte(y, lp), coin: REGLAGE_CARTE_RAYON, desactive: false, clip: Some(clip) })
@@ -3150,7 +3053,9 @@ impl Rendu {
 
         // ── Fil d'Ariane (ou le chemin en cours de saisie) ──
         if let Some(ed) = &app.saisie_chemin {
-            let r = rect(chemin_x() - 10.0, NAV_Y + 3.0, (l - MARGE_LISTE - chemin_x() + 10.0).max(80.0), NAV_H - 6.0);
+            // Le champ s'arrête avant le bouton « >_ » : sinon « ECHAP » passait dessus (audit, capture 11b)
+            let reserve = if app.emplacement == Emplacement::Reglages { 0.0 } else { TERMINAL_RESERVE };
+            let r = rect(chemin_x() - 10.0, nav_y() + 3.0, (l - MARGE_LISTE - reserve - chemin_x() + 10.0).max(80.0), nav_h() - 6.0);
             let arrondi = D2D1_ROUNDED_RECT { rect: r, radiusX: 8.0, radiusY: 8.0 };
             self.couleur(c, &CHAMP_FOND);
             rt.FillRoundedRectangle(&arrondi, &c.pinceau);
@@ -3167,9 +3072,9 @@ impl Rendu {
             // Vide du chemin survolé : il se clique pour taper un chemin
             let fin = app.zones.segments.last().map_or(chemin_x(), |s| s.0.right);
             self.couleur(c, &SURVOL);
-            rt.FillRoundedRectangle(&D2D1_ROUNDED_RECT { rect: rect(chemin_x() - 10.0, NAV_Y + 3.0, (l - MARGE_LISTE - chemin_x() + 10.0).max(80.0), NAV_H - 6.0), radiusX: 8.0, radiusY: 8.0 }, &c.pinceau);
-            self.couleur(c, &BLANC_TRES_FAIBLE);
-            self.texte(c, &f.petit, "CLIC : TAPER UN CHEMIN", rect(fin + 24.0, NAV_Y, (l - MARGE_LISTE - fin - 30.0).max(0.0), NAV_H));
+            rt.FillRoundedRectangle(&D2D1_ROUNDED_RECT { rect: rect(chemin_x() - 10.0, nav_y() + 3.0, (l - MARGE_LISTE - chemin_x() + 10.0).max(80.0), nav_h() - 6.0), radiusX: 8.0, radiusY: 8.0 }, &c.pinceau);
+            self.couleur(c, &BLANC_FAIBLE);
+            self.texte(c, &f.petit, "CLIC : TAPER UN CHEMIN", rect(fin + 24.0, nav_y(), (l - MARGE_LISTE - fin - 30.0).max(0.0), nav_h()));
         }
         let n = if app.saisie_chemin.is_some() { 0 } else { app.zones.segments.len() };
         for (i, (r, _, texte)) in app.zones.segments.iter().enumerate().take(n) {
@@ -3178,7 +3083,7 @@ impl Rendu {
             // `.crumb:hover` : fond `--hov`, rayon 10 ; dernier segment `--i1`, parents `--i2`
             if survole {
                 self.couleur(c, &SURVOL);
-                rt.FillRoundedRectangle(&D2D1_ROUNDED_RECT { rect: rect(r.left, r.top + 3.0, r.right - r.left, NAV_H - 6.0), radiusX: 10.0, radiusY: 10.0 }, &c.pinceau);
+                rt.FillRoundedRectangle(&D2D1_ROUNDED_RECT { rect: rect(r.left, r.top + 3.0, r.right - r.left, nav_h() - 6.0), radiusX: 10.0, radiusY: 10.0 }, &c.pinceau);
             }
             // Groupe ouvert (lot 14, `.gc`) : un point de la couleur choisie pour le groupe devant son nom
             let point = match &app.emplacement {
@@ -3192,10 +3097,10 @@ impl Rendu {
             let decal = if point.is_some() { GROUPE_POINT } else { 0.0 };
             self.couleur(c, if dernier || survole { &BLANC } else { &BLANC_DOUX });
             // +2 DIP : la mesure et le dessin arrondissent chacun de leur côté, sans marge « ÉTÉ CAFÉ » finirait en « ÉTÉ CAF… »
-            self.texte_espace(c, &f.chemin, texte, rect(r.left + CRUMB_MARGE + decal, r.top, r.right - r.left - 2.0 * CRUMB_MARGE + 2.0 - decal, NAV_H));
+            self.texte_espace(c, &f.chemin, texte, rect(r.left + CRUMB_MARGE + decal, r.top, r.right - r.left - 2.0 * CRUMB_MARGE + 2.0 - decal, nav_h()));
             if !dernier {
                 self.couleur(c, &BLANC_TRES_FAIBLE);
-                self.texte_espace(c, &f.chemin, "›", rect(r.right + CRUMB_ECART, r.top, 40.0, NAV_H));
+                self.texte_espace(c, &f.chemin, "›", rect(r.right + CRUMB_ECART, r.top, 40.0, nav_h()));
             }
         }
 
@@ -3249,7 +3154,7 @@ impl Rendu {
         if wb > 0.0 {
             let wf = self.largeur_filtre(app, l, rang);
             let place_filtre = if wf > 0.0 { wf + 16.0 } else { 0.0 };
-            let r = rect(l - MARGE_LISTE - TERMINAL_RESERVE - place_filtre - wb, NAV_Y + 9.0, wb, NAV_H - 18.0);
+            let r = rect(l - MARGE_LISTE - TERMINAL_RESERVE - place_filtre - wb, nav_y() + 9.0, wb, nav_h() - 18.0);
             let arrondi = D2D1_ROUNDED_RECT { rect: r, radiusX: 11.0, radiusY: 11.0 };
             self.couleur(c, &BLANC_TRES_FAIBLE);
             rt.DrawRoundedRectangle(&arrondi, &c.pinceau, 1.0, None);
@@ -3295,7 +3200,7 @@ impl Rendu {
             match etat {
                 Some((true, e)) => {
                     let d = mouvement::Decalage { dx: 0.0, dy: 0.0, echelle: e.echelle, opacite: e.opacite };
-                    self.avec_decalage(c, &d, (l / 2.0, (HAUTEUR_TITRE + h - STATUT_H) / 2.0), rect(0.0, HAUTEUR_TITRE, l, h - HAUTEUR_TITRE), || self.dessiner_page(c, app, l, h, p, premier));
+                    self.avec_decalage(c, &d, (l / 2.0, (HAUTEUR_TITRE + h - statut_h()) / 2.0), rect(0.0, HAUTEUR_TITRE, l, h - HAUTEUR_TITRE), || self.dessiner_page(c, app, l, h, p, premier));
                 }
                 _ => self.dessiner_page(c, app, l, h, p, premier),
             }
@@ -3317,10 +3222,10 @@ impl Rendu {
 
         // Lasso : voile rouge léger et contour en points blancs
         if let Some(la) = app.lasso.as_ref().filter(|la| la.actif) {
-            let haut_liste = LISTE_Y;
-            let bas_liste = LISTE_Y + app.hauteur_liste;
-            let y0 = (la.y0.min(la.y1) - app.defilement + LISTE_Y).clamp(haut_liste, bas_liste);
-            let y1 = (la.y0.max(la.y1) - app.defilement + LISTE_Y).clamp(haut_liste, bas_liste);
+            let haut_liste = liste_y();
+            let bas_liste = liste_y() + app.hauteur_liste;
+            let y0 = (la.y0.min(la.y1) - app.defilement + liste_y()).clamp(haut_liste, bas_liste);
+            let y1 = (la.y0.max(la.y1) - app.defilement + liste_y()).clamp(haut_liste, bas_liste);
             let (x0, x1) = (la.x0.min(la.x1).max(largeur_volet() + 2.0), la.x0.max(la.x1).min(l - 2.0));
             if x1 > x0 && y1 > y0 {
                 self.couleur(c, &D2D1_COLOR_F { a: 0.10, ..ACCENT });
@@ -3346,7 +3251,7 @@ impl Rendu {
         if app.depot == Cible::FondListe {
             self.couleur(c, &ACCENT);
             let (gauche, droite) = (largeur_volet() + MARGE_LISTE - 8.0, l - MARGE_LISTE + 4.0);
-            let (haut, bas) = (LISTE_Y - 2.0, LISTE_Y + app.hauteur_liste - 4.0);
+            let (haut, bas) = (liste_y() - 2.0, liste_y() + app.hauteur_liste - 4.0);
             let mut x = gauche;
             while x <= droite {
                 rt.FillEllipse(&ellipse(x, haut, 1.3), &c.pinceau);
@@ -3380,13 +3285,13 @@ impl Rendu {
             None
         };
         if let Some((m, col)) = message {
-            self.aide(c, m, rect(largeur_volet(), LISTE_Y + 40.0, l - largeur_volet(), 40.0), Pose::Centre, col);
+            self.aide(c, m, rect(largeur_volet(), liste_y() + 40.0, l - largeur_volet(), 40.0), Pose::Centre, col);
         } else if app.vide() {
             // État vide de la maquette (`.empty`) : dossier vide, ou filtre sans résultat. Les yeux ouverts au-dessus d'une phrase,
             // centrés dans la liste (liste, grille et colonnes : la zone est celle de la liste dans les trois vues)
             // Colonnes : le dossier ouvert est la colonne du milieu, c'est elle qui est vide (pas la largeur entière de la liste)
             let (gauche, largeur) = if app.affichage == Affichage::Colonnes { colonnes_miller(l)[1] } else { (largeur_volet(), l - largeur_volet()) };
-            self.dessiner_etat_vide(c, &pixel::texte_vide(&app.filtre), vue.pixel.periode, rect(gauche, LISTE_Y, largeur, app.hauteur_liste));
+            self.dessiner_etat_vide(c, &pixel::texte_vide(&app.filtre), vue.pixel.periode, rect(gauche, liste_y(), largeur, app.hauteur_liste));
         }
 
         // Barre de défilement fine
@@ -3394,13 +3299,13 @@ impl Rendu {
         let total = hauteur_defilable(app.nb_rangs().div_ceil(par), hr);
         if total > app.hauteur_liste && app.hauteur_liste > 0.0 {
             let hb = (app.hauteur_liste * app.hauteur_liste / total).max(24.0);
-            let yb = LISTE_Y + (app.hauteur_liste - hb) * (app.defilement / (total - app.hauteur_liste)).clamp(0.0, 1.0);
+            let yb = liste_y() + (app.hauteur_liste - hb) * (app.defilement / (total - app.hauteur_liste)).clamp(0.0, 1.0);
             self.couleur(c, &BLANC_TRES_FAIBLE);
             rt.FillRoundedRectangle(&D2D1_ROUNDED_RECT { rect: rect(l - 9.0, yb, 3.0, hb), radiusX: 1.5, radiusY: 1.5 }, &c.pinceau);
         }
 
         // ── Barre d'état : le séparateur et les gestes sont dessinés une seule fois, sur toute la fenêtre ──
-        let ys = h - STATUT_H;
+        let ys = h - statut_h();
         // À gauche : annonce récente (blanche, ou rouge si erreur), sinon le résumé du dossier.
         // À droite, le pied réserve sa place ; l'état d'opération le remplace s'il y en a un.
         let texte_operation = Self::texte_operation(app);
@@ -3414,12 +3319,12 @@ impl Rendu {
             None => (self.largeur_pied() + 20.0 + 30.0 - (self.largeur_fenetre.get() - l).max(0.0)).max(0.0),
         };
         let decalage = if premier { PIXEL_DECALAGE } else { 0.0 };
-        let zone_gauche = rect(largeur_volet() + MARGE_LISTE + decalage, ys, (l - largeur_volet() - MARGE_LISTE - decalage - place_droite).max(0.0), STATUT_H);
+        let zone_gauche = rect(largeur_volet() + MARGE_LISTE + decalage, ys, (l - largeur_volet() - MARGE_LISTE - decalage - place_droite).max(0.0), statut_h());
         match app.annonce.as_ref().filter(|a| a.2.elapsed() < crate::app::DUREE_ANNONCE) {
             Some((texte, erreur, _)) => {
                 self.couleur(c, if *erreur { &ERREUR } else { &BLANC });
-                rt.FillEllipse(&ellipse(zone_gauche.left + 3.0, ys + STATUT_H / 2.0, 2.5), &c.pinceau);
-                self.aide(c, texte, rect(zone_gauche.left + 12.0, ys, zone_gauche.right - zone_gauche.left - 12.0, STATUT_H), Pose::Gauche, if *erreur { &ERREUR } else { &BLANC });
+                rt.FillEllipse(&ellipse(zone_gauche.left + 3.0, ys + statut_h() / 2.0, 2.5), &c.pinceau);
+                self.aide(c, texte, rect(zone_gauche.left + 12.0, ys, zone_gauche.right - zone_gauche.left - 12.0, statut_h()), Pose::Gauche, if *erreur { &ERREUR } else { &BLANC });
             }
             None if !app.filtre.is_empty() => {
                 let texte = format!("{} TROUVES · ENTREE OUVRE · CTRL+F : SOUS-DOSSIERS · ECHAP : EFFACER", systeme::nombre(app.entrees.len()));
@@ -3483,7 +3388,7 @@ impl Rendu {
         // Barre d'état survolée : elle est cliquable (menu de la sélection)
         if app.survol == Cible::Statut {
             self.couleur(c, &SURVOL);
-            rt.FillRectangle(&rect(largeur_volet() + 1.0, ys + 1.0, l - largeur_volet() - 1.0, STATUT_H - 1.0), &c.pinceau);
+            rt.FillRectangle(&rect(largeur_volet() + 1.0, ys + 1.0, l - largeur_volet() - 1.0, statut_h() - 1.0), &c.pinceau);
         }
     }
 
@@ -3491,7 +3396,7 @@ impl Rendu {
     /// Chronologie en points (O3) : un point par jour, plus gros les jours chargés ; le jour choisi en rouge
     unsafe fn dessiner_chronologie(&self, c: &Cible2D, app: &App, l: f32, h: f32) {
         let rt = &c.rt;
-        let y = h - STATUT_H - CHRONO_H;
+        let y = h - statut_h() - CHRONO_H;
         self.couleur(c, &LIGNE);
         rt.FillRectangle(&rect(largeur_volet() + MARGE_LISTE, y, l - largeur_volet() - 2.0 * MARGE_LISTE, 1.0), &c.pinceau);
         let cy = y + CHRONO_H / 2.0;
@@ -3555,14 +3460,14 @@ impl Rendu {
                 (Colonne::Signature, _) => "SIGNE PAR",
             };
             let droite = col == Colonne::Taille;
-            let zone = if col == Colonne::Nom { rect(x + 28.0, ENTETE_Y, w - 36.0, ENTETE_H) } else { rect(x, ENTETE_Y, w - 8.0, ENTETE_H) };
+            let zone = if col == Colonne::Nom { rect(x + 28.0, entete_y(), w - 36.0, entete_h()) } else { rect(x, entete_y(), w - 8.0, entete_h()) };
             self.texte(c, if droite { &f.petit_droite } else { &f.petit }, nom, zone);
             if actif {
                 // Point rouge : plein = croissant, anneau = décroissant
                 let tw = self.mesurer(nom, &f.petit);
                 let px = if droite { zone.right - tw - 10.0 } else { zone.left + tw + 9.0 };
                 self.couleur(c, &ACCENT);
-                let p = ellipse(px, ENTETE_Y + ENTETE_H / 2.0, 3.0);
+                let p = ellipse(px, entete_y() + entete_h() / 2.0, 3.0);
                 if app.tri.1 {
                     rt.FillEllipse(&p, &c.pinceau);
                 } else {
@@ -3571,10 +3476,10 @@ impl Rendu {
             }
         }
         self.couleur(c, &LIGNE);
-        rt.FillRectangle(&rect(largeur_volet() + MARGE_LISTE, ENTETE_Y + ENTETE_H, l - largeur_volet() - MARGE_LISTE - MARGE_LISTE_DROITE, 1.0), &c.pinceau);
+        rt.FillRectangle(&rect(largeur_volet() + MARGE_LISTE, entete_y() + entete_h(), l - largeur_volet() - MARGE_LISTE - MARGE_LISTE_DROITE, 1.0), &c.pinceau);
 
         // ── Liste (seules les lignes visibles sont dessinées) ──
-        let zone_liste = rect(largeur_volet() + 1.0, LISTE_Y, l - largeur_volet() - 1.0, app.hauteur_liste);
+        let zone_liste = rect(largeur_volet() + 1.0, liste_y(), l - largeur_volet() - 1.0, app.hauteur_liste);
         rt.PushAxisAlignedClip(&zone_liste, D2D1_ANTIALIAS_MODE_ALIASED);
         let premiere = (app.defilement / hauteur_ligne()).floor().max(0.0) as usize;
         let nb = (app.hauteur_liste / hauteur_ligne()).ceil() as usize + 2;
@@ -3589,7 +3494,7 @@ impl Rendu {
         let mut cases = Vec::new();
         for r in premiere..derniere {
             if let crate::app::Rang::Element(i) = app.rang(r) {
-                places.push((&app.entrees[i], (x0, LISTE_Y + r as f32 * hauteur_ligne() - app.defilement)));
+                places.push((&app.entrees[i], (x0, liste_y() + r as f32 * hauteur_ligne() - app.defilement)));
                 cases.push(r - premiere);
             }
         }
@@ -3611,7 +3516,7 @@ impl Rendu {
         let nouveaux = app.dossier().map(crate::navigateur::nouveaux_dans).unwrap_or_default();
         let largeur_nouveau = if nouveaux.is_empty() { 0.0 } else { self.mesurer("NOUVEAU", &f.petit) + 10.0 };
         for r in premiere..(premiere + nb).min(app.nb_rangs()) {
-            let y = LISTE_Y + r as f32 * hauteur_ligne() - app.defilement;
+            let y = liste_y() + r as f32 * hauteur_ligne() - app.defilement;
             let i = match app.rang(r) {
                 crate::app::Rang::Element(i) => i,
                 crate::app::Rang::Section(s) => {
@@ -3925,7 +3830,7 @@ impl Rendu {
         }
         if let Some((choisie, haut)) = pastille {
             self.couleur(c, if actif { &ACCENT } else { &BLANC_FAIBLE });
-            let y = LISTE_Y + haut - app.defilement;
+            let y = liste_y() + haut - app.defilement;
             // La barre suit la ligne choisie, glissement d'entrée compris (elle est posée à la place finale puis décalée comme elle)
             let d = app.rang_de(choisie).checked_sub(premiere).and_then(|k| decalages.get(k)).copied().unwrap_or(mouvement::Decalage::AUCUN);
             let garde = self.flip_pousser(c, &d, (x0 + largeur_fond / 2.0, y + hauteur_ligne() / 2.0), rect(0.0, y - 8.0, l, hauteur_ligne() + 16.0), &couche_flip);
@@ -4285,12 +4190,12 @@ impl Rendu {
         let surlignage = app.texte_surlignage();
         let (par, hr) = app.pas();
         self.couleur(c, &LIGNE);
-        rt.FillRectangle(&rect(largeur_volet() + MARGE_LISTE, ENTETE_Y + ENTETE_H, l - largeur_volet() - MARGE_LISTE - MARGE_LISTE_DROITE, 1.0), &c.pinceau);
-        rt.PushAxisAlignedClip(&rect(largeur_volet() + 1.0, LISTE_Y, l - largeur_volet() - 1.0, app.hauteur_liste), D2D1_ANTIALIAS_MODE_ALIASED);
+        rt.FillRectangle(&rect(largeur_volet() + MARGE_LISTE, entete_y() + entete_h(), l - largeur_volet() - MARGE_LISTE - MARGE_LISTE_DROITE, 1.0), &c.pinceau);
+        rt.PushAxisAlignedClip(&rect(largeur_volet() + 1.0, liste_y(), l - largeur_volet() - 1.0, app.hauteur_liste), D2D1_ANTIALIAS_MODE_ALIASED);
         let premiere = (app.defilement / hr).floor().max(0.0) as usize;
         let rangees = (app.hauteur_liste / hr).ceil() as usize + 1;
         let (debut, fin) = (premiere * par, ((premiere + rangees + 1) * par).min(app.entrees.len()));
-        let place = |i: usize| (grille_x0() + (i % par) as f32 * (cote + GRILLE_ECART), LISTE_Y + (i / par) as f32 * hr - app.defilement);
+        let place = |i: usize| (grille_x0() + (i % par) as f32 * (cote + GRILLE_ECART), liste_y() + (i / par) as f32 * hr - app.defilement);
         // Lot 12B : les vignettes glissent de leur ancienne case à la nouvelle quand l'ordre, la vue ou le filtre change
         let places: Vec<(&Entree, (f32, f32))> = (debut..fin).map(|i| (&app.entrees[i], place(i))).collect();
         let decalages = self.decalages_flip(app, &places, 1, cote, cote + GRILLE_NOM);
@@ -4406,7 +4311,7 @@ impl Rendu {
         let couche_flip = self.couche_flip(c, decalages);
         for i in premiere..(premiere + nb).min(entrees.len()) {
             let e = &entrees[i];
-            let y = LISTE_Y + i as f32 * hauteur_ligne() - decalage;
+            let y = liste_y() + i as f32 * hauteur_ligne() - decalage;
             // Lot 12B : seule la colonne du dossier ouvert reçoit des décalages (les deux autres : tranche vide)
             let garde = match decalages.get(i - premiere) {
                 Some(d) => self.flip_pousser(c, d, (x + w / 2.0, y + hauteur_ligne() / 2.0), rect(x - 8.0, y - 8.0, w + 16.0, hauteur_ligne() + 16.0), &couche_flip),
@@ -4469,15 +4374,15 @@ impl Rendu {
         ];
         for (k, (x, w)) in cols.iter().enumerate() {
             self.couleur(c, if k == 1 { &BLANC } else { &BLANC_DOUX });
-            self.texte(c, &f.petit, &titres[k], rect(x + 8.0, ENTETE_Y, w - 16.0, ENTETE_H));
+            self.texte(c, &f.petit, &titres[k], rect(x + 8.0, entete_y(), w - 16.0, entete_h()));
             if k > 0 {
                 self.couleur(c, &LIGNE);
-                rt.FillRectangle(&rect(x - 4.0, ENTETE_Y, 1.0, LISTE_Y - ENTETE_Y + app.hauteur_liste), &c.pinceau);
+                rt.FillRectangle(&rect(x - 4.0, entete_y(), 1.0, liste_y() - entete_y() + app.hauteur_liste), &c.pinceau);
             }
         }
         self.couleur(c, &LIGNE);
-        rt.FillRectangle(&rect(largeur_volet() + MARGE_LISTE, ENTETE_Y + ENTETE_H, l - largeur_volet() - MARGE_LISTE - MARGE_LISTE_DROITE, 1.0), &c.pinceau);
-        rt.PushAxisAlignedClip(&rect(largeur_volet() + 1.0, LISTE_Y, l - largeur_volet() - 1.0, app.hauteur_liste), D2D1_ANTIALIAS_MODE_ALIASED);
+        rt.FillRectangle(&rect(largeur_volet() + MARGE_LISTE, entete_y() + entete_h(), l - largeur_volet() - MARGE_LISTE - MARGE_LISTE_DROITE, 1.0), &c.pinceau);
+        rt.PushAxisAlignedClip(&rect(largeur_volet() + 1.0, liste_y(), l - largeur_volet() - 1.0, app.hauteur_liste), D2D1_ANTIALIAS_MODE_ALIASED);
 
         // Parent : le dossier ouvert y est marqué, et ramené dans la zone visible
         let courant = app.emplacement.nom().map(str::to_lowercase);
@@ -4494,7 +4399,7 @@ impl Rendu {
         // Lot 12B : les lignes du dossier ouvert glissent comme celles de la liste (les colonnes voisines, non)
         let (premiere, nb) = Self::etendue_miller(app.defilement, app.hauteur_liste);
         let fin = (premiere + nb).min(app.entrees.len());
-        let places: Vec<(&Entree, (f32, f32))> = (premiere..fin).map(|i| (&app.entrees[i], (cols[1].0, LISTE_Y + i as f32 * hauteur_ligne() - app.defilement))).collect();
+        let places: Vec<(&Entree, (f32, f32))> = (premiere..fin).map(|i| (&app.entrees[i], (cols[1].0, liste_y() + i as f32 * hauteur_ligne() - app.defilement))).collect();
         let decalages = self.decalages_flip(app, &places, 2, cols[1].1, hauteur_ligne());
         self.colonne_miller(c, &app.entrees, cols[1], app.defilement, app.hauteur_liste, |i| (app.marques.contains(&i), app.selection == Some(i)), survol, |e| app.chemin_de(e).and_then(|p| outils::balise(&p)), |e| if crate::etiquettes::existe_une() { app.chemin_de(e).and_then(|p| crate::etiquettes::de(&p)) } else { None }, &decalages, &app.texte_surlignage());
         // Lot 12D : la ligne supprimée finit sa sortie dans la colonne du dossier ouvert
@@ -4516,14 +4421,14 @@ impl Rendu {
         match choisi {
             Some(e) if e.est_conteneur() => {
                 if app.miller_enfant.is_empty() {
-                    self.couleur(c, &BLANC_TRES_FAIBLE);
-                    self.texte(c, &f.petit, "VIDE", rect(x + 10.0, LISTE_Y + 6.0, w - 20.0, 24.0));
+                    self.couleur(c, &BLANC_FAIBLE);
+                    self.texte(c, &f.petit, "VIDE", rect(x + 10.0, liste_y() + 6.0, w - 20.0, 24.0));
                 }
                 self.colonne_miller(c, &app.miller_enfant, cols[2], 0.0, app.hauteur_liste, |_| (false, false), None, |_| None, |_| None, &[], "");
             }
             Some(e) => {
-                self.icone_grande(c, icones::pour(e), x + w / 2.0, LISTE_Y + 70.0, 13.0, false, 1.0);
-                let mut y = LISTE_Y + 150.0;
+                self.icone_grande(c, icones::pour(e), x + w / 2.0, liste_y() + 70.0, 13.0, false, 1.0);
+                let mut y = liste_y() + 150.0;
                 self.couleur(c, &BLANC);
                 self.texte_w(c, &f.liste, nom_vu(e), rect(x + 10.0, y, w - 20.0, 24.0));
                 y += 34.0;
@@ -4910,7 +4815,7 @@ impl Rendu {
         // ── Champ ── Pixel (dessiné par la fenêtre, une seule instance) se pose à gauche : `pixel_dans_palette`
         let champ = rect(x + 46.0, y + 12.0, w - 66.0 - 64.0, 40.0);
         if p.saisie.texte.is_empty() {
-            self.couleur(c, &BLANC_TRES_FAIBLE);
+            self.couleur(c, &BLANC_FAIBLE);
             self.texte(c, &f.petit, &p.invite(), rect(champ.left + 10.0, champ.top, champ.right - champ.left - 20.0, 40.0));
             self.couleur(c, &ACCENT);
             rt.FillRectangle(&rect(champ.left + 6.0, champ.top + 10.0, 2.0, 20.0), &c.pinceau);
@@ -5394,7 +5299,7 @@ impl Rendu {
         // Pixel (dessiné par la fenêtre, une seule instance) se pose à gauche du champ : `pixel_dans_palette`
         let champ = rect(x + 46.0, y + 12.0, w - 66.0, 40.0);
         if p.saisie.texte.is_empty() {
-            self.couleur(c, &BLANC_TRES_FAIBLE);
+            self.couleur(c, &BLANC_FAIBLE);
             self.texte(c, &f.petit, &p.invite(), rect(champ.left + 10.0, champ.top, champ.right - champ.left - 20.0, 40.0));
             self.couleur(c, &ACCENT);
             rt.FillRectangle(&rect(champ.left + 6.0, champ.top + 10.0, 2.0, 20.0), &c.pinceau);
@@ -5465,7 +5370,7 @@ impl Rendu {
         }
         let yi = y + 64.0 + 3.0 * 46.0;
         self.aide(c, &format!("REGEX (CTRL+R) : {}", if lot.regex { "OUI · $1 DANS REMPLACER" } else { "NON" }), rect(x + 24.0, yi, w - 48.0, 20.0), Pose::Gauche, if lot.regex { &ACCENT } else { &BLANC_DOUX });
-        self.couleur(c, &BLANC_TRES_FAIBLE);
+        self.couleur(c, &BLANC_FAIBLE);
         self.texte(c, &f.petit, "JETONS DU MOTIF : {nom} {ext} {n} {nn} {nnn} (COMPTEUR) {date} (PRISE DE VUE EXIF, SINON MODIFICATION)", rect(x + 24.0, yi + 20.0, w - 48.0, 20.0));
 
         // Aperçu avant / après
@@ -5489,7 +5394,7 @@ impl Rendu {
             }
         }
         if lot.noms.len() > place {
-            self.couleur(c, &BLANC_TRES_FAIBLE);
+            self.couleur(c, &BLANC_FAIBLE);
             self.texte(c, &f.petit_droite, &format!("{}–{} / {}", lot.defilement + 1, (lot.defilement + place).min(lot.noms.len()), lot.noms.len()), rect(x + 24.0, y + hc - 64.0, w - 48.0, 20.0));
         }
         let yb = y + hc - 40.0;
@@ -5520,10 +5425,10 @@ impl Rendu {
         let x = largeur_volet() + MARGE_LISTE - 6.0;
         let largeur = (ll - x - MARGE_LISTE_DROITE + 6.0).max(40.0);
         if app.hauteur_liste <= 0.0 || i >= app.entrees.len() {
-            return [x, LISTE_Y, largeur, hauteur_ligne().max(cible[3].min(30.0))];
+            return [x, liste_y(), largeur, hauteur_ligne().max(cible[3].min(30.0))];
         }
-        let y = LISTE_Y + app.rang_de(i) as f32 * hauteur_ligne() - app.defilement;
-        [x, y.clamp(LISTE_Y, LISTE_Y + (app.hauteur_liste - hauteur_ligne()).max(0.0)), largeur, hauteur_ligne()]
+        let y = liste_y() + app.rang_de(i) as f32 * hauteur_ligne() - app.defilement;
+        [x, y.clamp(liste_y(), liste_y() + (app.hauteur_liste - hauteur_ligne()).max(0.0)), largeur, hauteur_ligne()]
     }
 
     /// Carte des conflits. `cadre` : voile et fond de la carte ; `contenu` : titre, fiches, boutons (lot 12D : le contenu paraît après
@@ -5863,7 +5768,7 @@ impl Rendu {
         let rt = &c.rt;
         let f = &self.f;
         let (gauche, droite) = (page::gauche(), page::droite(l));
-        let (haut, bas) = (page::PAGE_Y, h - STATUT_H);
+        let (haut, bas) = (page::PAGE_Y, h - statut_h());
         let p = vp.page;
         let formulaire = p.formulaire.as_ref();
         // Panneau modal : il couvre le chemin, la barre d'actions et le volet, sous la barre de titre
@@ -5891,16 +5796,6 @@ impl Rendu {
             self.couleur(c, if actif || survole { &BLANC } else { &BLANC_DOUX });
             self.texte(c, &f.volet, page::CATEGORIES[k], rect(r.left + 20.0, r.top, r.right - r.left - 24.0, r.bottom - r.top));
         }
-        let fermer = page::zone_fermer(l);
-        let fondu_fermer = self.survol_k(Cible::ReglagesFermer);
-        if fondu_fermer > 0.0 {
-            self.couleur_k(c, &SURVOL, fondu_fermer);
-            rt.FillRoundedRectangle(&D2D1_ROUNDED_RECT { rect: fermer, radiusX: 8.0, radiusY: 8.0 }, &c.pinceau);
-        }
-        self.couleur(c, if app.survol == Cible::ReglagesFermer { &BLANC } else { &BLANC_DOUX });
-        let (cx, cy) = ((fermer.left + fermer.right) / 2.0, (fermer.top + fermer.bottom) / 2.0);
-        self.trait_signe(c, (cx - 4.0, cy - 4.0), (cx + 4.0, cy + 4.0), 1.4);
-        self.trait_signe(c, (cx - 4.0, cy + 4.0), (cx + 4.0, cy - 4.0), 1.4);
         rt.PushAxisAlignedClip(&rect(REGLAGES_NAV + 2.0, haut, l - REGLAGES_NAV - 2.0, bas - haut), D2D1_ANTIALIAS_MODE_ALIASED);
         let positions = page::positions(vp.lignes, p.categorie);
         for (k, (ligne, (y0, hl))) in vp.lignes.iter().zip(positions).enumerate() {
@@ -5917,12 +5812,22 @@ impl Rendu {
                 continue;
             }
             // Ligne d'information (raccourcis) : libellé à gauche, touche à droite, un trait dessous
-            if ligne.element == Element::Info && ligne.detail.is_empty() {
+            if ligne.compacte() {
+                // Une touche modifiable : la ligne choisie a un cadre, et celle qui attend sa touche le dit en couleur d'accent
+                let en_capture = matches!(ligne.element, Element::Raccourci(i) if p.capture == Some(i));
+                if p.focus == k && formulaire.is_none() && matches!(ligne.element, Element::Raccourci(_)) {
+                    let cadre = D2D1_ROUNDED_RECT { rect: rect(gauche + 0.5, y + 2.5, droite - gauche - 1.0, hl - 5.0), radiusX: 8.0, radiusY: 8.0 };
+                    self.couleur(c, &ACCENT_BORD);
+                    rt.DrawRoundedRectangle(&cadre, &c.pinceau, 1.0, None);
+                }
                 self.couleur(c, &BLANC);
                 self.texte(c, &f.liste, &ligne.libelle, rect(gauche + 16.0, y, (droite - gauche) * 0.6, hl));
-                if let Valeur::Texte(t) = &ligne.valeur {
+                if en_capture {
+                    self.couleur(c, &ACCENT);
+                    self.texte(c, &f.petit_droite, "Appuyez sur la nouvelle touche…", rect(droite - 16.0 - 320.0, y, 320.0, hl));
+                } else if let Valeur::Texte(t) = &ligne.valeur {
                     self.couleur(c, &BLANC_DOUX);
-                    self.texte(c, &f.petit_droite, t, rect(droite - 16.0 - 240.0, y, 240.0, hl));
+                    self.texte(c, &f.petit_droite, t, rect(droite - 16.0 - 320.0, y, 320.0, hl));
                 }
                 self.couleur(c, &LIGNE);
                 rt.FillRectangle(&rect(gauche, y + hl - 1.0, droite - gauche, 1.0), &c.pinceau);
@@ -6043,6 +5948,27 @@ impl Rendu {
         }
         rt.PopAxisAlignedClip();
 
+        // Bande du haut, dessinée après le contenu : le bouton × reste lisible quand les lignes défilent dessous. Dès que la
+        // page a défilé, la bande est opaque, rappelle la catégorie et porte un trait : plus aucun texte coupé net sous la barre.
+        if p.defilement > 0.5 {
+            self.couleur(c, &VOILE);
+            rt.FillRectangle(&rect(REGLAGES_NAV + 1.0, HAUTEUR_TITRE, l - REGLAGES_NAV - 1.0, page::BANDE_H), &c.pinceau);
+            self.couleur(c, &BLANC);
+            self.texte(c, &f.h2, page::CATEGORIES[p.categorie], rect(gauche, HAUTEUR_TITRE + 14.0, droite - gauche - 48.0, 32.0));
+            self.couleur(c, &LIGNE);
+            rt.FillRectangle(&rect(REGLAGES_NAV + 1.0, HAUTEUR_TITRE + page::BANDE_H, l - REGLAGES_NAV - 1.0, 1.0), &c.pinceau);
+        }
+        let fermer = page::zone_fermer(l);
+        let fondu_fermer = self.survol_k(Cible::ReglagesFermer);
+        if fondu_fermer > 0.0 {
+            self.couleur_k(c, &SURVOL, fondu_fermer);
+            rt.FillRoundedRectangle(&D2D1_ROUNDED_RECT { rect: fermer, radiusX: 8.0, radiusY: 8.0 }, &c.pinceau);
+        }
+        self.couleur(c, if app.survol == Cible::ReglagesFermer { &BLANC } else { &BLANC_DOUX });
+        let (cx, cy) = ((fermer.left + fermer.right) / 2.0, (fermer.top + fermer.bottom) / 2.0);
+        self.trait_signe(c, (cx - 4.0, cy - 4.0), (cx + 4.0, cy + 4.0), 1.4);
+        self.trait_signe(c, (cx - 4.0, cy + 4.0), (cx + 4.0, cy - 4.0), 1.4);
+
         // Barre de défilement
         let total = page::hauteur_totale(vp.lignes, p.categorie);
         let visible = bas - haut;
@@ -6054,7 +5980,7 @@ impl Rendu {
         }
 
         // Barre d'état : annonce ou aide clavier
-        let ys = h - STATUT_H;
+        let ys = h - statut_h();
         self.couleur(c, &LIGNE);
         rt.FillRectangle(&rect(0.0, ys, l, 1.0), &c.pinceau);
         // Pixel occupe le bord gauche de la barre d'état (il est dessiné par la fenêtre, une seule fois)
@@ -6065,12 +5991,12 @@ impl Rendu {
         // Même départ que la barre d'état de la liste : Pixel est dessiné au même endroit dans les deux vues (ici l'aide
         // commençait trop à gauche et passait sous ses yeux)
         let depart = (largeur_volet() + MARGE_LISTE).max(gauche) + decalage;
-        let zone = rect(depart, ys, (droite - depart - place_pied).max(0.0), STATUT_H);
+        let zone = rect(depart, ys, (droite - depart - place_pied).max(0.0), statut_h());
         match app.annonce.as_ref().filter(|a| a.2.elapsed() < crate::app::DUREE_ANNONCE) {
             Some((texte, erreur, _)) => {
                 self.couleur(c, if *erreur { &ERREUR } else { &BLANC });
-                rt.FillEllipse(&ellipse(zone.left + 3.0, ys + STATUT_H / 2.0, 2.5), &c.pinceau);
-                self.aide(c, texte, rect(zone.left + 12.0, ys, zone.right - zone.left - 12.0, STATUT_H), Pose::Gauche, if *erreur { &ERREUR } else { &BLANC });
+                rt.FillEllipse(&ellipse(zone.left + 3.0, ys + statut_h() / 2.0, 2.5), &c.pinceau);
+                self.aide(c, texte, rect(zone.left + 12.0, ys, zone.right - zone.left - 12.0, statut_h()), Pose::Gauche, if *erreur { &ERREUR } else { &BLANC });
             }
             None => {
                 let aide = if formulaire.is_some() {
@@ -6129,7 +6055,7 @@ impl Rendu {
                 continue;
             }
             if !utile {
-                self.couleur(c, &BLANC_TRES_FAIBLE);
+                self.couleur(c, &BLANC_FAIBLE);
                 self.texte(c, &f.petit, "Inutile pour un dossier", rect(champ.left + 10.0, champ.top, champ.right - champ.left - 20.0, champ.bottom - champ.top));
                 continue;
             }
@@ -6156,7 +6082,7 @@ impl Rendu {
                         3 => "Facultatif",
                         _ => "Facultatif · gardé par Windows",
                     };
-                    self.couleur(c, &BLANC_TRES_FAIBLE);
+                    self.couleur(c, &BLANC_FAIBLE);
                     self.texte(c, &f.petit, exemple, zone_texte);
                 } else {
                     self.couleur(c, &BLANC_DOUX);
@@ -6177,7 +6103,7 @@ impl Rendu {
         let w = carte.right - carte.left - 48.0;
         self.couleur(c, &BLANC_DOUX);
         self.texte(c, &f.petit, aide, rect(carte.left + 24.0, y, w, 20.0));
-        self.couleur(c, &BLANC_TRES_FAIBLE);
+        self.couleur(c, &BLANC_FAIBLE);
         self.texte(c, &f.petit, "LE MOT DE PASSE VA DANS LE GESTIONNAIRE D'IDENTIFICATION DE WINDOWS, JAMAIS DANS UN FICHIER", rect(carte.left + 24.0, y + 20.0, w, 20.0));
         if let Some(e) = &fo.erreur {
             self.couleur(c, &ERREUR);
@@ -6215,6 +6141,25 @@ impl Rendu {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Doto est dans l'exe : la collection privée existe, contient la famille « Doto » et ses graisses nommées, sans dépendre de la
+    /// police installée dans Windows (sans cela, un autre PC afficherait les titres en police ordinaire).
+    #[test]
+    fn doto_embarquee_est_chargee() {
+        unsafe {
+            let dw: IDWriteFactory = DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED).unwrap();
+            let col = collection_doto(&dw).expect("collection Doto embarquée");
+            let mut idx = 0u32;
+            let mut existe = windows::Win32::Foundation::BOOL(0);
+            col.FindFamilyName(&HSTRING::from(POLICE), &mut idx, &mut existe).unwrap();
+            assert!(existe.as_bool(), "famille Doto absente de la collection embarquée");
+            let famille = col.GetFontFamily(idx).unwrap();
+            assert!(famille.GetFontCount() >= 1);
+            // Une graisse normale et une grasse se résolvent toutes deux (instances nommées de la police variable)
+            assert!(famille.GetFirstMatchingFont(DWRITE_FONT_WEIGHT_NORMAL, DWRITE_FONT_STRETCH_NORMAL, DWRITE_FONT_STYLE_NORMAL).is_ok());
+            assert!(famille.GetFirstMatchingFont(DWRITE_FONT_WEIGHT_BOLD, DWRITE_FONT_STRETCH_NORMAL, DWRITE_FONT_STYLE_NORMAL).is_ok());
+        }
+    }
 
     /// Maquette `.sq` : carrés de 5 DIP, 2 DIP d'écart. Le dessin n'ajoute aucune zone cliquable (`Cible` inchangée) : la hauteur d'une
     /// ligne et la case de la grille ne dépendent pas de l'étiquette.
@@ -6296,7 +6241,7 @@ mod tests {
     fn tiroir_historique_geometrie() {
         let z = zone_tiroir(1440.0, 900.0);
         assert_eq!((z.left, z.right), (1440.0 - 340.0, 1440.0));
-        assert_eq!((z.top, z.bottom), (HAUTEUR_TITRE + 1.0, 900.0 - STATUT_H));
+        assert_eq!((z.top, z.bottom), (HAUTEUR_TITRE + 1.0, 900.0 - statut_h()));
         // Quelques entrées tiennent : pas de défilement ; beaucoup : le défilement va jusqu'au bas de la dernière
         assert_eq!(historique_defilement_max(4, &z, false), 0.0);
         let max = historique_defilement_max(200, &z, true);

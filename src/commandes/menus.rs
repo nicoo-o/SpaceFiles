@@ -306,7 +306,7 @@ pub(crate) unsafe fn menu_sessions(hwnd: HWND, f: &mut Fenetre) {
     let mut choix: Vec<Choix> = sessions
         .iter()
         .enumerate()
-        .map(|(k, x)| Choix::Autre(format!("OUVRIR {} · {} ONGLET{}", x.split('|').next().unwrap_or(""), x.split('|').count() - 1, if x.split('|').count() > 2 { "S" } else { "" }), Autre::OuvrirSession(k)))
+        .map(|(k, x)| Choix::Autre(format!("OUVRIR {} · {} ONGLET{}", x.split('|').next().unwrap_or(""), reglages::onglets_de_session(x).len(), if reglages::onglets_de_session(x).len() > 1 { "S" } else { "" }), Autre::OuvrirSession(k)))
         .collect();
     if !choix.is_empty() {
         choix.push(Choix::Separation);
@@ -316,7 +316,7 @@ pub(crate) unsafe fn menu_sessions(hwnd: HWND, f: &mut Fenetre) {
         let sup = sessions.iter().enumerate().map(|(k, x)| Choix::Autre(x.split('|').next().unwrap_or("").to_string(), Autre::SupprimerSession(k))).collect();
         choix.push(Choix::Sous("SUPPRIMER UNE SESSION", sup));
     }
-    ouvrir_menu(hwnd, f, choix, largeur_volet() + 60.0, LISTE_Y);
+    ouvrir_menu(hwnd, f, choix, largeur_volet() + 60.0, liste_y());
     let _ = InvalidateRect(hwnd, None, false);
 }
 

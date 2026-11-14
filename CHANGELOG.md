@@ -1,13 +1,14 @@
 # Notes de version de SpaceFiles
 
-SpaceFiles n'a pas de version publiée ; cette liste décrit l'état de `main` depuis le reboot du 01/11/2026 (tag `pre-reboot`, `503bb77`). Le numéro dans `Cargo.toml` est `0.1.0`, inchangé. Installer et désinstaller : `docs/installation.md`.
+Première pré-version publique (v0.1.0). Cette liste décrit l'état de `main` depuis le reboot du 01/11/2026 (tag `pre-reboot`, `503bb77`). Le numéro dans `Cargo.toml` est `0.1.0`. Installer et désinstaller : `docs/installation.md`.
 
 Chaque ligne se termine par ses sources entre parenthèses : hash de commit court ou chemin d'un rapport du dépôt. Les lots qui touchent SpaceNotch ou son Hub (autre dépôt) ne sont comptés ici que pour la part côté SpaceFiles.
 
-## [Non publié]
+## [0.1.0] - 2026-11-14 (pré-version)
 
 ### Ajouté
 
+- La police Doto est embarquée dans l'exe (`assets/fonts/Doto.ttf`, licence OFL, collection DirectWrite privée) : l'interface ne dépend plus d'une installation de la police sur le PC ; l'exe passe de 3,98 à 4,43 Mo (test `doto_embarquee_est_chargee`).
 - Le produit s'appelle SpaceFiles (ancien nom : Nothing Explorer) : exe `spacefiles.exe`, données dans `%APPDATA%\SpaceFiles` et `%LOCALAPPDATA%\SpaceFiles`, classes et libellés renommés, protocole `spacefiles://` avec l'alias `nothingexplorer://` conservé (37bfb06).
 - Au premier lancement, les données de l'ancien dossier `NothingExplorer` sont copiées vers `SpaceFiles` ; l'ancien dossier n'est jamais modifié (70b7527).
 - Un journal unique, `journal.txt`, écrit par `journal::ecrire` (niveau, module, message) (886643e).

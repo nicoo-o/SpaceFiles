@@ -420,7 +420,9 @@ pub const VOLET_ESPACE: f32 = 12.0;
 /// Marge intérieure du volet (maquette v6 : padding 12)
 pub const VOLET_PAD: f32 = 12.0;
 /// Carte d'un disque dans le volet (nom, jauge, place libre)
-pub const VOLET_DISQUE: f32 = 78.0;
+pub fn volet_disque() -> f32 {
+    78.0 * elasticite()
+}
 
 /// Panneau Réglages : rail de navigation de 236 DIP et marge du contenu
 pub const REGLAGES_NAV: f32 = 236.0;
@@ -445,8 +447,18 @@ pub const REGLAGE_SEG_RAYON: f32 = 12.0;
 
 // Barre de navigation : précédent, suivant, parent, puis le fil d'Ariane
 // Bloc de 58 DIP : 14 en haut, 38 de contenu, 6 en bas. Le chemin commence donc à 52.
-pub const NAV_Y: f32 = HAUTEUR_TITRE + 14.0;
-pub const NAV_H: f32 = 38.0;
+/// Facteur d'élasticité des zones de texte : 1,0 jusqu'à 150 % de « Taille du texte », puis proportionnel (225 % → 1,5).
+/// La hauteur de maquette porte déjà un texte à 150 % ; au-delà, chaque zone grandit pour ne rien couper ni superposer.
+pub fn elasticite() -> f32 {
+    (crate::reglages::echelle_texte() / 1.5).max(1.0)
+}
+pub const NAV_Y_BASE: f32 = HAUTEUR_TITRE + 14.0;
+pub fn nav_y() -> f32 {
+    NAV_Y_BASE
+}
+pub fn nav_h() -> f32 {
+    38.0 * elasticite()
+}
 pub const NAV_BOUTON: f32 = 32.0;
 pub fn nav_x() -> f32 {
     largeur_volet() + 16.0
@@ -456,19 +468,35 @@ pub fn chemin_x() -> f32 {
 }
 
 // Barre d'actions rapides, sous le chemin : bloc de 56 DIP (8 + 36 + 12)
-pub const BARRE_Y: f32 = NAV_Y + NAV_H + 6.0;
-pub const BARRE_H: f32 = 56.0;
-pub const BARRE_PAD_HAUT: f32 = 8.0;
+pub fn barre_y() -> f32 {
+    nav_y() + nav_h() + 6.0
+}
+pub fn barre_h() -> f32 {
+    56.0 * elasticite()
+}
+pub fn barre_pad_haut() -> f32 {
+    8.0 * elasticite()
+}
 
 // Liste des fichiers : en-tête à 166, liste à 200
-pub const ENTETE_Y: f32 = BARRE_Y + BARRE_H;
-pub const ENTETE_H: f32 = 34.0;
-pub const LISTE_Y: f32 = ENTETE_Y + ENTETE_H;
-/// Hauteur d'une ligne de la liste : 30 DIP en compact, 40 DIP en confort
-pub fn hauteur_ligne() -> f32 {
-    if crate::reglages::lignes_confort() { 40.0 } else { 30.0 }
+pub fn entete_y() -> f32 {
+    barre_y() + barre_h()
 }
-pub const STATUT_H: f32 = 36.0;
+pub fn entete_h() -> f32 {
+    34.0 * elasticite()
+}
+pub fn liste_y() -> f32 {
+    entete_y() + entete_h()
+}
+/// Hauteur d'une ligne de la liste : 30 DIP en compact, 40 DIP en confort, agrandies avec le texte au-delà de 150 %
+/// (la hauteur de maquette porte déjà un texte à 150 % ; à 225 % la ligne fait 1,5 fois plus haute)
+pub fn hauteur_ligne() -> f32 {
+    let base = if crate::reglages::lignes_confort() { 40.0 } else { 30.0 };
+    base * elasticite()
+}
+pub fn statut_h() -> f32 {
+    36.0 * elasticite()
+}
 
 /// Amplitude du soulèvement des éléments de chrome survolés (maquette `.chrome:hover`) ; les durées sont dans `mouvement.rs`.
 pub const SURVOL_DECALAGE: f32 = -2.0;
@@ -675,19 +703,19 @@ pub(crate) mod tests {
 
     #[test]
     fn anneau_de_la_premiere_ligne_reste_dans_le_clip_de_la_liste() {
-        // Capsule d'une ligne de liste à defilement = 0 : fond à y + 1, hauteur - 2 ; l'anneau ne doit pas passer sous LISTE_Y
+        // Capsule d'une ligne de liste à defilement = 0 : fond à y + 1, hauteur - 2 ; l'anneau ne doit pas passer sous liste_y()
         for h in [30.0f32, 40.0] {
-            let capsule = [100.0, LISTE_Y + 1.0, 600.0, h - 2.0];
+            let capsule = [100.0, liste_y() + 1.0, 600.0, h - 2.0];
             let t = trait_anneau_dans(capsule);
             let (haut, bas) = (t[1] - ANNEAU_EPAISSEUR / 2.0, t[1] + t[3] + ANNEAU_EPAISSEUR / 2.0);
-            assert!(haut >= LISTE_Y, "le haut de l'anneau ({haut}) est sous le clip ({LISTE_Y})");
-            assert!(bas <= LISTE_Y + h, "le bas de l'anneau sort de la ligne");
+            assert!(haut >= liste_y(), "le haut de l'anneau ({haut}) est sous le clip ({})", liste_y());
+            assert!(bas <= liste_y() + h, "le bas de l'anneau sort de la ligne");
         }
-        // Vignette de la grille en première rangée : fond à y = LISTE_Y
-        let t = trait_anneau_dans([40.0, LISTE_Y, 120.0, 150.0]);
-        assert!(t[1] - ANNEAU_EPAISSEUR / 2.0 >= LISTE_Y);
+        // Vignette de la grille en première rangée : fond à y = liste_y()
+        let t = trait_anneau_dans([40.0, liste_y(), 120.0, 150.0]);
+        assert!(t[1] - ANNEAU_EPAISSEUR / 2.0 >= liste_y());
         // Dernière ligne collée au bas du clip
-        let bas_clip = LISTE_Y + 300.0;
+        let bas_clip = liste_y() + 300.0;
         let t = trait_anneau_dans([100.0, bas_clip - 29.0, 600.0, 28.0]);
         assert!(t[1] + t[3] + ANNEAU_EPAISSEUR / 2.0 <= bas_clip);
     }

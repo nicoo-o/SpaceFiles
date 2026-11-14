@@ -50,6 +50,8 @@ pub struct Galerie {
     pub echelle_demandee: u32,
     /// Montré par la visionneuse web (HTML, SVG…) : l'image reste vide, un contrôle WebView2 couvre la zone (`webvue.rs`)
     pub web: bool,
+    /// Montré par le gestionnaire d'aperçu de Windows (Office…) : image vide, fenêtre du gestionnaire par-dessus (`hote_apercu.rs`)
+    pub systeme: bool,
 }
 
 /// Zoom minimal et maximal du coup d'œil, et plus grande échelle de rendu (au-delà, l'image est seulement agrandie)
@@ -78,6 +80,7 @@ impl Galerie {
             echelle: 1,
             echelle_demandee: 1,
             web: false,
+            systeme: false,
         }
     }
 
@@ -192,7 +195,7 @@ unsafe fn image_galerie(chemin: &str, ext: &str, page: u32, echelle: u32, cache:
         }
     }
     if matches!(ext.as_str(), "TTF" | "OTF" | "TTC") {
-        let mut a = Apercu { numero: 0, nom: String::new(), icone: Icone::Dossier, image: None, texte: None, infos: Vec::new(), teintes: Vec::new() };
+        let mut a = Apercu { numero: 0, nom: String::new(), icone: Icone::Dossier, image: None, texte: None, numeroter: false, infos: Vec::new(), teintes: Vec::new() };
         police(&mut a, chemin);
         if a.image.is_some() {
             return SortieGalerie::une(a.image.map(encrer));
@@ -371,6 +374,8 @@ pub struct Apercu {
     pub image: Option<Image>,
     /// Premières lignes d'un fichier texte
     pub texte: Option<String>,
+    /// Code et texte brut : le volet ajoute une colonne de numéros de ligne (jamais pour le Markdown mis en forme)
+    pub numeroter: bool,
     /// Libellé, valeur
     pub infos: Vec<(String, String)>,
     /// Couleurs du texte (code coloré, Markdown mis en forme) : début et longueur en UTF-16
@@ -417,7 +422,7 @@ unsafe fn preparer(numero: u64, chemin: &str, e: Option<&Entree>) -> Apercu {
         Some(e) => e.nom.clone(),
         None => chemin.trim_end_matches('\\').rsplit('\\').next().unwrap_or(chemin).to_string(),
     };
-    let mut a = Apercu { numero, nom, icone: e.map_or(Icone::Dossier, icones::pour), image: None, texte: None, infos: Vec::new(), teintes: Vec::new() };
+    let mut a = Apercu { numero, nom, icone: e.map_or(Icone::Dossier, icones::pour), image: None, texte: None, numeroter: false, infos: Vec::new(), teintes: Vec::new() };
     // Lire un fichier pour l'aperçu fait travailler des modules du Shell et des décodeurs : pas dans un dossier non fiable
     if crate::reglages::non_fiable(if e.is_some() { dossier::dossier_de(chemin) } else { chemin }) {
         a.infos.push(("DOSSIER".into(), "NON FIABLE · APERCU COUPE".into()));
@@ -486,6 +491,7 @@ unsafe fn preparer(numero: u64, chemin: &str, e: Option<&Entree>) -> Apercu {
             // Fichier seulement en ligne : le lire le téléchargerait, on s'en abstient
             if a.image.is_none() && TEXTE.contains(&e.ext.as_str()) && !en_ligne {
                 a.texte = debut_texte(chemin);
+                a.numeroter = e.ext != "MD";
                 if let Some(t) = &a.texte {
                     if e.ext == "MD" {
                         let (rendu, teintes) = markdown(t);

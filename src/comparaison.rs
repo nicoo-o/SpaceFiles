@@ -90,6 +90,37 @@ pub fn teintes(t: &str) -> Vec<(u32, u32, Teinte)> {
     v
 }
 
+/// Écarts de deux panneaux écrits en Markdown, pour garder une trace d'une synchronisation (P-06). `ici` et `la` sont les
+/// éléments en écart de chaque côté, sans les identiques ; un nom est protégé pour ne pas casser le tableau (`|`).
+pub fn ecarts_markdown(dossier_ici: &str, dossier_la: &str, ici: &[(String, &str)], la: &[(String, &str)]) -> String {
+    let nom = |n: &str| n.replace('|', "\\|");
+    let mut s = format!("# Écarts entre deux dossiers\n\n- Ici : `{dossier_ici}`\n- En face : `{dossier_la}`\n\n");
+    if ici.is_empty() && la.is_empty() {
+        s.push_str("Aucun écart : les deux dossiers sont identiques.\n");
+        return s;
+    }
+    s.push_str("| Côté | Nom | Écart |\n|---|---|---|\n");
+    for (c, liste) in [("Ici", ici), ("En face", la)] {
+        for (n, e) in liste {
+            s.push_str(&format!("| {c} | {} | {e} |\n", nom(n)));
+        }
+    }
+    s
+}
+
+/// Écarts de deux panneaux en CSV, pour un tableur : séparateur `;` (celui d'Excel en français), champs entre guillemets
+/// quand ils contiennent `;`, `"` ou un saut de ligne (guillemet doublé), une ligne par écart, colonne « Dossier » incluse.
+pub fn ecarts_csv(dossier_ici: &str, dossier_la: &str, ici: &[(String, &str)], la: &[(String, &str)]) -> String {
+    let champ = |t: &str| if t.contains([';', '"', '\n', '\r']) { format!("\"{}\"", t.replace('"', "\"\"")) } else { t.to_string() };
+    let mut s = String::from("Côté;Nom;Écart;Dossier\r\n");
+    for (c, d, liste) in [("Ici", dossier_ici, ici), ("En face", dossier_la, la)] {
+        for (n, e) in liste {
+            s.push_str(&format!("{c};{};{e};{}\r\n", champ(n), champ(d)));
+        }
+    }
+    s
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -107,5 +138,25 @@ mod tests {
         assert_eq!(t, vec![(0, 4, Teinte::Chaine), (8, 4, Teinte::MotCle)]);
         let enorme: String = (0..2500).map(|k| format!("a{k}\n")).collect();
         assert!(diff(&enorme, "x\n").is_err());
+    }
+
+    #[test]
+    fn ecarts_en_markdown() {
+        let vide = ecarts_markdown("C:\\a", "C:\\b", &[], &[]);
+        assert!(vide.contains("identiques") && !vide.contains("| Côté"));
+        let m = ecarts_markdown("C:\\a", "C:\\b", &[("x|y.txt".into(), "SEULEMENT ICI")], &[("z.txt".into(), "SEULEMENT EN FACE")]);
+        assert!(m.contains("| Ici | x\\|y.txt | SEULEMENT ICI |"));
+        assert!(m.contains("| En face | z.txt | SEULEMENT EN FACE |"));
+        assert!(m.contains("`C:\\a`") && m.contains("`C:\\b`"));
+    }
+
+    #[test]
+    fn ecarts_en_csv() {
+        let vide = ecarts_csv(r"C:\a", r"C:\b", &[], &[]);
+        assert_eq!(vide, "Côté;Nom;Écart;Dossier\r\n", "sans écart : l'en-tête seul");
+        let c = ecarts_csv(r"C:\a", r"C:\b;2", &[("x;y \"z\".txt".into(), "SEULEMENT ICI")], &[("w.txt".into(), "SEULEMENT EN FACE")]);
+        let lignes: Vec<&str> = c.split("\r\n").collect();
+        assert_eq!(lignes[1], "Ici;\"x;y \"\"z\"\".txt\";SEULEMENT ICI;C:\\a");
+        assert_eq!(lignes[2], "En face;w.txt;SEULEMENT EN FACE;\"C:\\b;2\"");
     }
 }

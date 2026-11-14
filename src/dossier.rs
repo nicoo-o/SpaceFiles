@@ -5,7 +5,7 @@ use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 use std::sync::Arc;
 
 use windows::core::PCWSTR;
-use windows::Win32::Foundation::{GetLastError, ERROR_ACCESS_DENIED, ERROR_FILE_NOT_FOUND, ERROR_PATH_NOT_FOUND};
+use windows::Win32::Foundation::GetLastError;
 use windows::Win32::Storage::FileSystem::*;
 use windows::Win32::UI::Shell::StrCmpLogicalW;
 
@@ -970,11 +970,7 @@ fn parcourir(chemin: &str, caches: bool, mut recevoir: impl FnMut(Entree)) -> Re
             Ok(h) => h,
             Err(_) => {
                 let e = GetLastError();
-                return Err(match e {
-                    ERROR_ACCESS_DENIED => "ACCES REFUSE".into(),
-                    ERROR_FILE_NOT_FOUND | ERROR_PATH_NOT_FOUND => "DOSSIER INTROUVABLE".into(),
-                    _ => format!("ERREUR {}", e.0),
-                });
+                return Err(message_code_liste(e.0));
             }
         };
         loop {
@@ -1323,5 +1319,38 @@ mod tests {
         assert_eq!(sec(&fichier("a.exe", Some(Meta { signature: "EDITEUR".into(), ..Meta::default() }))), "LE RESTE");
         assert_eq!(sec(&fichier("a.txt", Some(Meta::default()))), "LE RESTE");
         assert_eq!(Regroupement::depuis('O'), Regroupement::Origine);
+    }
+}
+/// Message affiché quand la lecture d'un dossier échoue (code Win32). Les codes réseau (« \\serveur\partage » injoignable) ont leur
+/// propre texte : « ERREUR 53 » ne disait rien à l'utilisateur (audit du 14/11).
+pub(crate) fn message_code_liste(code: u32) -> String {
+    match code {
+        5 => "ACCES REFUSE".into(),
+        2 | 3 => "DOSSIER INTROUVABLE".into(),
+        21 => "LECTEUR NON PRET".into(),
+        53 => "SERVEUR INTROUVABLE SUR LE RESEAU".into(),
+        67 => "PARTAGE INTROUVABLE SUR LE SERVEUR".into(),
+        64 | 59 | 121 | 1231 => "RESEAU INDISPONIBLE".into(),
+        86 | 1219 | 1326 => "IDENTIFIANTS REFUSES PAR LE SERVEUR".into(),
+        n => format!("ERREUR {n}"),
+    }
+}
+
+#[cfg(test)]
+mod tests_message_code {
+    use super::message_code_liste;
+
+    #[test]
+    fn les_codes_reseau_ont_un_texte_clair() {
+        assert_eq!(message_code_liste(53), "SERVEUR INTROUVABLE SUR LE RESEAU");
+        assert_eq!(message_code_liste(67), "PARTAGE INTROUVABLE SUR LE SERVEUR");
+        assert_eq!(message_code_liste(1326), "IDENTIFIANTS REFUSES PAR LE SERVEUR");
+    }
+
+    #[test]
+    fn les_codes_locaux_gardent_leur_texte_et_l_inconnu_garde_son_numero() {
+        assert_eq!(message_code_liste(5), "ACCES REFUSE");
+        assert_eq!(message_code_liste(3), "DOSSIER INTROUVABLE");
+        assert_eq!(message_code_liste(9999), "ERREUR 9999");
     }
 }

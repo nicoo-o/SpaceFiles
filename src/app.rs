@@ -123,6 +123,21 @@ fn poster<T>(fenetre: isize, msg: u32, v: T) -> bool {
 
 /// Calcul des tailles en cours : un calcul plus récent arrête les autres
 static TAILLES: AtomicU64 = AtomicU64::new(0);
+/// Plafond d'opérations de fichiers qui tournent en même temps, tous onglets confondus (P-07) : au-delà, trois
+/// copies à la fois saturent un disque lent et chacune va plus lentement que si elles passaient l'une après l'autre.
+/// Les suivantes attendent dans la file de leur onglet et partent quand une opération se termine.
+pub const PLAFOND_OPERATIONS: usize = 3;
+/// Opérations qui tournent maintenant (incrémenté au départ, décrémenté à la fin, sur le fil d'interface)
+static ACTIVES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Une nouvelle opération peut-elle partir alors que `actives` tournent déjà ?
+pub fn place_pour_une_operation(actives: usize) -> bool {
+    actives < PLAFOND_OPERATIONS
+}
+
+fn operations_actives() -> usize {
+    ACTIVES.load(Ordering::Relaxed)
+}
 /// Lecture des propriétés en cours : une lecture plus récente arrête les autres
 static METAS: AtomicU64 = AtomicU64::new(0);
 /// Surveillance de la synchronisation cloud : un seul suivi par dossier affiché
@@ -340,6 +355,8 @@ pub struct Operation {
     pub destination: Option<String>,
     /// Début, pour la phase de la grille 3 × 3 et du glissement de Pixel
     pub debut: Instant,
+    /// Le Shell a annoncé au moins un avancement : avant, l'opération « se prépare » (A-16)
+    pub demarree: bool,
     trace: Trace,
     /// À sortir de la corbeille une fois l'opération finie (Ctrl+Z d'un remplacement)
     apres: Vec<(String, String)>,
@@ -367,6 +384,33 @@ pub struct FinOp {
 /// Dernière action qu'on peut défaire, pour la pastille « ANNULER » (10 s). Commune à tous les onglets comme l'historique :
 /// Ctrl+Z défait la même action avant et après la disparition de la pastille.
 static ANNULABLE: std::sync::Mutex<Option<(String, Instant)>> = std::sync::Mutex::new(None);
+
+/// Dernières opérations finies, tous onglets confondus : (nom, issue, fin). Le centre d'opérations (N-01) les relit après la
+/// disparition des pastilles de fin (5 s) et d'erreur (10 s) : la cause d'un échec ne se perd plus.
+static RECENTES: std::sync::Mutex<Vec<(String, String, Instant)>> = std::sync::Mutex::new(Vec::new());
+const RECENTES_MAX: usize = 12;
+
+/// Retient l'issue d'une opération (« TERMINÉE », « ANNULÉE » ou le message de l'échec), la plus récente en tête
+fn noter_recente(nom: String, issue: String) {
+    let mut v = RECENTES.lock().unwrap_or_else(|e| e.into_inner());
+    v.insert(0, (nom, issue, Instant::now()));
+    v.truncate(RECENTES_MAX);
+}
+
+/// Opérations finies, de la plus récente à la plus ancienne : (nom, issue avec son âge)
+pub fn operations_recentes() -> Vec<(String, String)> {
+    let v = RECENTES.lock().unwrap_or_else(|e| e.into_inner());
+    v.iter().map(|(n, i, t)| (n.clone(), format!("{i} · {}", age_court(t.elapsed().as_secs())))).collect()
+}
+
+/// « IL Y A 12 S », « IL Y A 3 MIN », « IL Y A 2 H »
+pub fn age_court(secondes: u64) -> String {
+    match secondes {
+        0..=59 => format!("IL Y A {secondes} S"),
+        60..=3599 => format!("IL Y A {} MIN", secondes / 60),
+        _ => format!("IL Y A {} H", secondes / 3600),
+    }
+}
 
 /// Une action vient d'entrer dans l'historique : la pastille « SUPPRIMÉ · 1 ÉLÉMENT · ANNULER » apparaît
 pub fn proposer_annulation(libelle: String) {
@@ -1332,8 +1376,7 @@ impl App {
             }
             // La barre d'état coupe un long chemin au milieu du mot : on garde la fin, qui distingue les chemins (audit P2-05)
             None => {
-                let m: Vec<char> = t.to_uppercase().chars().collect();
-                let vu = if m.len() > 36 { format!("…{}", m[m.len() - 35..].iter().collect::<String>()) } else { m.iter().collect() };
+                let vu = fin_de_chemin(&t);
                 self.annoncer(format!("CHEMIN INTROUVABLE : {vu}"), true)
             }
         }
@@ -1342,7 +1385,7 @@ impl App {
 
     /// Début d'un lasso au point (x, y) du panneau
     pub fn commencer_lasso(&mut self, x: f32, y: f32, garder: bool) {
-        let y = y - LISTE_Y + self.defilement;
+        let y = y - liste_y() + self.defilement;
         let base = if garder { self.marques.clone() } else { HashSet::new() };
         self.lasso = Some(Lasso { x0: x, y0: y, x1: x, y1: y, base, actif: false });
     }
@@ -1350,11 +1393,11 @@ impl App {
     /// La souris bouge pendant un lasso : le rectangle suit, la liste défile près des bords,
     /// les éléments touchés sont choisis. Renvoie vrai s'il faut redessiner.
     pub fn etirer_lasso(&mut self, x: f32, y: f32) -> bool {
-        let bas = LISTE_Y + self.hauteur_liste;
+        let bas = liste_y() + self.hauteur_liste;
         if y > bas - 8.0 {
             self.defiler((y - bas + 8.0).min(40.0));
-        } else if y < LISTE_Y + 8.0 {
-            self.defiler(-(LISTE_Y + 8.0 - y).min(40.0));
+        } else if y < liste_y() + 8.0 {
+            self.defiler(-(liste_y() + 8.0 - y).min(40.0));
         }
         self.defilement = self.defilement_cible;
         let (par, hr) = self.pas();
@@ -1363,7 +1406,7 @@ impl App {
         let (cote, n) = (self.cote_grille, if grille { self.entrees.len() } else { self.nb_rangs() });
         let Some(l) = self.lasso.as_mut() else { return false };
         l.x1 = x;
-        l.y1 = y - LISTE_Y + self.defilement;
+        l.y1 = y - liste_y() + self.defilement;
         if !l.actif && (l.x1 - l.x0).abs() < 5.0 && (l.y1 - l.y0).abs() < 5.0 {
             return false;
         }
@@ -1823,7 +1866,7 @@ impl App {
 
     /// Pareil, puis sort `apres` de la corbeille une fois fini
     fn lancer_puis(&mut self, hwnd: HWND, genre: operations::Genre, sources: Vec<String>, dest: Option<String>, trace: Trace, apres: Vec<(String, String)>) {
-        if self.operation.is_some() || self.conflits.is_some() {
+        if self.operation.is_some() || self.conflits.is_some() || !place_pour_une_operation(operations_actives()) {
             // La marque de la palette suit l'opération dans la file : la première à partir ensuite ne doit pas la recevoir à sa place
             let palette = std::mem::take(&mut self.palette_arme);
             self.file.push_back(Attente { genre, sources, dest, trace, apres, palette });
@@ -1866,7 +1909,8 @@ impl App {
         let destination = elements.first().and_then(|e| e.dest.clone()).filter(|_| matches!(genre, operations::Genre::Copier | operations::Genre::Deplacer));
         let nom_court = crate::pastilles::nom_court(genre.libelle(), elements.len());
         self.fin_op = None;
-        self.operation = Some(Operation { avancement: 0.0, controle: controle.clone(), numero: n, nom_court, destination, debut: Instant::now(), trace, apres });
+        self.operation = Some(Operation { avancement: 0.0, controle: controle.clone(), numero: n, nom_court, destination, debut: Instant::now(), demarree: false, trace, apres });
+        ACTIVES.fetch_add(1, Ordering::Relaxed);
         operations::lancer(hwnd, n, genre, elements, vides, controle);
         // Pixel glisse et la grille 3 × 3 tourne tant que l'opération dure : une minuterie de 100 ms, détruite à la fin
         // SAFETY: fil d'interface, `hwnd` est la fenêtre principale vivante ; SetTimer ne garde aucune référence
@@ -1883,8 +1927,8 @@ impl App {
     }
 
     /// Démarre l'opération suivante de la file
-    fn suivante(&mut self, hwnd: HWND) {
-        if self.operation.is_none() && self.conflits.is_none() {
+    pub fn suivante(&mut self, hwnd: HWND) {
+        if self.operation.is_none() && self.conflits.is_none() && place_pour_une_operation(operations_actives()) {
             if let Some(a) = self.file.pop_front() {
                 self.palette_arme = a.palette;
                 self.lancer_puis(hwnd, a.genre, a.sources, a.dest, a.trace, a.apres);
@@ -1897,12 +1941,18 @@ impl App {
         self.file.len()
     }
 
+    /// Noms courts des opérations qui attendent derrière celle en cours (centre d'opérations)
+    pub fn noms_en_file(&self) -> Vec<String> {
+        self.file.iter().map(|a| crate::pastilles::nom_court(a.genre.libelle(), a.sources.len())).collect()
+    }
+
     /// Pastilles de cet onglet : l'opération qui tourne, celles qui attendent derrière, la fin ou l'échec de la dernière
     pub fn pastilles_propres(&self) -> Vec<crate::pastilles::Pastille> {
         use crate::pastilles::{expiree, nom_court, Genre, Pastille};
         let mut v = Vec::new();
         if let Some(op) = &self.operation {
-            v.push(Pastille::operation(op.nom_court.clone(), op.avancement, self.en_pause(), op.destination.clone()).avec_cle(op.numero));
+            let phase = self.phase_operation().unwrap_or(crate::pastilles::PhaseOp::EnCours);
+            v.push(Pastille::operation(op.nom_court.clone(), op.avancement, self.en_pause(), op.destination.clone()).avec_cle(op.numero).avec_phase(phase));
         }
         for a in &self.file {
             v.push(Pastille::attente(nom_court(a.genre.libelle(), a.sources.len())));
@@ -1961,7 +2011,15 @@ impl App {
     pub fn progres(&mut self, millieme: usize) {
         if let Some(op) = &mut self.operation {
             op.avancement = millieme as f32 / 1000.0;
+            op.demarree = true;
         }
+    }
+
+    /// Phase à nommer pour l'opération en cours (pastille et pied de fenêtre)
+    pub fn phase_operation(&self) -> Option<crate::pastilles::PhaseOp> {
+        let op = self.operation.as_ref()?;
+        let limitee = crate::operations::LIMITEE.load(Ordering::Relaxed);
+        Some(crate::pastilles::phase_op(op.demarree, crate::operations::attend_reseau(op.numero), op.controle.pause.load(Ordering::Relaxed), limitee))
     }
 
     /// Échap pendant une opération : on demande l'arrêt (et la file d'attente est vidée)
@@ -1976,6 +2034,10 @@ impl App {
     }
 
     pub fn fin_operation(&mut self, hwnd: HWND, b: Bilan) {
+        if self.operation.is_some() {
+            // Libère la place : les opérations qui attendaient à cause du plafond sont relancées par la procédure
+            let _ = ACTIVES.try_update(Ordering::Relaxed, Ordering::Relaxed, |n| Some(n.saturating_sub(1)));
+        }
         let (trace, apres, nom_court, destination) = self.operation.take().map_or((Trace::Aucune, Vec::new(), String::new(), None), |o| (o.trace, o.apres, o.nom_court, o.destination));
         // C'est l'opération de la palette ? Alors l'entrée d'historique qu'elle note ici est celle que son « Annuler » défera
         let de_la_palette = self.palette_numero == Some(b.numero);
@@ -2024,11 +2086,14 @@ impl App {
         }
         let sans_erreur = b.erreur.is_none();
         if let Some(e) = b.erreur {
+            noter_recente(nom_court.clone(), e.clone());
             self.fin_op = Some(FinOp { libelle: nom_court, destination: None, erreur: Some(e.clone()), quand: Instant::now() });
             self.annoncer(e, true);
         } else if b.annule {
+            noter_recente(nom_court, "ANNULÉE".into());
             self.annoncer(format!("{} ANNULEE", b.genre.libelle()), true);
         } else {
+            noter_recente(nom_court.clone(), "TERMINÉE".into());
             self.fin_op = Some(FinOp { libelle: nom_court, destination, erreur: None, quand: Instant::now() });
             let fait = match b.genre {
                 operations::Genre::Copier => "COPIE",
@@ -2990,6 +3055,11 @@ impl App {
             Fond::Taille(chemin, t) => {
                 self.tailles_connues.insert(chemin.to_lowercase(), t);
                 self.calcul_tailles = self.calcul_tailles.saturating_sub(1);
+                // Espace sur un dossier : le résultat reste affiché au lieu de seulement changer une colonne (audit C-14)
+                if self.calcul_tailles == 0 && self.dossiers_choisis() {
+                    let nom = chemin.trim_end_matches('\\').rsplit('\\').next().unwrap_or("");
+                    self.annoncer(format!("{} · {}", nom.to_uppercase(), crate::systeme::taille(t)), true);
+                }
                 let Some(d) = self.dossier().map(str::to_string) else { return true };
                 for e in self.entrees.iter_mut().chain(self.tout.iter_mut()) {
                     if matches!(e.genre, Genre::Dossier) && dossier::joindre(&d, &e.nom).eq_ignore_ascii_case(&chemin) {
@@ -3052,6 +3122,22 @@ impl App {
         } else {
             self.annoncer(format!("{faits} FICHIER{} DEBLOQUE{}", if faits > 1 { "S" } else { "" }, if faits > 1 { "S" } else { "" }), false);
         }
+    }
+
+    /// P-03 : nomme les programmes qui gardent le fichier choisi ouvert (Gestionnaire de redémarrage), en tâche de fond
+    pub fn qui_utilise(&mut self, hwnd: HWND) {
+        let Some(e) = self.selection.and_then(|i| self.entrees.get(i)).filter(|e| matches!(e.genre, Genre::Fichier)) else {
+            self.annoncer("CHOISISSEZ UN FICHIER", true);
+            return;
+        };
+        let Some(chemin) = self.chemin_de(e) else { return };
+        let nom = e.nom.to_uppercase();
+        self.annoncer(format!("RECHERCHE DE CE QUI UTILISE {nom}…"), false);
+        tache(hwnd, move || {
+            let qui = outils::programmes_sur(&chemin);
+            let message = if qui.is_empty() { format!("PERSONNE N'UTILISE {nom} (OU WINDOWS NE LE DIT PAS)") } else { format!("{nom} EST UTILISE PAR : {}", qui.join(", ").to_uppercase()) };
+            Fini { message, erreur: false, copier: None, lancer: None }
+        });
     }
 
     pub fn empreinte(&mut self, hwnd: HWND) {
@@ -3286,6 +3372,13 @@ fn noter_recent(c: &str) {
 mod tests {
     use super::*;
 
+    #[test]
+    fn le_plafond_d_operations_laisse_partir_les_trois_premieres() {
+        assert!((0..PLAFOND_OPERATIONS).all(place_pour_une_operation));
+        assert!(!place_pour_une_operation(PLAFOND_OPERATIONS));
+        assert!(!place_pour_une_operation(PLAFOND_OPERATIONS + 5));
+    }
+
     /// Part du cran comblée après `ms` millisecondes, images toutes les `periode_ms`
     fn comble_apres(periode_ms: f32, ms: f32) -> f32 {
         let (mut pos, mut t) = (0.0f32, 0.0f32);
@@ -3397,5 +3490,25 @@ mod tests {
         assert_eq!(app.texte_surlignage(), "plan");
         app.emplacement = Emplacement::Recherche { racine: r"C:\".into(), motif: "contrat".into() };
         assert_eq!(app.texte_surlignage().trim(), "contrat plan");
+    }
+}
+
+/// Fin d'un long chemin pour la barre d'état, dans sa casse d'origine (audit P2-07 : les majuscules faussaient
+/// le nom d'un dossier, Windows distinguant l'affichage même s'il ignore la casse)
+pub(crate) fn fin_de_chemin(t: &str) -> String {
+    let m: Vec<char> = t.chars().collect();
+    if m.len() > 36 { format!("…{}", m[m.len() - 35..].iter().collect::<String>()) } else { t.to_string() }
+}
+
+#[cfg(test)]
+mod tests_fin_de_chemin {
+    use super::fin_de_chemin;
+
+    #[test]
+    fn garde_la_casse_et_coupe_au_debut() {
+        assert_eq!(fin_de_chemin(r"Z:\Mes Docs"), r"Z:\Mes Docs");
+        let long = format!(r"C:\{}\Fin", "a".repeat(50));
+        let v = fin_de_chemin(&long);
+        assert!(v.starts_with('…') && v.ends_with(r"\Fin") && v.chars().count() == 36);
     }
 }

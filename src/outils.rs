@@ -4,7 +4,6 @@
 use std::collections::HashMap;
 use std::os::windows::process::CommandExt;
 use std::process::Command;
-use std::sync::Mutex;
 
 use windows::core::HSTRING;
 use windows::Win32::UI::Shell::ShellExecuteW;
@@ -282,6 +281,11 @@ pub fn programmes_sur(racine: &str) -> Vec<String> {
     const MAX_FICHIERS: usize = 5_000;
     let mut fichiers: Vec<String> = Vec::new();
     let mut dossiers = vec![std::path::PathBuf::from(racine)];
+    // Un fichier seul (commande « qui utilise ce fichier ? ») : on l'interroge lui-même, sans rien parcourir
+    if std::path::Path::new(racine).is_file() {
+        fichiers.push(racine.to_string());
+        dossiers.clear();
+    }
     while let Some(d) = dossiers.pop() {
         if fichiers.len() >= MAX_FICHIERS {
             break;
@@ -522,51 +526,14 @@ impl Balise {
     }
 }
 
-/// Chemin en minuscules → balise ; chargé une fois depuis les réglages
-static BALISES: Mutex<Option<HashMap<String, Balise>>> = Mutex::new(None);
-
-fn avec_balises<R>(f: impl FnOnce(&mut HashMap<String, Balise>) -> R) -> R {
-    let mut g = BALISES.lock().unwrap_or_else(|e| e.into_inner());
-    let m = g.get_or_insert_with(|| {
-        crate::reglages::actuels()
-            .balises
-            .iter()
-            .filter_map(|l| {
-                let (c, p) = l.split_once('|')?;
-                Some((p.to_lowercase(), Balise::depuis(c.chars().next()?)?))
-            })
-            .collect()
-    });
-    f(m)
-}
-
+/// Balise de ce chemin (façade sur le modèle unique `marquage.rs`, N-03)
 pub fn balise(chemin: &str) -> Option<Balise> {
-    avec_balises(|m| if m.is_empty() { None } else { m.get(&chemin.to_lowercase()).copied() })
+    crate::marquage::lire(|m| if m.marques.is_empty() { None } else { m.marques.get(&crate::marquage::cle(chemin)).and_then(|x| x.balise).and_then(Balise::depuis) })
 }
 
 /// Pose (ou retire, None) une balise sur ces chemins, et l'enregistre
 pub fn baliser(chemins: &[String], b: Option<Balise>) {
-    let cles: Vec<String> = chemins.iter().map(|c| c.to_lowercase()).collect();
-    avec_balises(|m| {
-        for c in &cles {
-            match b {
-                Some(b) => {
-                    m.insert(c.clone(), b);
-                }
-                None => {
-                    m.remove(c);
-                }
-            }
-        }
-    });
-    // Appliqué à la dernière version du fichier, pas à la carte de ce processus : une autre fenêtre a pu
-    // poser d'autres balises depuis (voir reglages::modifier)
-    crate::reglages::modifier(|r| {
-        r.balises.retain(|l| l.split_once('|').is_none_or(|(_, p)| !cles.iter().any(|c| c == &p.to_lowercase())));
-        if let Some(b) = b {
-            r.balises.extend(cles.iter().map(|c| format!("{}|{c}", b.lettre())));
-        }
-    });
+    crate::marquage::modifier(|m| m.poser_balise(chemins, b.map(Balise::lettre)));
 }
 
 #[cfg(test)]
@@ -644,6 +611,8 @@ mod tests {
         let _ouvert = std::fs::File::open(&f).unwrap();
         let qui = programmes_sur(&d.to_string_lossy());
         assert!(!qui.is_empty(), "aucun programme nommé");
+        // P-03 : le même fichier interrogé seul (commande « qui utilise ce fichier ? »)
+        assert!(!programmes_sur(&f.to_string_lossy()).is_empty(), "fichier seul : aucun programme nommé");
         drop(_ouvert);
         assert!(programmes_sur(&d.to_string_lossy()).is_empty());
         let _ = std::fs::remove_dir_all(&d);

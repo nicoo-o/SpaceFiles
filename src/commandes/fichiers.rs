@@ -272,19 +272,57 @@ pub(crate) unsafe fn comparer_panneaux(hwnd: HWND, f: &mut Fenetre, copier: bool
     let _ = InvalidateRect(hwnd, None, false);
 }
 
+/// Copie dans le presse-papiers les écarts des deux panneaux, en Markdown ou en CSV (P-06). Ne change ni la sélection ni les
+/// fichiers : la comparaison est recalculée ici, sans toucher aux écarts affichés.
+pub(crate) unsafe fn exporter_ecarts(hwnd: HWND, f: &mut Fenetre, csv: bool) {
+    let Some(autre) = f.second.as_ref() else {
+        f.app.annoncer("OUVREZ D'ABORD LE DOUBLE PANNEAU (F6)", true);
+        return;
+    };
+    let (Some(d_ici), Some(d_la)) = (f.app.dossier(), autre.dossier()) else {
+        f.app.annoncer("LES DEUX PANNEAUX DOIVENT MONTRER UN DOSSIER", true);
+        return;
+    };
+    let ici = f.app.comparer_avec(autre);
+    let la = autre.comparer_avec(&f.app);
+    let lister = |a: &App, m: &std::collections::HashMap<String, app::Ecart>| -> Vec<(String, &'static str)> {
+        let mut v: Vec<(String, &'static str)> =
+            a.tout.iter().filter_map(|e| m.get(&e.nom.to_lowercase()).filter(|x| **x != app::Ecart::Pareil).map(|x| (e.nom.clone(), x.libelle()))).collect();
+        v.sort_by_key(|(n, _)| n.to_lowercase());
+        v
+    };
+    // Côté « en face » : seulement ce qui n'existe pas ici (le reste est déjà dit du côté « ici », vu de l'autre sens)
+    let en_face: Vec<(String, &'static str)> = lister(autre, &la).into_iter().filter(|(_, e)| *e == app::Ecart::SeulIci.libelle()).map(|(n, _)| (n, "SEULEMENT EN FACE")).collect();
+    let sortie = if csv { comparaison::ecarts_csv } else { comparaison::ecarts_markdown };
+    let texte = sortie(d_ici, d_la, &lister(&f.app, &ici), &en_face);
+    operations::copier_texte(hwnd, &texte);
+    f.app.annoncer(format!("ECARTS COPIES EN {} : {} ICI, {} EN FACE", if csv { "CSV" } else { "MARKDOWN" }, lister(&f.app, &ici).len(), en_face.len()), false);
+}
+
 /// Rouvre les onglets d'une session nommée, après ceux qui sont ouverts
 pub(crate) unsafe fn ouvrir_session(hwnd: HWND, f: &mut Fenetre, nom: &str) {
     let Some(ligne) = reglages::actuels().sessions.into_iter().find(|x| x.split('|').next() == Some(nom)) else { return };
-    let emps: Vec<Emplacement> = ligne.split('|').skip(1).filter_map(depuis_session).collect();
+    let emps: Vec<Emplacement> = reglages::onglets_de_session(&ligne).into_iter().filter_map(depuis_session).collect();
     if emps.is_empty() {
         f.app.annoncer(format!("SESSION « {nom} » : PLUS AUCUN DOSSIER N'EXISTE"), true);
         return;
     }
     let n = emps.len();
+    let debut = f.nb_onglets();
     for e in emps {
         f.nouvel_onglet(hwnd, e);
     }
-    f.app.annoncer(format!("SESSION « {nom} » · {n} ONGLET{} OUVERT{}", if n > 1 { "S" } else { "" }, if n > 1 { "S" } else { "" }), false);
+    // L'onglet qui était actif à l'enregistrement redevient l'onglet actif (seulement s'il fait partie de ceux rouverts)
+    if let Some(a) = reglages::champ_de_session(&ligne, "actif").and_then(|v| v.parse::<usize>().ok()).filter(|&a| a < n) {
+        f.aller_onglet(debut + a);
+    }
+    // Dossier du second panneau : rouvert s'il existe encore et si le double panneau n'est pas déjà ouvert
+    let face = reglages::champ_de_session(&ligne, "face").and_then(depuis_session);
+    let avec_face = face.is_some() && f.second.is_none();
+    if let (Some(e), true) = (face, avec_face) {
+        f.double_panneau_sur(hwnd, e);
+    }
+    f.app.annoncer(format!("SESSION « {nom} » · {n} ONGLET{} OUVERT{}{}", if n > 1 { "S" } else { "" }, if n > 1 { "S" } else { "" }, if avec_face { " · DOUBLE PANNEAU" } else { "" }), false);
     let _ = InvalidateRect(hwnd, None, false);
 }
 
@@ -325,8 +363,15 @@ pub(crate) unsafe fn ouvrir_galerie(hwnd: HWND, f: &mut Fenetre) {
     // HTML, SVG… : la visionneuse web (scripts et réseau coupés) montre la page ; sans runtime WebView2, l'aperçu texte habituel
     g.web = chemin.is_some() && crate::webvue::est_web(&e.ext) && crate::webvue::disponible();
     let web = g.web;
+    // Sans runtime WebView2 : le dire une fois, sinon le source brut passe pour un défaut d'affichage (repli essayé le 14/11)
+    if !web && chemin.is_some() && crate::webvue::est_web(&e.ext) {
+        f.app.annoncer("WEBVIEW2 ABSENT · SOURCE DE LA PAGE AFFICHE", false);
+    }
+    // Office, RTF… : gestionnaire d'aperçu de Windows, seulement si l'auteur l'a activé (P-01) ; l'aperçu habituel sert de repli
+    g.systeme = !web && chemin.is_some() && reglages::actuels().apercu_systeme && crate::hote_apercu::disponible_pour(&e.ext);
+    let systeme = g.systeme;
     f.galerie = Some(g);
-    if let (Some(c), false) = (chemin, web) {
+    if let (Some(c), false) = (chemin, web || systeme) {
         apercu::charger_galerie(hwnd, numero, c, e.ext.clone(), 0, 1);
     }
 }
@@ -334,6 +379,7 @@ pub(crate) unsafe fn ouvrir_galerie(hwnd: HWND, f: &mut Fenetre) {
 /// Visionneuse web du coup d'œil : pose le contrôle WebView2 sur la zone d'image quand l'élément est une page web, le détruit
 /// sinon. Appelé à chaque peinture ; si la création échoue (runtime absent ou cassé), l'aperçu texte prend le relais.
 pub(crate) unsafe fn synchroniser_web(hwnd: HWND, f: &mut Fenetre) {
+    synchroniser_systeme(hwnd, f);
     let Some(g) = f.galerie.as_mut().filter(|g| g.web) else {
         crate::webvue::fermer(hwnd);
         return;
@@ -353,6 +399,32 @@ pub(crate) unsafe fn synchroniser_web(hwnd: HWND, f: &mut Fenetre) {
     let k = f.dpi / 96.0;
     let rect = RECT { left: (x * k).round() as i32, top: (y * k).round() as i32, right: ((x + w) * k).round() as i32, bottom: ((y + hz) * k).round() as i32 };
     crate::webvue::synchroniser(hwnd, Some((chemin.as_str(), rect)));
+}
+
+/// Gestionnaire d'aperçu de Windows (`hote_apercu.rs`) : pose sa fenêtre sur la zone d'image quand l'élément s'y prête, la
+/// décharge sinon ; s'il échoue ou dépasse son délai, l'aperçu habituel prend le relais.
+unsafe fn synchroniser_systeme(hwnd: HWND, f: &mut Fenetre) {
+    let Some(g) = f.galerie.as_mut().filter(|g| g.systeme) else {
+        crate::hote_apercu::fermer();
+        return;
+    };
+    if crate::hote_apercu::a_echoue() {
+        g.systeme = false;
+        let (numero, ext, chemin) = (g.numero, g.ext.clone(), g.chemin.clone());
+        crate::hote_apercu::fermer();
+        if let Some(c) = chemin {
+            apercu::charger_galerie(hwnd, numero, c, ext, 0, 1);
+        }
+        return;
+    }
+    let (Some(chemin), ext) = (g.chemin.clone(), g.ext.clone()) else { return };
+    let (l, h) = crate::fenetre::taille_client(hwnd);
+    let [x, y, w, hz] = crate::rendu::Rendu::zone_image_galerie(f.dip(l as i32), f.dip(h as i32));
+    let k = f.dpi / 96.0;
+    let rect = RECT { left: (x * k).round() as i32, top: (y * k).round() as i32, right: ((x + w) * k).round() as i32, bottom: ((y + hz) * k).round() as i32 };
+    // La fenêtre du gestionnaire (autre processus) passe au-dessus de notre dessin : on la cache sous la palette, un menu ou un toast
+    let masque = f.palette.is_some() || f.menu.is_some() || f.app.menu_barre.is_some() || !crate::app::toasts_vivants().is_empty();
+    crate::hote_apercu::synchroniser(hwnd, Some((chemin.as_str(), ext.as_str(), rect)), masque);
 }
 
 /// Coup d'œil : tourne les pages, `vers(page, pages)` donnant la nouvelle ; sans effet s'il n'y en a qu'une

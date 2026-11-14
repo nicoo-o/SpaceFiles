@@ -34,6 +34,10 @@ pub fn est_web(ext: &str) -> bool {
 pub fn disponible() -> bool {
     static OUI: OnceLock<bool> = OnceLock::new();
     *OUI.get_or_init(|| unsafe {
+        // Essai du repli sans WebView2 : SPACEFILES_SANS_WEBVIEW=1 le déclare absent (comme SPACEFILES_SANS_REGISTRE)
+        if std::env::var_os("SPACEFILES_SANS_WEBVIEW").is_some() {
+            return false;
+        }
         let mut version = PWSTR::null();
         let r = GetAvailableCoreWebView2BrowserVersionString(PCWSTR::null(), &mut version);
         let ok = r.is_ok() && !version.is_null();

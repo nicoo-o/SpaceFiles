@@ -310,7 +310,7 @@ pub(crate) unsafe fn invalider_bande(hwnd: HWND, f: &Fenetre) {
         return;
     }
     let echelle = f.dpi / 96.0;
-    let mut haut = f.dip(h as i32) - STATUT_H;
+    let mut haut = f.dip(h as i32) - statut_h();
     if let Some(e) = posees.enveloppe() {
         haut = haut.min(e.y - 34.0);
     }

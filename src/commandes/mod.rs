@@ -50,7 +50,12 @@ pub(crate) unsafe fn executer_palette(hwnd: HWND, f: &mut Fenetre) {
         palette::Action::EnregistrerSession(nom) => {
             let onglets: Vec<String> = f.emplacements().iter().filter_map(vers_session).collect();
             let n = onglets.len();
-            let ligne = std::iter::once(nom.clone()).chain(onglets).collect::<Vec<_>>().join("|");
+            // Champs facultatifs (N-05) : l'onglet actif et le dossier du second panneau
+            let mut champs = vec![format!("@actif={}", f.rang)];
+            if let Some(d) = f.second.as_ref().and_then(|o| o.dossier()) {
+                champs.push(format!("@face={d}"));
+            }
+            let ligne = std::iter::once(nom.clone()).chain(onglets).chain(champs).collect::<Vec<_>>().join("|");
             reglages::modifier(|r| {
                 r.sessions.retain(|x| x.split('|').next() != Some(nom.as_str()));
                 r.sessions.insert(0, ligne);
@@ -59,6 +64,20 @@ pub(crate) unsafe fn executer_palette(hwnd: HWND, f: &mut Fenetre) {
             sons::jouer(sons::Son::Tic);
         }
         palette::Action::OuvrirSession(nom) => ouvrir_session(hwnd, f, &nom),
+        palette::Action::AllerReglage(cat, rang) => aller_reglage(hwnd, f, cat, rang),
+        // Centre d'opérations : l'ordre part, puis la liste est refaite (la palette reste ouverte pour voir l'effet)
+        palette::Action::PauseOperation(k) | palette::Action::AnnulerOperation(k) => {
+            let arret = matches!(it.action, palette::Action::AnnulerOperation(_));
+            if let Some(a) = f.tous().nth(k) {
+                if arret {
+                    a.annuler_operation();
+                } else {
+                    a.basculer_pause();
+                }
+            }
+            f.palette = Some(Palette::operations(f.lignes_operations()));
+            f.remplir_palette();
+        }
         palette::Action::AjouterRegle(ligne) => {
             reglages::modifier(|r| {
                 if !r.regles.contains(&ligne) {
@@ -168,7 +187,18 @@ pub(crate) unsafe fn executer(hwnd: HWND, f: &mut Fenetre, c: Commande) {
         Commande::CopierChemin => f.app.copier_chemin(hwnd),
         Commande::Sha256 => f.app.empreinte(hwnd),
         Commande::Debloquer => f.app.debloquer(),
-        Commande::ImageJpg => f.app.traiter_images(hwnd, images::Traitement::Jpg),
+        Commande::QuiUtilise => f.app.qui_utilise(hwnd),
+        Commande::Aide => ouvrir_aide(hwnd, f),
+        Commande::ChercherReglage => chercher_reglage(f),
+        Commande::Journal => {
+            f.palette = Some(Palette::journal(crate::journal::dernieres_traces(30)));
+            f.remplir_palette();
+        }
+        Commande::Operations => {
+            f.palette = Some(Palette::operations(f.lignes_operations()));
+            f.remplir_palette();
+        }
+        Commande::ImageJpg =>f.app.traiter_images(hwnd, images::Traitement::Jpg),
         Commande::ImagePng => f.app.traiter_images(hwnd, images::Traitement::Png),
         Commande::ImageReduire => f.app.traiter_images(hwnd, images::Traitement::Reduire(1920)),
         Commande::ImageSansMeta => f.app.traiter_images(hwnd, images::Traitement::SansMeta),
@@ -336,6 +366,8 @@ pub(crate) unsafe fn executer(hwnd: HWND, f: &mut Fenetre, c: Commande) {
             }
         }
         Commande::ComparerTextes => comparer_textes(hwnd, f),
+        Commande::ExporterEcarts => exporter_ecarts(hwnd, f, false),
+        Commande::ExporterEcartsCsv => exporter_ecarts(hwnd, f, true),
         Commande::ArracherOnglet => match (&f.app.emplacement, f.nb_onglets() > 1) {
             (Emplacement::Dossier(c), true) => {
                 lancer_soi(&format!("\"{}\"", c.trim_end_matches('\\')));
@@ -478,7 +510,13 @@ pub(crate) unsafe fn executer(hwnd: HWND, f: &mut Fenetre, c: Commande) {
         Commande::TrierDecroissant => f.app.trier(f.app.tri.0, false),
         Commande::ToutChoisir => f.app.tout_choisir(),
         Commande::InverserSelection => f.app.inverser_selection(),
-        Commande::Palette => ouvrir_palette(f),
+        Commande::Palette | Commande::PaletteSecondaire => ouvrir_palette(f),
+        Commande::SaisirChemin | Commande::SaisirCheminSecondaire => f.app.commencer_saisie_chemin(),
+        Commande::BasculerPanneau => {
+            if f.second.is_some() {
+                f.basculer_panneau();
+            }
+        }
         Commande::DoublePanneau => f.double_panneau(hwnd),
         Commande::CopierVersAutre => f.vers_autre(hwnd, false),
         Commande::Galerie => ouvrir_galerie(hwnd, f),

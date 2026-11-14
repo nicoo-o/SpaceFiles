@@ -189,6 +189,8 @@ pub struct Reglages {
     pub caches: bool,
     pub dates_relatives: bool,
     pub apercu: bool,
+    /// Hôte `IPreviewHandler` du coup d'œil (P-01) : désactivé par défaut, tiers chargés dans un fil à part
+    pub apercu_systeme: bool,
     pub animations: bool,
     pub sons: bool,
     pub un_clic: bool,
@@ -302,6 +304,7 @@ impl Default for Reglages {
             // Maquette v6 : l'aperçu est ouvert pour un nouveau profil. Un profil existant qui a
             // déjà écrit `apercu = false` garde explicitement son choix.
             apercu: true,
+            apercu_systeme: false,
             animations: true,
             sons: true,
             un_clic: false,
@@ -410,6 +413,17 @@ pub fn est_sous(chemin: &str, dossiers: &[String]) -> bool {
 /// Dossier marqué non fiable (V11)
 pub fn non_fiable(dossier: &str) -> bool {
     est_sous(dossier, &actuels().non_fiables)
+}
+
+/// Une session est une ligne « nom|onglet|onglet|… », suivie de champs facultatifs qui commencent par `@` (`@actif=2` :
+/// rang de l'onglet à montrer ; `@face=C:\x` : dossier du second panneau). Une ancienne session n'a pas de champ `@`.
+pub fn onglets_de_session(ligne: &str) -> Vec<&str> {
+    ligne.split('|').skip(1).filter(|x| !x.starts_with('@')).collect()
+}
+
+/// Valeur d'un champ `@clé=valeur` d'une session
+pub fn champ_de_session<'a>(ligne: &'a str, cle: &str) -> Option<&'a str> {
+    ligne.split('|').skip(1).find_map(|x| x.strip_prefix('@')?.strip_prefix(cle)?.strip_prefix('='))
 }
 
 pub fn actuels() -> Reglages {
@@ -761,14 +775,22 @@ fn contraste_windows() -> bool {
 /// « Taille du texte » de Windows (Accessibilité), en centièmes : 100 à 225 dans le registre
 static TEXTE_POUR_CENT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(100);
 
-/// Facteur appliqué aux polices du texte. shortcut: plafonné à 1,5 car les hauteurs de ligne sont fixes en DIP, à relever avec elles.
+/// Plafond appliqué à « Taille du texte » (Windows va jusqu'à 225 %). Au-delà de 150 %, l'en-tête, la barre de chemin, les
+/// boutons, la barre d'état, le volet Aperçu et la carte du disque grandissent avec le texte (`theme::elasticite`). Captures
+/// du 14/11 à 225 % : lisibles ; restent rognés la barre de titre, le titre APERÇU et quelques boutons de densité.
+const TEXTE_MAX: u32 = 225;
+
+/// Facteur appliqué aux polices du texte, de 1,0 à 2,25. Au-delà de 1,5, les zones à hauteur fixe grandissent en proportion
+/// (`theme::elasticite`) ; jusqu'à 1,5 elles gardent leur hauteur de maquette.
 pub fn echelle_texte() -> f32 {
-    TEXTE_POUR_CENT.load(Ordering::Relaxed).clamp(100, 150) as f32 / 100.0
+    TEXTE_POUR_CENT.load(Ordering::Relaxed).clamp(100, TEXTE_MAX) as f32 / 100.0
 }
 
-/// Relit « Taille du texte » ; vrai si le facteur a changé (les polices sont alors à recréer)
+/// Relit « Taille du texte » ; vrai si le facteur a changé (les polices sont alors à recréer).
+/// `SPACEFILES_TEXTE_POUR_CENT` (100 à 225) le fixe sans toucher au réglage de Windows : sert aux captures et aux essais.
 pub fn relire_echelle_texte() -> bool {
     use windows::Win32::System::Registry::{RegGetValueW, HKEY_CURRENT_USER, RRF_RT_REG_DWORD};
+    let force = std::env::var("SPACEFILES_TEXTE_POUR_CENT").ok().and_then(|t| t.trim().parse::<u32>().ok());
     let mut v = 100u32;
     let mut taille = 4u32;
     // SAFETY: `v` fait 4 octets, taille annoncée 4
@@ -776,7 +798,8 @@ pub fn relire_echelle_texte() -> bool {
     if r.is_err() {
         v = 100;
     }
-    TEXTE_POUR_CENT.swap(v, Ordering::Relaxed).clamp(100, 150) != v.clamp(100, 150)
+    let v = force.unwrap_or(v);
+    TEXTE_POUR_CENT.swap(v, Ordering::Relaxed).clamp(100, TEXTE_MAX) != v.clamp(100, TEXTE_MAX)
 }
 
 /// Relit l'état du thème Contraste élevé (à chaque changement de réglage du système, pas seulement des nôtres) ; vrai s'il a changé
@@ -909,6 +932,7 @@ fn ecrire(r: &Reglages) -> String {
     s += &format!("fichiers_caches = {}\n", r.caches);
     s += &format!("dates_relatives = {}\n", r.dates_relatives);
     s += &format!("apercu = {}\n", r.apercu);
+    s += &format!("apercu_systeme = {}\n", r.apercu_systeme);
     s += &format!("animations = {}\n", r.animations);
     s += &format!("sons = {}\n", r.sons);
     s += &format!("un_clic = {}\n", r.un_clic);
@@ -1071,6 +1095,7 @@ fn lire(texte: &str) -> Reglages {
             ("fichiers_caches", Valeur::Bool(b)) => r.caches = b,
             ("dates_relatives", Valeur::Bool(b)) => r.dates_relatives = b,
             ("apercu", Valeur::Bool(b)) => r.apercu = b,
+            ("apercu_systeme", Valeur::Bool(b)) => r.apercu_systeme = b,
             ("animations", Valeur::Bool(b)) => r.animations = b,
             ("sons", Valeur::Bool(b)) => r.sons = b,
             ("un_clic", Valeur::Bool(b)) => r.un_clic = b,
@@ -1147,6 +1172,19 @@ fn lire(texte: &str) -> Reglages {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn session_avec_et_sans_champs() {
+        use super::{champ_de_session, onglets_de_session};
+        let ancienne = "projet|C:\\a|C:\\b";
+        assert_eq!(onglets_de_session(ancienne), vec!["C:\\a", "C:\\b"]);
+        assert_eq!(champ_de_session(ancienne, "actif"), None);
+        let neuve = "projet|C:\\a|C:\\b|@actif=1|@face=D:\\x";
+        assert_eq!(onglets_de_session(neuve), vec!["C:\\a", "C:\\b"]);
+        assert_eq!(champ_de_session(neuve, "actif"), Some("1"));
+        assert_eq!(champ_de_session(neuve, "face"), Some("D:\\x"));
+        assert_eq!(champ_de_session(neuve, "autre"), None);
+    }
+
     /// Toutes les combinaisons local x Windows x partagé : seul un `Reduced` partagé éteint de plus, `Full` n'allume rien
     #[test]
     fn animations_avec_mouvement_partage() {

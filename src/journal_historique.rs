@@ -93,8 +93,13 @@ pub fn lire(texte: &str) -> Vec<Entree> {
 /// Le texte du fichier pour ces entrées (les `MAX_ENTREES` dernières)
 pub fn ecrire(entrees: &[Entree]) -> String {
     let debut = entrees.len().saturating_sub(MAX_ENTREES);
-    entrees[debut..].iter().map(|e| format!("{}\r\n", ligne(e))).collect()
+    let mut s = crate::atomique::en_tete_format(FORMAT);
+    s.extend(entrees[debut..].iter().map(|e| format!("{}\r\n", ligne(e))));
+    s
 }
+
+/// Version du fichier (A-02) : un fichier annonçant mieux n'est jamais réécrit par cette version
+const FORMAT: u32 = 1;
 
 /// (année, mois, jour, heure, minute) de « AAAA-MM-JJ HH:MM[:SS] »
 fn analyser_date(s: &str) -> Option<(i64, i64, i64, i64, i64)> {
@@ -216,6 +221,9 @@ fn sauver(j: &Journal) {
         return;
     }
     let Some(p) = chemin_fichier() else { return };
+    if crate::atomique::plus_recent_que_connu(&p, FORMAT, "journal_historique") {
+        return;
+    }
     crate::atomique::ecrire_journalise(&p, ecrire(j.entrees()).as_bytes(), "journal_historique");
 }
 
@@ -296,7 +304,11 @@ mod tests {
         assert_eq!(v[199].libelle, "Action 249");
         // L'écriture borne aussi
         let beaucoup: Vec<Entree> = (0..300).map(|k| e(0, "2026-11-09 09:12", &format!("A{k}"), "", Etat::Passe)).collect();
-        assert_eq!(ecrire(&beaucoup).lines().count(), MAX_ENTREES);
+        let texte = ecrire(&beaucoup);
+        assert_eq!(texte.lines().count(), MAX_ENTREES + 1, "l'en-tête de format s'ajoute aux entrées");
+        assert!(texte.starts_with("#format=1"));
+        // L'en-tête n'est jamais lu comme une entrée, et le tout se relit à l'identique
+        assert_eq!(lire(&texte).len(), MAX_ENTREES);
         // Et la mémoire
         let mut j = Journal::vide();
         for k in 0..210 {

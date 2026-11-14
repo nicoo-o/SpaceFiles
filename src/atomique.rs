@@ -44,9 +44,41 @@ pub(crate) fn ecrire_journalise(cible: &Path, octets: &[u8], module: &str) {
     }
 }
 
+/// Première ligne d'un fichier texte de données : `#format=N` (A-02). Les anciennes versions l'ignorent (ni `|` ni date).
+pub(crate) fn en_tete_format(version: u32) -> String {
+    format!("#format={version}\r\n")
+}
+
+/// Version annoncée par la première ligne ; `None` pour un fichier d'avant l'en-tête (version 0, toujours lisible)
+pub(crate) fn format_du_texte(texte: &str) -> Option<u32> {
+    texte.trim_start_matches('\u{feff}').lines().next()?.trim().strip_prefix("#format=")?.trim().parse().ok()
+}
+
+/// Le fichier déjà sur disque vient-il d'une version plus récente que `connue` ? Alors on ne l'écrase pas : une version
+/// future a pu changer le format, et réécrire en perdrait le contenu. Trace au journal, sans chemin.
+pub(crate) fn plus_recent_que_connu(cible: &Path, connue: u32, module: &str) -> bool {
+    let Ok(octets) = std::fs::read(cible) else { return false };
+    match format_du_texte(&String::from_utf8_lossy(&octets)) {
+        Some(v) if v > connue => {
+            crate::journal::ecrire(crate::journal::Niveau::Erreur, module, &format!("format {v} plus récent que {connue} : données non enregistrées, mettre SpaceFiles à jour"));
+            true
+        }
+        _ => false,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn en_tete_de_format_se_relit() {
+        assert_eq!(format_du_texte(&en_tete_format(1)), Some(1));
+        assert_eq!(format_du_texte("\u{feff}#format=7\nx"), Some(7));
+        assert_eq!(format_du_texte("1|c:\\a\n"), None);
+        assert_eq!(format_du_texte(""), None);
+        assert_eq!(format_du_texte("#format=abc"), None);
+    }
 
     fn dossier(nom: &str) -> std::path::PathBuf {
         let d = std::env::temp_dir().join(format!("atomique-{nom}-{}", std::process::id()));

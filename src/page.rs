@@ -30,6 +30,8 @@ pub enum Element {
     DatesRelatives,
     EtatCloud,
     Apercu,
+    /// Aperçu des gestionnaires de Windows (Office, PDF…) dans le coup d'œil ; désactivé par défaut (P-01)
+    ApercuSysteme,
     UnClic,
     Ressort,
     NettoyageJours,
@@ -82,7 +84,11 @@ pub enum Element {
     EffacerIndex,
     /// Ligne d'information (raccourcis, dossier des données) : rien à choisir
     Info,
+    /// Touche d'une commande de la table (rang dans `palette::COMMANDES`) : Entrée la change, Suppr rétablit celle d'origine
+    Raccourci(usize),
     PoidsSonore,
+    /// Mode Essentiel (F9), sous son vrai nom « Récents + épingles » ; non enregistré, il vaut pour la session
+    Essentiel,
     /// Interrupteur des fonctions expérimentales (SFTP, WebDAV, sauvegarde NAS, MTP)
     Experimental,
 }
@@ -110,12 +116,13 @@ impl Element {
             Element::RestaurerOnglets | Element::DatesRelatives | Element::NettoyageJours | Element::RetenirRecents | Element::EffacerRecents => Icone::Horloge,
             Element::WinE => Icone::Executable,
             Element::TailleLignes | Element::VoletDense | Element::VueDefaut => Icone::Tableur,
-            Element::Contraste | Element::Apercu | Element::Trame | Element::RefletSurvol => Icone::Image,
+            Element::Contraste | Element::Apercu | Element::ApercuSysteme | Element::Trame | Element::RefletSurvol => Icone::Image,
             Element::Mouvement => Icone::Video,
             Element::YeuxPixel => Icone::Code,
             Element::PixelHeure => Icone::Horloge,
             Element::SectionVolet(_) | Element::Fichier | Element::Info => Icone::Texte,
-            Element::Extensions | Element::Caches | Element::NettoyerCopies => Icone::Fichier,
+            Element::Raccourci(_) => Icone::Raccourci,
+            Element::Extensions | Element::Caches | Element::NettoyerCopies | Element::Essentiel => Icone::Fichier,
             Element::UnClic => Icone::Raccourci,
             Element::ConflitDefaut => Icone::Document,
             Element::CopieVerifiee | Element::DisqueIndexe(_) | Element::EffacerIndex => Icone::Disque,
@@ -146,6 +153,13 @@ pub struct Ligne {
     pub libelle: String,
     pub detail: String,
     pub valeur: Valeur,
+}
+
+impl Ligne {
+    /// Ligne serrée sans carte (touches, données) : un libellé à gauche, une valeur à droite, un trait dessous
+    pub fn compacte(&self) -> bool {
+        matches!(self.element, Element::Info | Element::Raccourci(_)) && self.detail.is_empty()
+    }
 }
 
 fn oui(b: bool) -> Valeur {
@@ -293,8 +307,10 @@ pub fn lignes(r: &Reglages, detectes: &[Lieu], ajoutes: &[Lieu], par_defaut: boo
     l(Element::Extensions, "Extensions des fichiers", "« photo.jpg » plutôt que « photo » (le type reste dans sa colonne).", oui(r.extensions));
     l(Element::VueDefaut, "Vue des nouveaux onglets", "Liste, grille de miniatures ou colonnes.", segments(&crate::reglages::VUES, (r.vue_defaut as usize).min(2)));
     l(Element::Caches, "Fichiers cachés", "Affichés dans les nouveaux onglets (Ctrl+H pour l'onglet ouvert).", oui(r.caches));
+    l(Element::Essentiel, "Récents + épingles", "Mode Essentiel (F9) : seuls les éléments des 7 derniers jours et les épinglés, volet replié.", oui(crate::app::ESSENTIEL.load(std::sync::atomic::Ordering::Relaxed)));
     l(Element::DatesRelatives, "Dates relatives", "« Il y a 5 min », « Hier 14:02 » au lieu de la date complète.", oui(r.dates_relatives));
     l(Element::EtatCloud, "État des fichiers cloud", "Point plein : sur ce PC · anneau : en ligne seulement · double : toujours gardé.", oui(r.etat_cloud));
+    l(Element::ApercuSysteme, "Aperçu des gestionnaires Windows", "Coup d'œil : Word, Excel, PowerPoint, RTF… par le gestionnaire installé, abandonné après 3 s. Expérimental : un gestionnaire figé peut geler la fenêtre.", oui(r.apercu_systeme));
     l(Element::Apercu, "Aperçu à l'ouverture", "Ouvert par défaut pour un nouveau profil (Alt+P à tout moment).", oui(r.apercu));
 
     l(Element::Section(CATEGORIES[5]), "", "", Valeur::Rien);
@@ -346,17 +362,19 @@ pub fn lignes(r: &Reglages, detectes: &[Lieu], ajoutes: &[Lieu], par_defaut: boo
     l(Element::EffacerIndex, "Supprimer l'index de recherche", "Noms des fichiers, gardés sur ce PC · refait à la recherche suivante.", Valeur::Bouton("Supprimer"));
 
     l(Element::Section(CATEGORIES[9]), "", "", Valeur::Rien);
-    // Une commande dont la touche a été changée (réglage `raccourcis`) montre sa nouvelle touche
-    let effectives: Vec<(String, &str)> = crate::palette::COMMANDES.iter().filter(|c| !c.2.is_empty() && !c.2.starts_with("CLIC")).map(|c| (crate::reglages::touche_de_commande(&format!("{:?}", c.0).to_uppercase()).unwrap_or_else(|| c.2.to_string()), c.1)).collect();
-    let commandes = effectives.iter().map(|(t, q)| (t.as_str(), *q));
-    let autres = [("WIN+E", "OUVRIR SPACEFILES"), ("CTRL+L", "SAISIR UN CHEMIN"), ("CTRL+K", "PALETTE DE COMMANDES"), ("CTRL+MAJ+P", "PALETTE DE COMMANDES"), ("TAB", "AUTRE PANNEAU (DOUBLE PANNEAU)")];
-    // Une touche peut servir deux commandes selon le mode (F5 : actualiser en simple panneau, copier en double) : on déduplique la paire
-    let mut vus = Vec::new();
-    for (touche, quoi) in autres.into_iter().chain(commandes) {
-        if !vus.contains(&(touche, quoi)) {
-            vus.push((touche, quoi));
-            l(Element::Info, &casse_phrase(quoi), "", Valeur::Texte(touche_lisible(touche)));
-        }
+    // Les touches fixes d'abord (non modifiables), puis chaque commande de la table : Entrée change sa touche, Suppr la rétablit.
+    // Une commande dont la touche a été changée (réglage `raccourcis`) montre sa nouvelle touche, marquée « · modifiée ».
+    l(Element::Info, "Entrée sur une ligne pour changer sa touche · Suppr la rétablit", "", Valeur::Texte(String::new()));
+    for (touche, quoi) in crate::palette::TOUCHES_FIXES {
+        l(Element::Info, &casse_phrase(quoi), "", Valeur::Texte(touche_lisible(touche)));
+    }
+    // Une touche peut servir deux commandes selon le mode (F5 : actualiser en simple panneau, copier en double) : les deux
+    // lignes restent, chacune avec son libellé
+    for (i, c) in crate::palette::COMMANDES.iter().enumerate().filter(|(i, _)| crate::palette::a_une_touche(*i)) {
+        let touche = crate::palette::touche_effective(i, &r.raccourcis);
+        let modifiee = touche != c.2;
+        let texte = if modifiee { format!("{} · modifiée", touche_lisible(&touche)) } else { touche_lisible(&touche) };
+        l(Element::Raccourci(i), &casse_phrase(c.1), "", Valeur::Texte(texte));
     }
 
     l(Element::Section(CATEGORIES[10]), "", "", Valeur::Rien);
@@ -387,6 +405,9 @@ pub const INFO_H: f32 = 36.0;
 /// Haut de la page (sous la barre de titre) : la marge haute de 24 fait partie du contenu qui défile
 pub const PAGE_Y: f32 = HAUTEUR_TITRE + 1.0;
 
+/// Hauteur de la bande fixe du haut quand la page a défilé : elle porte le × (14 + 30 + 14) et le nom de la catégorie
+pub const BANDE_H: f32 = 58.0;
+
 /// Bords gauche et droit des cartes (padding de 32)
 pub fn gauche() -> f32 {
     REGLAGES_NAV + REGLAGES_PAD_X
@@ -402,15 +423,17 @@ pub fn rect_carte(y: f32, l: f32) -> D2D_RECT_F {
 
 /// Largeur d'un segment : celle de la plus longue option (estimée, la même pour dessiner et pour viser au clic)
 pub fn largeur_segment(options: &[String]) -> f32 {
-    options.iter().map(|o| o.chars().count() as f32 * 6.8 + 28.0).fold(64.0, f32::max)
+    options.iter().map(|o| o.chars().count() as f32 * 6.8 * crate::reglages::echelle_texte() + 28.0).fold(64.0, f32::max)
 }
 
 /// Zones des segments, collés à droite de la carte (padding 16), de gauche à droite
 pub fn zones_segments(carte: D2D_RECT_F, options: &[String]) -> Vec<D2D_RECT_F> {
     let w = largeur_segment(options);
     let x0 = carte.right - 16.0 - w * options.len() as f32;
-    let y0 = (carte.top + carte.bottom - REGLAGE_SEG_H) / 2.0;
-    (0..options.len()).map(|k| rect(x0 + k as f32 * w, y0, w, REGLAGE_SEG_H)).collect()
+    // Le texte des segments suit « Taille du texte » : largeur par caractère et hauteur grandissent avec lui (la carte fait 70 DIP)
+    let h = REGLAGE_SEG_H * crate::theme::elasticite();
+    let y0 = (carte.top + carte.bottom - h) / 2.0;
+    (0..options.len()).map(|k| rect(x0 + k as f32 * w, y0, w, h)).collect()
 }
 
 /// Segment visé par le point (x, y) de la carte, s'il y en a un
@@ -468,9 +491,9 @@ pub fn positions(lignes: &[Ligne], cat: usize) -> Vec<(f32, f32)> {
     }
     v[p.start - 1] = (0.0, TITRE_H);
     // Des lignes d'information sans carte (Raccourcis) : un peu d'air sous le titre, les cartes ont leur marge haute
-    let mut y = TITRE_H + if lignes[p.start].element == Element::Info && lignes[p.start].detail.is_empty() { 8.0 } else { 0.0 };
+    let mut y = TITRE_H + if lignes[p.start].compacte() { 8.0 } else { 0.0 };
     for k in p {
-        let h = if lignes[k].element == Element::Info && lignes[k].detail.is_empty() { INFO_H } else { LIGNE_H };
+        let h = if lignes[k].compacte() { INFO_H } else { LIGNE_H };
         v[k] = (y, h);
         y += h;
     }
@@ -514,12 +537,14 @@ pub struct Page {
     pub formulaire: Option<Formulaire>,
     /// Catégorie affichée (rang dans `CATEGORIES`)
     pub categorie: usize,
+    /// Page Raccourcis : rang (dans `palette::COMMANDES`) de la commande qui attend sa nouvelle touche
+    pub capture: Option<usize>,
 }
 
 impl Page {
     /// Ouverture : la page Apparence, première carte choisie (la ligne 0 est la section, la 1 le thème)
     pub fn nouvelle() -> Self {
-        Self { focus: 1, defilement: 0.0, formulaire: None, categorie: 0 }
+        Self { focus: 1, defilement: 0.0, formulaire: None, categorie: 0, capture: None }
     }
 
     /// Y a-t-il une carte à choisir dans la page affichée ? (Raccourcis : seulement des lignes d'information)
@@ -595,6 +620,7 @@ impl Page {
     pub fn aller_categorie(&mut self, lignes: &[Ligne], k: usize) {
         self.categorie = k.min(CATEGORIES.len() - 1);
         self.defilement = 0.0;
+        self.capture = None;
         let p = plage(lignes, self.categorie);
         // Sans carte à choisir (Raccourcis), le focus reste sur la section : rien n'est surligné
         self.focus = p.clone().find(|&i| lignes[i].element.choisissable()).unwrap_or(p.start.saturating_sub(1));
@@ -697,8 +723,9 @@ mod tests {
             for l in &v {
                 let tout = format!("{} {}", l.libelle, l.detail).to_uppercase();
                 assert!(!tout.contains("RECHERCHE RAPIDE") && !tout.contains("ALT+ESPACE"), "ligne restante : {tout}");
+                // Seule exception : la ligne d'information qui dit que cette touche est celle du lanceur de SpaceNotch
                 if let Valeur::Texte(t) = &l.valeur {
-                    assert!(!t.to_uppercase().contains("ALT+ESPACE"), "touche restante : {t}");
+                    assert!(!t.to_uppercase().contains("ALT+ESPACE") || l.libelle.to_uppercase().contains("SPACENOTCH"), "touche restante : {t}");
                 }
             }
             // La ligne Win+E, elle, reste
@@ -730,7 +757,7 @@ mod tests {
             Detecte(_) | Ajoute(_) | Ajouter => 1,
             Depart | RestaurerOnglets | ParDefaut | WinE => 2,
             VoletDense | Arbre | SectionVolet(_) | Epingle(_) => 3,
-            Extensions | VueDefaut | Caches | DatesRelatives | EtatCloud | Apercu => 4,
+            Extensions | VueDefaut | Caches | Essentiel | DatesRelatives | EtatCloud | Apercu | ApercuSysteme => 4,
             UnClic | Ressort | ConflitDefaut | CopieVerifiee | LimiteReseau | Experimental => 5,
             TelechargementsNavigateur | NettoyageJours | NettoyerCopies | NettoyerArchives | RangerAuto | Regle(_) => 6,
             DisqueIndexe(_) | Exclu(_) | Reconstruire => 7,
@@ -738,9 +765,33 @@ mod tests {
             Animations | Sons | PoidsSonore => 10,
             Fichier | Exporter | Importer | Reinitialiser | Version => 11,
             Info => usize::MAX,
+            Raccourci(_) => 9,
             // Une section n'est pas un réglage : le test appelant ne la passe jamais ici
             Section(_) => usize::MAX - 1,
         }
+    }
+
+    /// Page Raccourcis : une ligne par commande qui a une touche, la touche choisie remplace celle d'origine et se dit « modifiée »
+    #[test]
+    fn page_raccourcis_montre_la_touche_choisie() {
+        let renommer = crate::palette::COMMANDES.iter().position(|c| format!("{:?}", c.0) == "Renommer").unwrap();
+        let texte = |r: &Reglages| {
+            let v = lignes(r, &[], &[], false, false);
+            let l = v.iter().find(|l| l.element == Element::Raccourci(renommer)).expect("ligne Renommer");
+            match &l.valeur {
+                Valeur::Texte(t) => t.clone(),
+                _ => panic!("la valeur d'une touche est un texte"),
+            }
+        };
+        let mut r = Reglages::default();
+        assert_eq!(texte(&r), "F2");
+        r.raccourcis = vec!["CTRL+MAJ+Y=Renommer".into()];
+        assert_eq!(texte(&r), "Ctrl+Maj+Y · modifiée");
+        // Une ligne par commande qui a une touche, et jamais de geste à la souris
+        let v = lignes(&r, &[], &[], false, false);
+        let n = v.iter().filter(|l| matches!(l.element, Element::Raccourci(_))).count();
+        assert_eq!(n, (0..crate::palette::COMMANDES.len()).filter(|&i| crate::palette::a_une_touche(i)).count());
+        assert!(v.iter().filter(|l| l.element == Element::Info).all(|l| l.libelle != "Clic milieu"));
     }
 
     /// Chaque réglage est dans une seule page, la bonne, et les 12 pages existent
@@ -758,7 +809,7 @@ mod tests {
             let pages: Vec<usize> = (0..CATEGORIES.len()).filter(|&c| plage(&v, c).contains(&k)).collect();
             assert_eq!(pages.len(), 1, "{:?} doit être dans exactement une page", l.element);
             if l.element == Element::Info {
-                // Raccourcis (touches) ou données (À propos)
+                // Raccourcis (touches fixes) ou données (À propos)
                 assert!(pages[0] == 9 || pages[0] == 11, "ligne d'information dans la page {}", pages[0]);
             } else {
                 assert_eq!(pages[0], categorie_attendue(l.element), "{:?}", l.element);
@@ -853,12 +904,19 @@ mod tests {
         // Une catégorie hors table est ramenée à la dernière
         p.aller_categorie(&v, 99);
         assert_eq!(p.categorie, 11);
-        // Raccourcis : que des lignes d'information, rien à choisir, mais la page existe et défile
+        // Raccourcis : les touches fixes sont des lignes d'information, les commandes se choisissent (Entrée change la touche)
         p.aller_categorie(&v, 9);
-        assert!(!p.a_des_choix(&v));
-        assert!(matches!(v[p.focus].element, Element::Section(_)));
-        p.deplacer(&v, 1);
-        assert!(matches!(v[p.focus].element, Element::Section(_)));
+        assert!(p.a_des_choix(&v));
+        assert!(matches!(v[p.focus].element, Element::Raccourci(_)), "le focus tombe sur la première touche modifiable");
+        p.capture = Some(0);
+        p.changer_categorie(&v, 1);
+        assert_eq!(p.capture, None, "changer de page abandonne la capture");
+        p.aller_categorie(&v, 9);
+        let n_info = plage(&v, 9).filter(|&k| v[k].element == Element::Info).count();
+        // Une ligne d'explication et les deux touches qui ne se changent pas (Win+E, Alt+Espace)
+        assert!(n_info >= 3, "les touches fixes restent affichées : {n_info}");
+        p.extreme(&v, false);
+        assert!(matches!(v[p.focus].element, Element::Raccourci(_)));
         p.defiler(&v, 5000.0, 300.0);
         assert!(p.defilement > 0.0 && p.defilement <= hauteur_totale(&v, 9) - 300.0 + 0.01);
         // Après une suppression le focus revient sur une carte de la page

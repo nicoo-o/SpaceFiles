@@ -5,9 +5,10 @@ use crate::*;
 
 mod arbre;
 mod clavier;
+mod logique;
 mod procedure;
 mod session;
-mod souris;
+pub(crate) mod souris;
 
 pub(crate) use arbre::*;
 pub(crate) use clavier::*;
@@ -29,6 +30,8 @@ pub(crate) const WM_OUVRIR_ICI: u32 = WM_APP + 31;
 static MODALES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 /// Un `WM_TELECHARGEMENT` est arrivé pendant une modale : il est reposté une seule fois, à sa fin
 static TELECHARGEMENT_EN_ATTENTE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// Idem pour `WM_OUVRIR_ICI` : ouvrir un onglet remplace `f.app`, ce que la modale en dessous ne supporte pas
+static OUVRIR_ICI_EN_ATTENTE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// Posée autour d'un appel modal ; la détruire à sa sortie reposte le message de téléchargement s'il a été retenu.
 /// Fil d'interface seulement (les compteurs sont atomiques, mais le repost vise la fenêtre de ce fil).
@@ -49,6 +52,12 @@ impl Drop for GardeModale {
                 // (échec silencieux si elle n'existe plus)
                 unsafe {
                     let _ = PostMessageW(self.0, navigateur::WM_TELECHARGEMENT, WPARAM(0), LPARAM(0));
+                }
+            }
+            if OUVRIR_ICI_EN_ATTENTE.swap(false, std::sync::atomic::Ordering::SeqCst) {
+                // SAFETY: message sans pointeur, même fenêtre que ci-dessus
+                unsafe {
+                    let _ = PostMessageW(self.0, WM_OUVRIR_ICI, WPARAM(0), LPARAM(0));
                 }
             }
             // Les réponses de fond de la palette retenues pendant la modale reviennent maintenant
@@ -87,6 +96,21 @@ unsafe fn liberer_palette(msg: u32, p: isize) {
         WM_PALETTE_LECTURE => drop(Box::from_raw(p as *mut assistant::Lecture)),
         WM_PALETTE_TACHE => drop(Box::from_raw(p as *mut Fini)),
         _ => {}
+    }
+}
+
+/// Une boucle modale tient-elle l'état de la fenêtre ? (UI Automation refuse alors ses actions)
+pub(crate) fn modale_en_cours() -> bool {
+    MODALES.load(std::sync::atomic::Ordering::SeqCst) > 0
+}
+
+/// `WM_OUVRIR_ICI` pendant une modale : retenu et reposté à la fin ; vrai = ne rien faire maintenant.
+pub(crate) fn retenir_ouvrir_ici() -> bool {
+    if MODALES.load(std::sync::atomic::Ordering::SeqCst) > 0 {
+        OUVRIR_ICI_EN_ATTENTE.store(true, std::sync::atomic::Ordering::SeqCst);
+        true
+    } else {
+        false
     }
 }
 
@@ -268,6 +292,30 @@ impl Fenetre {
         // Cartes d'information (toasts) : communes à tous les onglets
         v.extend(app::toasts_vivants().into_iter().map(|p| (p, usize::MAX)));
         v.sort_by_key(|(p, _)| pastilles::rang_ordre(p));
+        v
+    }
+
+    /// Centre d'opérations (N-01) : ce qui tourne dans chaque onglet, ce qui attend, puis les dernières opérations finies avec
+    /// la cause de leur échec. Le rang d'une opération est celui de `tous()` : c'est lui que pause et arrêt visent.
+    pub(crate) fn lignes_operations(&self) -> Vec<palette::LigneOp> {
+        use palette::{GenreLigneOp, LigneOp};
+        let plusieurs = self.nb_onglets() > 1;
+        let mut v = Vec::new();
+        for (k, a) in self.apps().enumerate() {
+            let onglet = if plusieurs { format!(" · ONGLET {}", k + 1) } else { String::new() };
+            if let Some(op) = &a.operation {
+                let phase = a.phase_operation().and_then(|p| p.libelle()).map(|m| format!("{m} · ")).unwrap_or_default();
+                let detail = format!("{phase}{} %{onglet}", (op.avancement * 100.0).round() as i32);
+                v.push(LigneOp { genre: GenreLigneOp::EnCours(k), titre: op.nom_court.clone(), detail });
+            }
+            for (rang, nom) in a.noms_en_file().into_iter().enumerate() {
+                v.push(LigneOp { genre: GenreLigneOp::EnFile, titre: nom, detail: format!("EN FILE · N°{}{onglet}", rang + 1) });
+            }
+        }
+        for (nom, issue) in app::operations_recentes() {
+            let echec = !(issue.starts_with("TERMINÉE") || issue.starts_with("ANNULÉE"));
+            v.push(LigneOp { genre: GenreLigneOp::Finie { echec }, titre: nom, detail: issue });
+        }
         v
     }
 
@@ -516,6 +564,17 @@ impl Fenetre {
         v
     }
 
+    /// Pour les rectangles de lignes de UI Automation : DPI, largeur du panneau qui a le focus et son décalage en x (le
+    /// panneau de droite du double panneau commence après le volet, comme le test de clic `point_panneau`).
+    pub(crate) unsafe fn geo_accessible(&self, hwnd: HWND) -> Option<accessibilite::Geo> {
+        let (w, _) = taille_client(hwnd);
+        let lt = w as f32 * 96.0 / self.dpi;
+        let double = self.second.is_some();
+        let largeur = theme::largeur_panneau(theme::largeur_liste(lt, self.apercu_visible), double);
+        let decalage = if double && self.focus_droite { largeur - theme::largeur_volet() } else { 0.0 };
+        Some(accessibilite::Geo { dpi: self.dpi, largeur, decalage })
+    }
+
     /// La page des réglages telle que la lit un lecteur d'écran (None hors des réglages)
     pub(crate) fn page_lue(&self) -> Option<accessibilite::PageLue> {
         if self.app.emplacement != Emplacement::Reglages {
@@ -523,7 +582,9 @@ impl Fenetre {
         }
         let lignes = self.lignes();
         let (cartes, focus) = page::noms_accessibles(&lignes, self.page.categorie, self.page.focus);
-        Some(accessibilite::PageLue { categorie: page::CATEGORIES[self.page.categorie].to_string(), cartes, focus })
+        let pos = page::positions(&lignes, self.page.categorie);
+        let places = page::plage(&lignes, self.page.categorie).map(|k| (page::PAGE_Y + pos[k].0 - self.page.defilement, pos[k].1, lignes[k].compacte())).collect();
+        Some(accessibilite::PageLue { places, categorie: page::CATEGORIES[self.page.categorie].to_string(), cartes, focus })
     }
 
     /// Lignes de la page des réglages
@@ -597,7 +658,13 @@ impl Fenetre {
             self.app.annoncer("PANNEAU UNIQUE", false);
             return;
         }
-        let mut o = App::nouveau(self.app.emplacement.clone());
+        self.double_panneau_sur(hwnd, self.app.emplacement.clone());
+        self.app.annoncer("DOUBLE PANNEAU · TAB : CHANGER DE PANNEAU · F5 / MAJ+F6 : COPIER / DEPLACER EN FACE", false);
+    }
+
+    /// Ouvre le second panneau sur cet emplacement (F6 : le même que le premier ; une session : celui qu'elle a gardé)
+    pub(crate) unsafe fn double_panneau_sur(&mut self, hwnd: HWND, emp: Emplacement) {
+        let mut o = App::nouveau(emp);
         o.disques = self.app.disques.clone();
         o.nuages = self.app.nuages.clone();
         o.serveurs = self.app.serveurs.clone();
@@ -606,7 +673,6 @@ impl Fenetre {
         o.charger(hwnd);
         self.second = Some(o);
         self.focus_droite = false;
-        self.app.annoncer("DOUBLE PANNEAU · TAB : CHANGER DE PANNEAU · F5 / MAJ+F6 : COPIER / DEPLACER EN FACE", false);
     }
 
     /// F5 (double panneau), Maj+F5 / Maj+F6 : copie ou déplace la sélection dans le dossier de l'autre panneau
@@ -769,9 +835,11 @@ pub(crate) fn combinaison(vk: VIRTUAL_KEY, ctrl: bool, alt: bool, maj: bool) -> 
     Some([(ctrl, "CTRL+"), (alt, "ALT+"), (maj, "MAJ+")].iter().filter(|x| x.0).map(|x| x.1).collect::<String>() + &nom)
 }
 
-/// Ctrl+K ou Ctrl+Maj+P : ouvre la palette, et la ferme quand elle est ouverte
+/// Les touches de la palette (Ctrl+K et Ctrl+Maj+P par défaut, ou celles choisies dans les réglages) : ouvre la palette, et la
+/// ferme quand elle est ouverte
 pub(crate) fn bascule_palette(vk: VIRTUAL_KEY, ctrl: bool, alt: bool, maj: bool) -> bool {
-    combinaison(vk, ctrl, alt, maj).is_some_and(|c| crate::palette::TOUCHES_PALETTE.contains(&c.as_str()))
+    let Some(c) = combinaison(vk, ctrl, alt, maj) else { return false };
+    [("PALETTE", "CTRL+K"), ("PALETTESECONDAIRE", "CTRL+MAJ+P")].iter().any(|(nom, defaut)| reglages::touche_de_commande(nom).unwrap_or_else(|| defaut.to_string()) == c)
 }
 
 /// Ce que fait F5 selon le mode (lot 15B, `if(k==='F5'&&dual)` de la maquette)
@@ -867,7 +935,7 @@ mod tests {
     #[test]
     fn marge_droite_et_bas_de_liste_sont_du_fond_cliquable() {
         let (l, h) = (1200.0f32, 800.0f32);
-        let milieu = LISTE_Y + 100.0;
+        let milieu = liste_y() + 100.0;
         // Les lignes s'arrêtent avant la marge droite, qui reste dans la zone des fichiers (menu du fond, lasso, dépôt)
         let bord = bord_droit_ligne(l);
         assert!(dans_ligne(l, bord - 1.0));
@@ -879,8 +947,8 @@ mod tests {
         // Hors de la zone : sous l'en-tête, au-dessus de la barre d'état, volet à gauche, aperçu à droite
         assert!(!zone_fichiers(l, h, 100.0, milieu));
         assert!(!zone_fichiers(l, h, l + 1.0, milieu));
-        assert!(!zone_fichiers(l, h, 600.0, LISTE_Y - 1.0));
-        assert!(!zone_fichiers(l, h, 600.0, h - STATUT_H));
+        assert!(!zone_fichiers(l, h, 600.0, liste_y() - 1.0));
+        assert!(!zone_fichiers(l, h, 600.0, h - statut_h()));
     }
 
     #[test]
@@ -898,7 +966,10 @@ mod tests {
     #[test]
     fn ctrl_k_ne_sert_a_aucune_autre_commande_de_la_table() {
         assert_eq!(combinaison(VK_K, true, false, false).as_deref(), Some("CTRL+K"));
-        assert!(palette::COMMANDES.iter().all(|c| !palette::TOUCHES_PALETTE.contains(&c.2)), "une commande de la table prend la touche de la palette");
+        // Les touches de la palette sont celles de ses deux lignes de la table, et d'aucune autre commande
+        let palettes: Vec<&str> = palette::COMMANDES.iter().filter(|c| matches!(c.0, Commande::Palette | Commande::PaletteSecondaire)).map(|c| c.2).collect();
+        assert_eq!(palettes, ["CTRL+K", "CTRL+MAJ+P"]);
+        assert!(palette::COMMANDES.iter().filter(|c| !matches!(c.0, Commande::Palette | Commande::PaletteSecondaire)).all(|c| !palettes.contains(&c.2)));
     }
 
     #[test]

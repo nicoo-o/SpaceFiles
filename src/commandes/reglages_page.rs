@@ -44,6 +44,44 @@ pub(crate) unsafe fn ouvrir_reglages(hwnd: HWND, f: &mut Fenetre) {
     }
 }
 
+/// F1 : la page Raccourcis des réglages, qui liste toutes les touches (dont Espace, Ctrl+K, Tab)
+pub(crate) unsafe fn ouvrir_aide(hwnd: HWND, f: &mut Fenetre) {
+    ouvrir_reglages(hwnd, f);
+    let lignes = f.lignes();
+    if let Some(k) = crate::page::CATEGORIES.iter().position(|&c| c == "Raccourcis") {
+        f.page.aller_categorie(&lignes, k);
+    }
+}
+
+/// « Chercher un réglage » : la palette liste les réglages de toutes les pages (titre et détail), la requête les filtre
+pub(crate) fn chercher_reglage(f: &mut Fenetre) {
+    let lignes = f.lignes();
+    let mut liste = Vec::new();
+    for cat in 0..crate::page::CATEGORIES.len() {
+        for k in crate::page::plage(&lignes, cat) {
+            let l = &lignes[k];
+            // Les lignes d'information (touches, données) ne se règlent pas : la page Raccourcis a sa commande d'aide
+            if l.element.choisissable() && !l.libelle.is_empty() {
+                liste.push((cat, k, l.libelle.clone(), l.detail.clone()));
+            }
+        }
+    }
+    f.palette = Some(Palette::reglage(liste));
+    f.remplir_palette();
+}
+
+/// Ouvre la page `cat` des réglages et y choisit la ligne `rang`
+pub(crate) unsafe fn aller_reglage(hwnd: HWND, f: &mut Fenetre, cat: usize, rang: usize) {
+    ouvrir_reglages(hwnd, f);
+    let lignes = f.lignes();
+    f.page.aller_categorie(&lignes, cat);
+    if lignes.get(rang).is_some_and(|l| l.element.choisissable()) && crate::page::plage(&lignes, cat).contains(&rang) {
+        f.page.focus = rang;
+    }
+    let hauteur = hauteur_page(hwnd, f);
+    f.page.montrer(&lignes, hauteur);
+}
+
 /// « + Ajouter un stockage » de Ce PC : la page Stockages des réglages, formulaire ouvert
 pub(crate) unsafe fn formulaire_stockage(hwnd: HWND, f: &mut Fenetre) {
     ouvrir_reglages(hwnd, f);
@@ -80,6 +118,12 @@ pub(crate) unsafe fn activer_reglage(hwnd: HWND, f: &mut Fenetre, k: usize, sens
     let mut annonce: Option<String> = None;
     match element {
         Element::Section(_) | Element::Version | Element::Info => return,
+        // Page Raccourcis : la ligne attend la nouvelle touche (voir `capturer_touche`)
+        Element::Raccourci(i) => {
+            f.page.capture = Some(i);
+            f.app.annoncer("APPUYEZ SUR LA NOUVELLE TOUCHE · ECHAP ANNULE · SUPPR RETABLIT L'ORIGINE", false);
+            return;
+        }
         // Réglages à contrôle segmenté : Entrée / Espace passe au segment suivant (en boucle), les flèches vont au voisin
         // sans boucler (l'ordre des segments à l'écran n'est pas celui des valeurs enregistrées)
         Element::SectionVolet(_) | Element::Theme | Element::TailleLignes | Element::VueDefaut | Element::Mouvement | Element::PixelHeure => {
@@ -190,9 +234,15 @@ pub(crate) unsafe fn activer_reglage(hwnd: HWND, f: &mut Fenetre, k: usize, sens
         }),
         Element::RestaurerOnglets => reglages::modifier(|r| r.restaurer_onglets = !r.restaurer_onglets),
         Element::Caches => reglages::modifier(|r| r.caches = !r.caches),
+        // Pas un réglage enregistré : la même bascule que F9, qui annonce et rebâtit les listes
+        Element::Essentiel => {
+            super::executer(hwnd, f, Commande::Essentiel);
+            return;
+        }
         Element::DatesRelatives => reglages::modifier(|r| r.dates_relatives = !r.dates_relatives),
         Element::EtatCloud => reglages::modifier(|r| r.etat_cloud = !r.etat_cloud),
         Element::Apercu => reglages::modifier(|r| r.apercu = !r.apercu),
+        Element::ApercuSysteme => reglages::modifier(|r| r.apercu_systeme = !r.apercu_systeme),
         Element::UnClic => reglages::modifier(|r| r.un_clic = !r.un_clic),
         Element::Animations => reglages::modifier(|r| r.animations = !r.animations),
         Element::Sons => reglages::modifier(|r| r.sons = !r.sons),
@@ -232,8 +282,9 @@ pub(crate) unsafe fn activer_reglage(hwnd: HWND, f: &mut Fenetre, k: usize, sens
         }
         Element::Exporter => match systeme::choisir(hwnd, true) {
             Some(d) => {
-                annonce = Some(match reglages::exporter(std::path::Path::new(&d)) {
-                    Ok(c) => format!("RÉGLAGES EXPORTÉS · {}", c.display().to_string().to_uppercase()),
+                let dossier = std::path::Path::new(&d);
+                annonce = Some(match reglages::exporter(dossier).and_then(|c| crate::marquage::exporter(dossier).map(|_| c)) {
+                    Ok(c) => format!("RÉGLAGES ET MARQUES EXPORTÉS · {}", c.display().to_string().to_uppercase()),
                     Err(e) => e,
                 })
             }
@@ -241,10 +292,13 @@ pub(crate) unsafe fn activer_reglage(hwnd: HWND, f: &mut Fenetre, k: usize, sens
         },
         Element::Importer => match systeme::choisir(hwnd, false) {
             Some(c) => {
-                annonce = Some(match reglages::importer(std::path::Path::new(&c)) {
-                    Ok(()) => {
+                let fichier = std::path::Path::new(&c);
+                // Les marques (groupes, balises, étiquettes) sont dans un fichier voisin du TOML, écrit par le même export
+                let marques = fichier.with_file_name(crate::marquage::FICHIER_EXPORT);
+                annonce = Some(match reglages::importer(fichier).and_then(|()| crate::marquage::importer(&marques)) {
+                    Ok(avec_marques) => {
                         f.rafraichir_lieux();
-                        "RÉGLAGES IMPORTÉS".into()
+                        if avec_marques { "RÉGLAGES ET MARQUES IMPORTÉS" } else { "RÉGLAGES IMPORTÉS (PAS DE FICHIER DE MARQUES À CÔTÉ)" }.into()
                     }
                     Err(e) => e,
                 })
@@ -261,6 +315,70 @@ pub(crate) unsafe fn activer_reglage(hwnd: HWND, f: &mut Fenetre, k: usize, sens
         f.app.annoncer(a, false);
     }
     terminer_changement(hwnd);
+}
+
+/// Ce que fait une touche pressée pendant la capture d'une touche (calcul pur : c'est ce que testent les tests)
+#[derive(Debug, PartialEq, Eq)]
+enum Capture {
+    /// Touche de modification seule : on attend la suivante
+    Attendre,
+    /// Échap : la touche reste telle quelle
+    Abandonner,
+    /// Suppr : la touche d'origine revient
+    Retablir,
+    /// Pas une combinaison valide (lettre seule, touche inconnue)
+    Invalide,
+    /// Déjà prise par l'occupant nommé
+    Occupee(&'static str),
+    /// Enregistrer cette combinaison
+    Enregistrer(String),
+}
+
+fn decider_capture(vk: VIRTUAL_KEY, ctrl: bool, maj: bool, alt: bool, i: usize, actuels: &[String]) -> Capture {
+    if matches!(vk, VK_CONTROL | VK_SHIFT | VK_MENU | VK_LCONTROL | VK_RCONTROL | VK_LSHIFT | VK_RSHIFT | VK_LMENU | VK_RMENU | VK_LWIN | VK_RWIN) {
+        return Capture::Attendre;
+    }
+    let nue = !(ctrl || alt || maj);
+    if vk == VK_ESCAPE && nue {
+        return Capture::Abandonner;
+    }
+    if vk == VK_DELETE && nue {
+        return Capture::Retablir;
+    }
+    let Some(combo) = combinaison(vk, ctrl, alt, maj) else { return Capture::Invalide };
+    match palette::occupant(&combo, i, actuels) {
+        Some(autre) => Capture::Occupee(autre),
+        None => Capture::Enregistrer(combo),
+    }
+}
+
+/// Page Raccourcis, ligne en attente d'une touche : ce que fait la touche pressée. Échap abandonne, Suppr rétablit la touche
+/// d'origine, une combinaison valide est enregistrée si personne d'autre ne la tient (sinon on reste en attente, avec
+/// le nom de l'occupant dans la barre d'état). Les touches de modification seules attendent la suivante.
+pub(crate) unsafe fn capturer_touche(f: &mut Fenetre, vk: VIRTUAL_KEY, ctrl: bool, maj: bool, alt: bool) {
+    let Some(i) = f.page.capture else { return };
+    match decider_capture(vk, ctrl, maj, alt, i, &reglages::actuels().raccourcis) {
+        Capture::Attendre => {}
+        Capture::Abandonner => {
+            f.page.capture = None;
+            f.app.annoncer("TOUCHE INCHANGEE", false);
+        }
+        Capture::Retablir => {
+            reglages::modifier(|r| r.raccourcis = palette::raccourcis_avec(&r.raccourcis, i, None));
+            f.page.capture = None;
+            f.app.annoncer("TOUCHE D'ORIGINE RETABLIE", false);
+        }
+        Capture::Invalide => f.app.annoncer("AJOUTEZ CTRL OU ALT, OU CHOISISSEZ UNE TOUCHE F", true),
+        Capture::Occupee(autre) => {
+            let combo = combinaison(vk, ctrl, alt, maj).unwrap_or_default();
+            f.app.annoncer(format!("{} EST DEJA A : {autre}", page::touche_lisible(&combo).to_uppercase()), true);
+        }
+        Capture::Enregistrer(combo) => {
+            reglages::modifier(|r| r.raccourcis = palette::raccourcis_avec(&r.raccourcis, i, Some(&combo)));
+            f.page.capture = None;
+            f.app.annoncer(format!("{} : {}", palette::COMMANDES[i].1, page::touche_lisible(&combo).to_uppercase()), false);
+        }
+    }
 }
 
 /// Ce que tout changement de réglage déclenche ensuite
@@ -303,6 +421,38 @@ fn segment_dans(r: &mut reglages::Reglages, element: Element, s: usize) {
 mod tests {
     use super::*;
     use crate::pixel::ChoixPixel;
+
+    fn rang(c: palette::Commande) -> usize {
+        palette::COMMANDES.iter().position(|x| x.0 == c).unwrap()
+    }
+
+    #[test]
+    fn capture_de_touche_avec_modificateurs_simules() {
+        use windows::Win32::UI::Input::KeyboardAndMouse::{VK_C, VK_E, VK_F2, VK_F8, VK_L, VK_Y};
+        let renommer = rang(palette::Commande::Renommer);
+        // Modificateurs seuls : on attend ; Échap abandonne ; Suppr rétablit
+        assert_eq!(decider_capture(VK_CONTROL, true, false, false, renommer, &[]), Capture::Attendre);
+        assert_eq!(decider_capture(VK_ESCAPE, false, false, false, renommer, &[]), Capture::Abandonner);
+        assert_eq!(decider_capture(VK_DELETE, false, false, false, renommer, &[]), Capture::Retablir);
+        // Les modificateurs s'écrivent dans l'ordre Ctrl, Alt, Maj
+        assert_eq!(decider_capture(VK_Y, true, true, false, renommer, &[]), Capture::Enregistrer("CTRL+MAJ+Y".into()));
+        assert_eq!(decider_capture(VK_Y, true, true, true, renommer, &[]), Capture::Enregistrer("CTRL+ALT+MAJ+Y".into()));
+        // Une lettre seule ou avec Maj seul : refusée ; une touche F nue : acceptée
+        assert_eq!(decider_capture(VK_Y, false, false, false, renommer, &[]), Capture::Invalide);
+        assert_eq!(decider_capture(VK_Y, false, true, false, renommer, &[]), Capture::Invalide);
+        assert_eq!(decider_capture(VK_F8, false, false, false, renommer, &[]), Capture::Enregistrer("F8".into()));
+        // Touche déjà prise par une autre commande
+        let copier = rang(palette::Commande::Copier);
+        assert!(matches!(decider_capture(VK_C, true, false, false, renommer, &[]), Capture::Occupee(_)));
+        assert_eq!(decider_capture(VK_E, false, false, false, copier, &[]), Capture::Invalide);
+        // Sa propre touche reste libre pour elle-même ; une touche quittée est libre pour une autre
+        assert_eq!(decider_capture(VK_F2, false, false, false, renommer, &[]), Capture::Enregistrer("F2".into()));
+        let l = vec!["CTRL+MAJ+Y=Renommer".to_string()];
+        assert_eq!(decider_capture(VK_F2, false, false, false, copier, &l), Capture::Enregistrer("F2".into()));
+        assert!(matches!(decider_capture(VK_Y, true, true, false, copier, &l), Capture::Occupee(_)));
+        // Les anciennes touches fixes sont des commandes de la table : Ctrl+L appartient à « saisir un chemin »
+        assert_eq!(decider_capture(VK_L, true, false, false, renommer, &[]), Capture::Occupee("SAISIR UN CHEMIN"));
+    }
 
     #[test]
     fn segment_mouvement() {

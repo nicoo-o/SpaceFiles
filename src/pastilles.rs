@@ -107,6 +107,50 @@ pub enum Bouton {
     Afficher,
 }
 
+/// Ce que fait l'opération en cours quand sa jauge n'avance pas (A-16). Avant le premier avancement annoncé par le Shell
+/// (calcul des tailles, recherche des conflits), la jauge restait à 0 % sans un mot : on dit « PRÉPARATION ».
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum PhaseOp {
+    /// Avant le premier avancement du Shell
+    Preparation,
+    /// Réseau coupé : reprise automatique à son retour
+    Reseau,
+    Pause,
+    /// Vitesse bridée par le réglage de limite réseau
+    Limitee,
+    /// Rien à dire : la jauge parle
+    EnCours,
+}
+
+impl PhaseOp {
+    /// Mot de droite (majuscules), ou rien quand la jauge suffit
+    pub fn libelle(self) -> Option<&'static str> {
+        match self {
+            PhaseOp::Preparation => Some("PRÉPARATION"),
+            PhaseOp::Reseau => Some("EN ATTENTE DE L'EMPLACEMENT"),
+            PhaseOp::Pause => Some("EN PAUSE"),
+            PhaseOp::Limitee => Some("VITESSE LIMITÉE"),
+            PhaseOp::EnCours => None,
+        }
+    }
+}
+
+/// Choisit la phase à nommer. Priorité : le réseau coupé explique tout (même en pause), puis la pause voulue par
+/// l'utilisateur, puis la préparation (rien n'a encore avancé), puis la limite de vitesse.
+pub fn phase_op(demarree: bool, reseau: bool, pause: bool, limitee: bool) -> PhaseOp {
+    if reseau {
+        PhaseOp::Reseau
+    } else if pause {
+        PhaseOp::Pause
+    } else if !demarree {
+        PhaseOp::Preparation
+    } else if limitee {
+        PhaseOp::Limitee
+    } else {
+        PhaseOp::EnCours
+    }
+}
+
 #[derive(Clone, PartialEq, Debug)]
 pub struct Pastille {
     pub genre: Genre,
@@ -197,6 +241,14 @@ impl Pastille {
         self
     }
 
+    /// Nomme l'attente de l'opération (A-16) : le mot de droite remplace le silence d'une jauge qui n'avance pas
+    pub fn avec_phase(mut self, phase: PhaseOp) -> Self {
+        if let Some(mot) = phase.libelle() {
+            self.etiquette = Some(mot.into());
+        }
+        self
+    }
+
     /// Erreur et annulation montrent leurs boutons sans survol : l'utilisateur doit pouvoir y répondre. Un téléchargement fini
     /// aussi : AFFICHER est la raison d'être de la pastille, et elle ne reste que 10 s.
     pub fn deployee_en_permanence(&self) -> bool {
@@ -224,6 +276,8 @@ impl Pastille {
         let mot: String = lettres.next().map(|c| c.to_uppercase().collect::<String>() + &lettres.as_str().to_lowercase()).unwrap_or_default();
         match self.genre {
             Genre::Operation if self.en_pause => format!("{mot}, en pause, {} pour cent", (self.avancement * 100.0).round() as i32),
+            // Une phase nommée (préparation, réseau coupé, vitesse limitée) se lit avant le pourcentage
+            Genre::Operation if self.etiquette.is_some() => format!("{mot}, {}, {} pour cent", self.etiquette.as_deref().unwrap_or("").to_lowercase(), (self.avancement * 100.0).round() as i32),
             Genre::Operation => format!("{mot}, {} pour cent", (self.avancement * 100.0).round() as i32),
             Genre::Attente => format!("{mot}, en attente"),
             Genre::Fin => format!("{mot}, terminé"),
@@ -902,6 +956,27 @@ mod tests {
         // La clé suit la pastille jusque dans sa zone : deux opérations de même rang d'un dessin à l'autre se distinguent
         let d = mettre_en_page(1600.0, 220.0, 500.0, &[o.clone(), op("COPIE", 0.1).avec_cle(8)], None, TL, PL, &m);
         assert_eq!(d.places.iter().map(|p| p.cle).collect::<Vec<_>>(), vec![7, 8]);
+    }
+
+    #[test]
+    fn la_phase_nomme_l_attente() {
+        // Avant le premier avancement : « PRÉPARATION » ; ensuite la jauge parle
+        assert_eq!(phase_op(false, false, false, false), PhaseOp::Preparation);
+        assert_eq!(phase_op(true, false, false, false), PhaseOp::EnCours);
+        // Priorités : réseau > pause > préparation > vitesse limitée
+        assert_eq!(phase_op(false, true, true, true), PhaseOp::Reseau);
+        assert_eq!(phase_op(false, false, true, false), PhaseOp::Pause);
+        assert_eq!(phase_op(true, false, false, true), PhaseOp::Limitee);
+        assert_eq!(PhaseOp::EnCours.libelle(), None);
+        let p = op("COPIE", 0.0).avec_phase(PhaseOp::Preparation);
+        assert_eq!(p.etiquette.as_deref(), Some("PRÉPARATION"));
+        assert_eq!(p.nom_accessible(), "Copie, préparation, 0 pour cent");
+        // Rien à nommer : la pastille garde sa jauge seule
+        assert!(op("COPIE", 0.5).avec_phase(PhaseOp::EnCours).etiquette.is_none());
+        // Le mot de droite se loge dans la pastille sans écraser le nom
+        let m = |t: &str| t.chars().count() as f32 * 7.0;
+        let d = mettre_en_page(1600.0, 220.0, 500.0, &[op("COPIE · 3 ÉLÉMENTS", 0.0).avec_phase(PhaseOp::Reseau)], Some(0), TL, PL, &m);
+        assert_eq!(d.places[0].etiquette.as_ref().unwrap().0, "EN ATTENTE DE L'EMPLACEMENT");
     }
 
     fn tel(phase: PhaseTelechargement, nom: &str, droite: &str, cle: u64) -> Pastille {

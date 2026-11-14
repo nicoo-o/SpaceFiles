@@ -29,7 +29,10 @@ pub enum Outil {
     Plus,
 }
 
-pub const BOUTON: f32 = 36.0;
+/// Côté d'un bouton de la barre d'actions : 36 DIP, agrandi avec le texte au-delà de 150 % (`theme::elasticite`)
+pub fn bouton() -> f32 {
+    36.0 * elasticite()
+}
 /// Groupe Compact / Confort, à gauche du groupe des vues
 pub const DENSITE_LARGEUR: f32 = 128.0;
 const DENSITE_ECART: f32 = 16.0;
@@ -40,11 +43,11 @@ const ESPACE: f32 = 2.0;
 const SEPARATION: f32 = 14.0;
 
 impl Outil {
-    /// Rayon de coin du fond de l'outil : une pilule (`BOUTON / 2`) pour « + NOUVEAU » (maquette `.btn`), 10 pour les autres.
+    /// Rayon de coin du fond de l'outil : une pilule (`bouton() / 2`) pour « + NOUVEAU » (maquette `.btn`), 10 pour les autres.
     /// Le fond, le contour et le reflet du curseur le partagent : le reflet avait un coin de 8 et dessinait, autour de la pilule,
     /// une seconde forme carrée aux coins arrondis.
     pub fn rayon_coin(self) -> f32 {
-        if self == Outil::Nouveau { BOUTON / 2.0 } else { 10.0 }
+        if self == Outil::Nouveau { bouton() / 2.0 } else { 10.0 }
     }
 
     /// Texte court (boutons à libellé) ; vide : icône seule
@@ -159,7 +162,7 @@ fn largeur(o: Outil, texte: bool, mesurer: &dyn Fn(&str) -> f32) -> f32 {
     if o.a_menu() && o != Outil::Plus {
         ICONE + if texte { mesurer(o.libelle()) + 6.0 } else { 0.0 } + CHEVRON
     } else {
-        BOUTON
+        bouton()
     }
 }
 
@@ -192,7 +195,7 @@ pub fn placer(x0: f32, x1: f32, mesurer: &dyn Fn(&str) -> f32) -> Vec<Place> {
         }
     }
 
-    let y = BARRE_Y + BARRE_PAD_HAUT;
+    let y = barre_y() + barre_pad_haut();
     let mut v = Vec::new();
     let ranger = |groupes: &[Vec<Outil>], mut x: f32, v: &mut Vec<Place>| {
         let mut premier = true;
@@ -202,7 +205,7 @@ pub fn placer(x0: f32, x1: f32, mesurer: &dyn Fn(&str) -> f32) -> Vec<Place> {
             }
             for (k, &o) in g.iter().enumerate() {
                 let w = largeur(o, texte, mesurer);
-                v.push(Place { outil: o, zone: D2D_RECT_F { left: x, top: y, right: x + w, bottom: y + BOUTON }, texte: texte || o == Outil::Nouveau, separe: k == 0 && !premier });
+                v.push(Place { outil: o, zone: D2D_RECT_F { left: x, top: y, right: x + w, bottom: y + bouton() }, texte: texte || o == Outil::Nouveau, separe: k == 0 && !premier });
                 x += w + ESPACE;
             }
             premier = false;
@@ -229,7 +232,7 @@ pub fn zones_densite(barre: &[Place]) -> [Option<D2D_RECT_F>; 2] {
         return [None, None];
     }
     let y = premier.zone.top;
-    [Some(rect(x + 3.0, y, DENSITE_BOUTON, BOUTON)), Some(rect(x + 64.0, y, DENSITE_BOUTON, BOUTON))]
+    [Some(rect(x + 3.0, y, DENSITE_BOUTON, bouton())), Some(rect(x + 64.0, y, DENSITE_BOUTON, bouton()))]
 }
 
 #[cfg(test)]
@@ -239,12 +242,12 @@ mod tests {
     #[test]
     fn une_seule_forme_pour_le_bouton_nouveau() {
         // Fond, contour et reflet lisent le même rayon : la pilule (moitié de la hauteur), jamais le coin de 8 du reflet d'avant
-        assert_eq!(Outil::Nouveau.rayon_coin(), BOUTON / 2.0);
+        assert_eq!(Outil::Nouveau.rayon_coin(), bouton() / 2.0);
         for o in [Outil::Copier, Outil::Supprimer, Outil::Trier, Outil::VueListe, Outil::Plus] {
             assert_eq!(o.rayon_coin(), 10.0);
         }
         // Le rayon d'une pilule ne dépasse jamais la moitié de la hauteur du bouton
-        assert!(Outil::Nouveau.rayon_coin() * 2.0 <= BOUTON);
+        assert!(Outil::Nouveau.rayon_coin() * 2.0 <= bouton());
     }
 
     #[test]

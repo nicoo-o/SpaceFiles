@@ -69,6 +69,56 @@ fn ajouter(fichier: &Path, texte: &str) {
     }
 }
 
+/// Remplace chaque chemin Windows d'un texte par son dernier élément : le journal affiché dans l'app ne montre
+/// ni nom d'utilisateur ni arborescence (utile aussi quand on copie une capture dans un rapport public).
+pub fn sans_chemins(texte: &str) -> String {
+    texte
+        .split(' ')
+        .map(|mot| {
+            let nu = mot.trim_matches(|c| matches!(c, '«' | '»' | '"' | '\'' | '(' | ')' | ',' | ';'));
+            let est_chemin = nu.contains(":\\") || nu.starts_with("\\\\");
+            if est_chemin {
+                let fin = nu.rsplit('\\').find(|p| !p.is_empty()).unwrap_or("");
+                format!("…\\{fin}")
+            } else {
+                mot.to_string()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// Lit le journal d'erreurs et rend les traces d'erreur, d'avertissement et de plantage, de la plus récente à la
+/// plus ancienne : (date et origine, message), chemins retirés. Les lignes d'information sont écartées.
+pub fn analyser_traces(contenu: &str, max: usize) -> Vec<(String, String)> {
+    let mut v: Vec<(String, String)> = Vec::new();
+    for ligne in contenu.lines() {
+        let l = ligne.trim();
+        if l.len() < 20 || !l.as_bytes()[..4].iter().all(u8::is_ascii_digit) {
+            continue;
+        }
+        let (date, reste) = l.split_at(19);
+        let reste = reste.trim_start();
+        if let Some(r) = reste.strip_prefix("ERREUR ").or_else(|| reste.strip_prefix("AVERT ")) {
+            let niveau = if reste.starts_with("ERREUR") { "ERREUR" } else { "AVERT" };
+            let (module, message) = r.split_once(' ').unwrap_or((r, ""));
+            v.push((format!("{date} · {niveau} · {module}"), sans_chemins(message)));
+        } else if reste.contains("· fil ") {
+            v.push((format!("{date} · PLANTAGE"), sans_chemins(reste)));
+        }
+    }
+    v.reverse();
+    v.truncate(max);
+    v
+}
+
+/// Les `max` dernières traces graves du journal courant (liste vide si le fichier est absent)
+pub fn dernieres_traces(max: usize) -> Vec<(String, String)> {
+    let Some(d) = crate::reglages::dossier_donnees(true) else { return Vec::new() };
+    let contenu = std::fs::read(d.join("journal.txt")).map(|o| String::from_utf8_lossy(&o).into_owned()).unwrap_or_default();
+    analyser_traces(&contenu, max)
+}
+
 pub fn fichier_operations() -> Option<std::path::PathBuf> {
     Some(crate::reglages::dossier_donnees(true)?.join("operations.csv"))
 }
@@ -174,6 +224,27 @@ pub fn operation(action: &str, detail: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Un chemin n'apparaît jamais en entier dans le journal affiché ; le reste du texte est intact
+    #[test]
+    fn chemins_retires_du_journal_affiche() {
+        assert_eq!(sans_chemins("lecture de C:\\Users\\Jean\\Documents\\a.txt impossible"), "lecture de …\\a.txt impossible");
+        assert_eq!(sans_chemins("« \\\\NAS\\partage\\x » refusé"), "« …\\x » refusé");
+        assert_eq!(sans_chemins("rien à retirer"), "rien à retirer");
+    }
+
+    /// Les traces graves sortent de la plus récente à la plus ancienne ; l'information est écartée ; le plafond tient
+    #[test]
+    fn traces_graves_du_plus_recent_au_plus_ancien() {
+        let j = "2026-11-14 10:00:00 INFO eco connecté\r\n2026-11-14 10:01:00 ERREUR index échec C:\\Users\\Jean\\x.db\r\n\
+                 2026-11-14 10:02:00 AVERT reseau lent\r\n2026-11-14 10:03:00 · version 1.0 · fil « main »\r\npanicked at src\\a.rs\r\n";
+        let t = analyser_traces(j, 10);
+        assert_eq!(t.len(), 3);
+        assert!(t[0].0.contains("PLANTAGE") && t[1].0.contains("AVERT") && t[2].0.contains("ERREUR"));
+        assert!(!t[2].1.contains("Jean"));
+        assert_eq!(analyser_traces(j, 2).len(), 2);
+        assert!(analyser_traces("", 5).is_empty());
+    }
 
     #[test]
     fn mise_en_forme_d_une_trace() {

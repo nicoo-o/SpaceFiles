@@ -580,11 +580,13 @@ pub fn attend_reseau(numero: u64) -> bool {
     ATTENTES.lock().unwrap_or_else(|e| e.into_inner()).contains(&numero)
 }
 
-/// Erreur de réseau (serveur perdu, connexion coupée) : de quoi reprendre plus tard
+/// Erreur de réseau (serveur perdu, connexion coupée) ou de lecteur retiré ou endormi (clé USB débranchée, disque
+/// externe qui se réveille après la veille) : de quoi reprendre plus tard (N-02)
 fn reseau(h: HRESULT) -> bool {
     let h = h.0 as u32;
     let code = if h & 0xFFFF_0000 == 0x8007_0000 { h & 0xFFFF } else { h };
-    matches!(code, 51 | 53 | 59 | 64 | 67 | 121 | 1222 | 1231 | 1232 | 1236 | 1240)
+    // 21 lecteur non prêt, 55 ressource plus disponible, 1117 erreur d'E/S du périphérique, 1167 périphérique non connecté
+    matches!(code, 21 | 51 | 53 | 55 | 59 | 64 | 67 | 121 | 1117 | 1167 | 1222 | 1231 | 1232 | 1236 | 1240)
 }
 
 /// L'opération en cours est-elle bridée par la limite de vitesse réseau ? (barre d'état)

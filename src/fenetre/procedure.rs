@@ -41,17 +41,7 @@ pub(crate) extern "system" fn procedure(hwnd: HWND, msg: u32, wparam: WPARAM, lp
                     let droite = pt.x >= l as i32 - bord;
                     let haut = pt.y < bord;
                     let bas = pt.y >= h as i32 - bord;
-                    let zone = match (gauche, droite, haut, bas) {
-                        (true, _, true, _) => HTTOPLEFT,
-                        (_, true, true, _) => HTTOPRIGHT,
-                        (true, _, _, true) => HTBOTTOMLEFT,
-                        (_, true, _, true) => HTBOTTOMRIGHT,
-                        (true, _, _, _) => HTLEFT,
-                        (_, true, _, _) => HTRIGHT,
-                        (_, _, true, _) => HTTOP,
-                        (_, _, _, true) => HTBOTTOM,
-                        _ => HTNOWHERE,
-                    };
+                    let zone = super::logique::zone_de_bord(gauche, droite, haut, bas);
                     if zone != HTNOWHERE {
                         return LRESULT(zone as isize);
                     }
@@ -306,6 +296,10 @@ pub(crate) extern "system" fn procedure(hwnd: HWND, msg: u32, wparam: WPARAM, lp
                     if let Some(a) = f.tous().find(|a| a.possede(b.numero)) {
                         a.fin_operation(hwnd, *b);
                         entree = a.palette_entree.take();
+                    }
+                    // Une place vient de se libérer sous le plafond d'opérations : les onglets qui attendaient peuvent partir
+                    for a in f.tous() {
+                        a.suivante(hwnd);
                     }
                     // Une opération de la palette qui attendait dans la file et qui n'est jamais partie (Échap a vidé la file, tout ignoré) :
                     // plus rien ne tourne, la palette le dit au lieu de rester en progression
@@ -659,7 +653,7 @@ pub(crate) extern "system" fn procedure(hwnd: HWND, msg: u32, wparam: WPARAM, lp
                             Affichage::Grille => {
                                 let (par, hr) = f.app.pas();
                                 let x = grille_x0() + (i % par) as f32 * (f.app.cote_grille + app::GRILLE_ECART);
-                                let y = LISTE_Y + (i / par) as f32 * hr - f.app.defilement;
+                                let y = liste_y() + (i / par) as f32 * hr - f.app.defilement;
                                 px >= x && px <= x + 26.0 && py >= y + 6.0 && py <= y + 32.0
                             }
                             Affichage::Colonnes => false,
@@ -782,7 +776,7 @@ pub(crate) extern "system" fn procedure(hwnd: HWND, msg: u32, wparam: WPARAM, lp
                     let decalage = if f.second.is_some() && f.focus_droite { largeur_panneau(largeur_liste(f.dip(lt as i32), f.apercu_visible), true) - largeur_volet() } else { 0.0 };
                     let mut pt = POINT {
                         x: ((largeur_volet() + 60.0 + decalage) * echelle) as i32,
-                        y: ((LISTE_Y + ligne * hauteur_ligne() - f.app.defilement) * echelle) as i32,
+                        y: ((liste_y() + ligne * hauteur_ligne() - f.app.defilement) * echelle) as i32,
                     };
                     let _ = ClientToScreen(hwnd, &mut pt);
                     menu_contextuel(hwnd, cible, pt.x, pt.y);
@@ -1013,8 +1007,8 @@ pub(crate) extern "system" fn procedure(hwnd: HWND, msg: u32, wparam: WPARAM, lp
 
             WM_MOUSEWHEEL => {
                 if let Some(f) = etat_de(hwnd) {
-                    let crans = ((wparam.0 >> 16) & 0xFFFF) as i16 as f32 / 120.0;
-                    let ctrl = wparam.0 & 0x0008 != 0; // MK_CONTROL
+                    let crans = super::logique::crans_molette(wparam.0);
+                    let ctrl = super::logique::ctrl_tenue(wparam.0);
                     if f.galerie.is_some() {
                         // Coup d'œil : Ctrl + molette = zoom autour du pointeur ; molette seule = pages (un cran = une page)
                         if ctrl {
@@ -1022,12 +1016,11 @@ pub(crate) extern "system" fn procedure(hwnd: HWND, msg: u32, wparam: WPARAM, lp
                             let _ = ScreenToClient(hwnd, &mut p);
                             zoomer_galerie(hwnd, f, 1.25f32.powf(crans), Some((f.dip(p.x), f.dip(p.y))));
                         } else if crans != 0.0 {
-                            let sens: i64 = if crans > 0.0 { -1 } else { 1 };
-                            page_galerie(hwnd, f, |p, n| (p as i64 + sens).clamp(0, n as i64 - 1) as u32);
+                            page_galerie(hwnd, f, |p, n| super::logique::page_apres_molette(p, n, crans));
                         }
                         let _ = InvalidateRect(hwnd, None, false);
                     } else if let Some(l) = &mut f.lot {
-                        l.defilement = (l.defilement as i64 - (crans * 3.0) as i64).clamp(0, l.noms.len().saturating_sub(1) as i64) as usize;
+                        l.defilement = super::logique::defilement_lot(l.defilement, crans, l.noms.len());
                     } else if let Some(p) = &mut f.palette {
                         p.deplacer(-(crans as i64));
                     } else if f.historique && {
@@ -1185,6 +1178,13 @@ pub(crate) extern "system" fn procedure(hwnd: HWND, msg: u32, wparam: WPARAM, lp
                     animer(hwnd, f);
                     return LRESULT(0);
                 }
+                // Page Raccourcis, une ligne attend sa touche : toute touche lui revient (avant les raccourcis, qui la lanceraient)
+                if f.page.capture.is_some() && f.app.emplacement == Emplacement::Reglages && f.page.formulaire.is_none() {
+                    capturer_touche(f, vk, ctrl, maj, alt);
+                    let _ = InvalidateRect(hwnd, None, false);
+                    animer(hwnd, f);
+                    return LRESULT(0);
+                }
                 // Panneau Historique (lot 15B) : Échap rentre le tiroir avant tout autre geste, sauf pendant une saisie ou une fenêtre modale
                 // (déjà traitées plus haut)
                 if vk == VK_ESCAPE && f.historique && !f.modale() && f.app.edition.is_none() && f.page.formulaire.is_none() {
@@ -1244,7 +1244,7 @@ pub(crate) extern "system" fn procedure(hwnd: HWND, msg: u32, wparam: WPARAM, lp
                         return LRESULT(0);
                     }
                     // Dans les réglages, Tab change de catégorie (touche_page) : il ne bascule pas le double panneau
-                    VK_TAB if !ctrl && f.second.is_some() && f.app.edition.is_none() && f.page.formulaire.is_none() && f.app.emplacement != Emplacement::Reglages => {
+                    VK_TAB if !ctrl && f.second.is_some() && reglages::touche_de_commande("BASCULERPANNEAU").is_none() && f.app.edition.is_none() && f.page.formulaire.is_none() && f.app.emplacement != Emplacement::Reglages => {
                         f.basculer_panneau();
                         animer(hwnd, f);
                         return LRESULT(0);
@@ -1337,6 +1337,7 @@ pub(crate) extern "system" fn procedure(hwnd: HWND, msg: u32, wparam: WPARAM, lp
                     VK_H if ctrl && maj => Some(Commande::Historique),
                     VK_F6 if ctrl && maj => Some(Commande::Comparer),
                     VK_F9 if !ctrl && !alt => Some(Commande::Essentiel),
+                    VK_F1 if !ctrl && !alt && !maj => Some(Commande::Aide),
                     VK_Z if ctrl && alt => Some(Commande::Zip),
                     VK_X if ctrl && alt => Some(Commande::Extraire),
                     VK_D if ctrl && !alt => Some(Commande::Epingler),
@@ -1645,6 +1646,10 @@ pub(crate) extern "system" fn procedure(hwnd: HWND, msg: u32, wparam: WPARAM, lp
                 if cd.dwData != ONGLETS_COPIES || cd.lpData.is_null() {
                     return LRESULT(0);
                 }
+                // Une modale tient `&mut Fenetre` en dessous : refusé (l'expéditeur lit 0 et garde ses onglets)
+                if modale_en_cours() {
+                    return LRESULT(0);
+                }
                 // SAFETY: l'expéditeur garantit cbData octets lisibles pendant l'appel (contrat de WM_COPYDATA)
                 let u = std::slice::from_raw_parts(cd.lpData as *const u16, cd.cbData as usize / 2);
                 let Some(f) = etat_de(hwnd) else { return LRESULT(0) };
@@ -1657,11 +1662,54 @@ pub(crate) extern "system" fn procedure(hwnd: HWND, msg: u32, wparam: WPARAM, lp
 
             // Fin de la consultation du disque de `recevoir_ouvrir_ici` : l'onglet s'ouvre ici, sur le fil d'interface
             WM_OUVRIR_ICI => {
+                // Pendant une modale le résultat reste déposé ; le message revient à sa fin
+                if retenir_ouvrir_ici() {
+                    return LRESULT(0);
+                }
                 // Aucun pointeur dans ce message : un message forgé ne fait que vider la file plus tôt (voir `OUVERTURES`)
                 let a_ouvrir = eco::reutiliser::vider(&OUVERTURES, hwnd.0 as isize);
                 if let Some(f) = etat_de(hwnd) {
                     for o in a_ouvrir {
                         ouvrir_ici(hwnd, f, o);
+                    }
+                }
+                LRESULT(0)
+            }
+
+            crate::hote_apercu::WM_HOTE_FOCUS => {
+                // Le gestionnaire d'aperçu rend le clavier (Tab, Échap) : seul le fil de la fenêtre peut reprendre le focus
+                let _ = SetFocus(hwnd);
+                LRESULT(0)
+            }
+
+            accessibilite::WM_UIA_ACTION => {
+                // Action d'un lecteur d'écran (motifs Selection et Invoke), postée par le fil de UI Automation
+                let Some((action, k, nom)) = accessibilite::prendre_action() else { return LRESULT(0) };
+                // Une modale tient `&mut Fenetre` en dessous de nous : on n'y touche pas
+                if modale_en_cours() {
+                    return LRESULT(0);
+                }
+                if let Some(f) = etat_de(hwnd) {
+                    // Sur la page des réglages la liste du dossier n'est pas affichée ; la ligne doit porter encore le nom que le lecteur a lu
+                    if f.page_lue().is_none() && f.app.entrees.get(k).is_some_and(|e| e.nom == nom) {
+                        match action {
+                            accessibilite::ACTION_CHOISIR => f.app.choisir_seul(k),
+                            accessibilite::ACTION_AJOUTER => {
+                                if !f.app.marques.contains(&k) {
+                                    f.app.basculer(k);
+                                }
+                                f.app.selection = Some(k);
+                            }
+                            accessibilite::ACTION_RETIRER => {
+                                f.app.marques.remove(&k);
+                            }
+                            accessibilite::ACTION_OUVRIR => {
+                                f.app.choisir_seul(k);
+                                f.app.ouvrir(hwnd, k);
+                            }
+                            _ => {}
+                        }
+                        let _ = InvalidateRect(hwnd, None, false);
                     }
                 }
                 LRESULT(0)
@@ -1673,7 +1721,7 @@ pub(crate) extern "system" fn procedure(hwnd: HWND, msg: u32, wparam: WPARAM, lp
                     if let Some(f) = etat_de(hwnd) {
                         let noms: Vec<String> = f.pastilles().iter().map(|(p, _)| p.nom_accessible()).collect();
                         let lue = f.page_lue();
-                        accessibilite::maj(hwnd, &f.app, &noms, lue.as_ref());
+                        accessibilite::maj(hwnd, &f.app, &noms, lue.as_ref(), f.geo_accessible(hwnd));
                     }
                     let _ = InvalidateRect(hwnd, None, false);
                     r
@@ -1720,7 +1768,7 @@ pub(crate) extern "system" fn procedure(hwnd: HWND, msg: u32, wparam: WPARAM, lp
                     let pastille_ouverte = f.pastille_ouverte(liste_pastilles.len());
                     let noms: Vec<String> = liste_pastilles.iter().map(|p| p.nom_accessible()).collect();
                     let lue = f.page_lue();
-                    accessibilite::maj(hwnd, &f.app, &noms, lue.as_ref());
+                    accessibilite::maj(hwnd, &f.app, &noms, lue.as_ref(), f.geo_accessible(hwnd));
                     let (l, h) = taille_client(hwnd);
                     let dpi = f.dpi;
                     let titres = f.titres();
@@ -1901,6 +1949,9 @@ pub(crate) extern "system" fn procedure(hwnd: HWND, msg: u32, wparam: WPARAM, lp
             WM_DESTROY => {
                 // Le contrôle WebView2 se ferme avec la fenêtre vivante, pas au destructeur du fil (après la boucle de messages)
                 crate::webvue::fermer(hwnd);
+                crate::hote_apercu::fermer();
+                // UI Automation lâche les fournisseurs de cette fenêtre : plus d'appel vers un état détruit
+                accessibilite::deconnecter(hwnd);
                 let _ = RevokeDragDrop(hwnd);
                 // L'abonnement au dossier Téléchargements est coupé avec la fenêtre : le fil s'arrête dès qu'il le voit (une lecture en
                 // cours peut finir, son résultat est jeté par la génération)

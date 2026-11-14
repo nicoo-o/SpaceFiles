@@ -940,3 +940,13 @@ fn destination_longue_le_bilan_donne_un_chemin_qui_existe() {
         None => panic!("I1 : le chemin long de la copie doit être retrouvé (sinon pas de Ctrl+Z)"),
     }
 }
+
+#[test]
+fn un_lecteur_retire_ou_endormi_se_reprend_comme_un_reseau_coupe() {
+    use windows::core::HRESULT;
+    let hr = |code: u32| HRESULT(0x8007_0000u32.wrapping_add(code) as i32);
+    // 21 lecteur non prêt, 55 ressource disparue, 1117 erreur d'E/S, 1167 périphérique non connecté, 64 réseau
+    assert!([21, 55, 1117, 1167, 64].iter().all(|&c| super::reseau(hr(c))));
+    // Accès refusé (5) ou fichier introuvable (2) : une vraie erreur, pas une attente
+    assert!(![5, 2, 32].iter().any(|&c| super::reseau(hr(c))));
+}

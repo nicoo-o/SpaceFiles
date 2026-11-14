@@ -105,6 +105,12 @@ pub(crate) unsafe fn touche_page(hwnd: HWND, f: &mut Fenetre, vk: VIRTUAL_KEY, c
                     activer_reglage(hwnd, f, f.page.focus, 0);
                     true
                 }
+                // Suppr sur une touche modifiée : celle d'origine revient, sans passer par la capture
+                Some(Element::Raccourci(i)) => {
+                    reglages::modifier(|r| r.raccourcis = palette::raccourcis_avec(&r.raccourcis, i, None));
+                    f.app.annoncer("TOUCHE D'ORIGINE RETABLIE", false);
+                    false
+                }
                 _ => false,
             };
             if retire {
@@ -345,6 +351,8 @@ pub(crate) unsafe fn touche_galerie(hwnd: HWND, f: &mut Fenetre, vk: VIRTUAL_KEY
     let maj = GetKeyState(VK_SHIFT.0 as i32) < 0;
     match vk {
         VK_ESCAPE | VK_SPACE => f.galerie = None,
+        // Aperçu d'un gestionnaire Windows : Tab lui donne le clavier (il le rend par Tab ou Échap)
+        VK_TAB if f.galerie.as_ref().is_some_and(|g| g.systeme) => crate::hote_apercu::prendre_le_focus(),
         // Zoom au clavier : + / − (rangée du haut ou pavé numérique), 0 revient à l'ajustement
         VK_OEM_PLUS | VK_ADD => zoomer_galerie(hwnd, f, 1.25, None),
         VK_OEM_MINUS | VK_SUBTRACT => zoomer_galerie(hwnd, f, 0.8, None),

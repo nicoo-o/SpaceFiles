@@ -11,13 +11,66 @@
 </p>
 
 <p align="center">
-  <code>3.81 MB exe</code> · <code>16 MB resident</code> · <code>640 tests</code> · <code>1 optional web view</code>
+  <a href="https://github.com/nicoo-o/SpaceFiles/releases/latest"><b>▶ DOWNLOAD v0.1.0 (pre-release) · portable zip · Windows 11</b></a><br>
+  <sub>Unsigned executable: Windows will warn you. <a href="#trust-">Read why, and how to check the file ▸</a></sub>
+</p>
+
+<p align="center">
+  <img src="docs/readme/vitrine-sombre-palette.png" alt="SpaceFiles command palette, dark theme" width="860">
+</p>
+
+<p align="center">
+  <code>4.43 MB exe</code> · <code>16 MB resident</code> · <code>692 tests</code> · <code>1 optional web view</code>
 </p>
 
 ---
 
-> **STATE ▸ IN DEVELOPMENT.** There is no release yet and no binary to download. Everything below exists in `main`
-> today; what is missing is listed under [KNOWN LIMITS ▸](#known-limits-). If a number is on this page, it was measured.
+> **STATE ▸ FIRST PRE-RELEASE (v0.1.0).** A portable zip is published; it is not signed and not updated
+> automatically. What is missing is listed under [KNOWN LIMITS ▸](#known-limits-). If a number is on this page, it was measured.
+
+## TRUST ▸
+
+You are asked to run an unsigned program from a stranger. Here is what is true, and how to check it yourself.
+
+- **Windows will warn you.** The exe has no code-signing certificate (it costs money; see
+  [`docs/release/signature-et-mises-a-jour.md`](docs/release/signature-et-mises-a-jour.md)). SmartScreen shows
+  "Windows protected your PC": click **More info**, then **Run anyway**. Smart App Control, if enabled, may refuse
+  the file outright; that is Windows' rule, not something to bypass here.
+- **Check the file.** The release carries `SHA256SUMS.txt`. In PowerShell:
+  `Get-FileHash .\SpaceFiles-v0.1.0-portable.zip -Algorithm SHA256` must print the same hash.
+- **No telemetry, no account, no update check.** The only outgoing connection in the code is a port-445
+  reachability test toward a network storage you configured yourself.
+- **What it writes.** Its settings and caches go to `%APPDATA%\SpaceFiles` and `%LOCALAPPDATA%\SpaceFiles`. In the
+  source, the only code that writes to the registry is the optional "default explorer" setting (<kbd>Win</kbd>+<kbd>E</kbd>);
+  the zip has no installer.
+- **Read the code.** It is all here, under the MIT licence. Windows 10 has not been tested.
+
+## SEE ▸
+
+<p align="center">
+  <img src="docs/readme/vitrine-sombre-liste.png" alt="List view, dark" width="430">
+  <img src="docs/readme/vitrine-clair-liste.png" alt="List view, light" width="430">
+  <img src="docs/readme/vitrine-sombre-grille.png" alt="Grid view, dark" width="430">
+  <img src="docs/readme/vitrine-sombre-double.png" alt="Dual pane, dark" width="430">
+  <img src="docs/readme/vitrine-sombre-apercu.png" alt="Quick look on an image, dark" width="430">
+  <img src="docs/readme/vitrine-clair-double.png" alt="Dual pane, light" width="430">
+</p>
+<p align="center"><sub>A demo folder with made-up files; the interface is in French (see the known limits).</sub></p>
+
+## VERSUS FILE EXPLORER ▸
+
+Not a verdict: a list of what differs. Windows' own File Explorer is better integrated with the shell, the cloud
+and every other program; SpaceFiles does not try to replace that.
+
+| | File Explorer (Windows 11) | SpaceFiles |
+|---|---|---|
+| Dual pane | no | yes (<kbd>F6</kbd>), with folder comparison |
+| Miller columns | no | yes |
+| Command palette | no | yes (<kbd>Ctrl</kbd>+<kbd>K</kbd>) |
+| Search | Windows Search index | home-made index, with filters |
+| Language | your system language | French only |
+| Signed by Microsoft | yes | no |
+| Interface | system | dot-matrix, one font, dark and light |
 
 ## OPEN ▸
 
@@ -62,11 +115,11 @@ No adjectives. Numbers, with their limits.
 
 | What | Measured | Note |
 |---|---|---|
-| Executable | 3.81 MB (3,810,304 bytes) | release build, LTO, `panic = abort`, 14 November 2026 |
+| Executable | 4.43 MB (4,433,920 bytes) | release build, LTO, `panic = abort`, Doto font embedded (+0.46 MB), 14 November 2026 |
 | Resident process | 16 MB working set | the part that stays in memory for <kbd>Win</kbd>+<kbd>E</kbd> |
 | Folder of 200,000 entries | listed in 0.9 s, 195 MB | one single measurement, not an average |
 | Index of 2.5 million items | ~4 min 30 s, 110 MB | low-priority crawl |
-| Tests | 640 passed, 0 failed, 7 ignored | `cargo test`, 14 November 2026 |
+| Tests | 692 passed, 0 failed, 8 ignored | `cargo test`, 14 November 2026 |
 | Direct dependencies | 4 crates (30 in total) | `windows`, `windows-core`, `regex`, `webview2-com` |
 
 ## PLUG ▸
@@ -97,10 +150,11 @@ and how `desinstaller.ps1` removes it (your data is kept unless you ask otherwis
 
 ## KNOWN LIMITS ▸
 
-- **No release, no signed binary, no auto-update.** Build it yourself or wait. A downloaded exe will trigger
-  SmartScreen; compare its SHA-256 (`tools/install/empreinte.ps1`). WebView2 is optional (HTML preview only).
+- **Pre-release, no signed binary, no auto-update.** The exe triggers SmartScreen (see [TRUST ▸](#trust-)).
+  Or build it yourself. WebView2 is optional (HTML preview only).
+- **The zip is portable: no installer.** `installer.ps1` only works from a source checkout (shortcut, resident
+  process, <kbd>Win</kbd>+<kbd>E</kbd>).
 - **French only.** Interface, comments and documentation are in French. The filters above are not a typo.
-- **No screenshots on this page yet.** The real ones show the author's folders; clean ones are on the list.
 - SFTP, WebDAV, NAS backup and MTP are frozen behind an `experimental` setting, off for a new profile.
 - Not covered by automated checks: anything that needs a real mouse (hover, right-click menu, lasso), a second
   screen with another DPI, full screen.
@@ -111,7 +165,7 @@ and how `desinstaller.ps1` removes it (your data is kept unless you ask otherwis
 - **No account, no remote service**: no Drive, Dropbox or iCloud, and no file sent to a model. The network stays
   closed.
 - **No telemetry, no personalised recommendations**: the "recommended" pane of File Explorer is not a goal.
-- **No background auto-update**: the binary is replaced by hand, the day a release exists.
+- **No background auto-update**: the binary is replaced by hand.
 - **No home-grown archive engine**: `tar.exe` covers zip, tar and 7z both ways; compression is not reimplemented.
 - **No extension marketplace, no mobile companion**: one author, one binary.
 

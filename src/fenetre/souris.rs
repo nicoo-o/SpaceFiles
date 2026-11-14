@@ -4,7 +4,7 @@ use crate::*;
 /// Le point (DIP, coordonnées du panneau de largeur `l`) est dans la zone des fichiers : sous l'en-tête, au-dessus de la barre
 /// d'état, de la fin du volet au bord droit du panneau. Les marges gauche et droite en font partie.
 pub(crate) fn zone_fichiers(l: f32, h: f32, x: f32, y: f32) -> bool {
-    x > largeur_volet() && x < l && y >= LISTE_Y && y < h - STATUT_H
+    x > largeur_volet() && x < l && y >= liste_y() && y < h - statut_h()
 }
 
 /// Abscisse (DIP) où s'arrête une ligne de la vue liste : sa hauteur de fond va jusqu'ici, au-delà c'est la marge droite vide
@@ -195,11 +195,11 @@ pub(crate) unsafe fn cible_sous(hwnd: HWND, f: &Fenetre, px: i32, py: i32) -> Ci
     if let Some(z) = app.zones.jours.iter().find(|z| dedans(&z.0, x, y)) {
         return Cible::Jour(z.1);
     }
-    if y >= h - STATUT_H && x > largeur_volet() && x < lt && app.emplacement != Emplacement::Reglages {
+    if y >= h - statut_h() && x > largeur_volet() && x < lt && app.emplacement != Emplacement::Reglages {
         return Cible::Statut;
     }
     // Vide de la barre du chemin (après les segments)
-    if (NAV_Y..NAV_Y + NAV_H).contains(&y) && x >= chemin_x() - 10.0 && x < l - MARGE_LISTE && app.emplacement != Emplacement::Reglages {
+    if (nav_y()..nav_y() + nav_h()).contains(&y) && x >= chemin_x() - 10.0 && x < l - MARGE_LISTE && app.emplacement != Emplacement::Reglages {
         return Cible::Chemin;
     }
     // Toute la zone des fichiers répond, marge droite comprise : c'est le vide où l'on clique pour le menu du fond, le lasso, le dépôt
@@ -208,13 +208,13 @@ pub(crate) unsafe fn cible_sous(hwnd: HWND, f: &Fenetre, px: i32, py: i32) -> Ci
         Affichage::Grille if dans_liste => return case_grille(app, x, y).map_or(Cible::FondListe, Cible::Ligne),
         Affichage::Colonnes if dans_liste => {
             let (cx, cw) = colonnes_miller(l)[1];
-            let i = ((y - LISTE_Y + app.defilement) / hauteur_ligne()) as usize;
+            let i = ((y - liste_y() + app.defilement) / hauteur_ligne()) as usize;
             return if x >= cx && x < cx + cw && i < app.entrees.len() { Cible::Ligne(i) } else { Cible::FondListe };
         }
         Affichage::Grille | Affichage::Colonnes => return Cible::Rien,
         Affichage::Liste => {}
     }
-    if x > largeur_volet() && x < l && (ENTETE_Y..ENTETE_Y + ENTETE_H).contains(&y) {
+    if x > largeur_volet() && x < l && (entete_y()..entete_y() + entete_h()).contains(&y) {
         for (col, cx, w) in colonnes(l) {
             if x >= cx && x < cx + w {
                 return Cible::Entete(col);
@@ -223,7 +223,7 @@ pub(crate) unsafe fn cible_sous(hwnd: HWND, f: &Fenetre, px: i32, py: i32) -> Ci
     }
     if dans_liste {
         // Les lignes s'arrêtent avant la marge droite ; le reste (marges gauche et droite, dessous la dernière ligne) est le fond
-        let r = ((y - LISTE_Y + app.defilement) / hauteur_ligne()) as usize;
+        let r = ((y - liste_y() + app.defilement) / hauteur_ligne()) as usize;
         if dans_ligne(l, x) && r < app.nb_rangs() {
             return match app.rang(r) {
                 app::Rang::Section(s) => Cible::Section(s),
@@ -276,7 +276,7 @@ pub(crate) fn cible_page(f: &Fenetre, l: f32, h: f32, x: f32, y: f32) -> Cible {
     if let Some((k, _)) = page::zones_nav().into_iter().find(|(_, r)| dedans(r, x, y)) {
         return Cible::ReglagesNav(k);
     }
-    if x <= page::gauche() - 6.0 || x >= page::droite(l) + 6.0 || y < page::PAGE_Y || y >= h - STATUT_H {
+    if x <= page::gauche() - 6.0 || x >= page::droite(l) + 6.0 || y < page::PAGE_Y || y >= h - statut_h() {
         return Cible::Rien;
     }
     let lignes = f.lignes();
@@ -301,7 +301,7 @@ pub(crate) fn segment_vise(f: &Fenetre, l: f32, k: usize, x: f32, y: f32) -> Opt
 /// Hauteur visible de la page des réglages (DIP)
 pub(crate) unsafe fn hauteur_page(hwnd: HWND, f: &Fenetre) -> f32 {
     let (_, hp) = taille_client(hwnd);
-    (f.dip(hp as i32) - STATUT_H - page::PAGE_Y).max(0.0)
+    (f.dip(hp as i32) - statut_h() - page::PAGE_Y).max(0.0)
 }
 
 /// Zone visée par un glisser-déposer au point client (px)
@@ -439,13 +439,13 @@ mod tests {
     fn zone_fichiers_exclut_le_volet_l_en_tete_et_la_barre_d_etat_mais_pas_le_haut_de_la_liste() {
         let (l, h) = (1000.0f32, 700.0f32);
         let v = largeur_volet();
-        // Bords exacts : x strictement entre le volet et `l`, y de LISTE_Y inclus à la barre d'état exclue
-        assert!(!zone_fichiers(l, h, v, LISTE_Y + 10.0));
-        assert!(zone_fichiers(l, h, v + 0.5, LISTE_Y));
-        assert!(!zone_fichiers(l, h, l, LISTE_Y + 10.0));
-        assert!(zone_fichiers(l, h, l - 0.5, h - STATUT_H - 0.5));
-        assert!(!zone_fichiers(l, h, 500.0, LISTE_Y - 0.5));
-        assert!(!zone_fichiers(l, h, 500.0, h - STATUT_H));
+        // Bords exacts : x strictement entre le volet et `l`, y de liste_y() inclus à la barre d'état exclue
+        assert!(!zone_fichiers(l, h, v, liste_y() + 10.0));
+        assert!(zone_fichiers(l, h, v + 0.5, liste_y()));
+        assert!(!zone_fichiers(l, h, l, liste_y() + 10.0));
+        assert!(zone_fichiers(l, h, l - 0.5, h - statut_h() - 0.5));
+        assert!(!zone_fichiers(l, h, 500.0, liste_y() - 0.5));
+        assert!(!zone_fichiers(l, h, 500.0, h - statut_h()));
     }
 
     #[test]

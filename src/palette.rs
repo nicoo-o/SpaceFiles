@@ -21,6 +21,11 @@ pub enum Commande {
     CheminUnix,
     CopierChemin,
     Sha256,
+    QuiUtilise,
+    Aide,
+    ChercherReglage,
+    Journal,
+    Operations,
     Debloquer,
     ImageJpg,
     ImagePng,
@@ -99,6 +104,8 @@ pub enum Commande {
     ArracherOnglet,
     RattacherFenetre,
     ComparerTextes,
+    ExporterEcarts,
+    ExporterEcartsCsv,
     AjouterPlateau,
     VoirPlateau,
     ModeCapture,
@@ -122,6 +129,12 @@ pub enum Commande {
     ViderCorbeille,
     PoidsSonore,
     PartageProche,
+    /// Touche secondaire de la palette (Ctrl+Maj+P) : sa propre ligne pour pouvoir la changer à part
+    PaletteSecondaire,
+    SaisirChemin,
+    SaisirCheminSecondaire,
+    /// Passer d'un panneau à l'autre (Tab en double panneau)
+    BasculerPanneau,
 }
 
 /// Fonction expérimentale (gelée par le réglage `experimental`) qu'une commande utilise : la sauvegarde vers un NAS
@@ -146,9 +159,47 @@ pub fn commande_nommee(nom: &str) -> Option<Commande> {
     COMMANDES.iter().map(|c| c.0).find(|c| format!("{c:?}").eq_ignore_ascii_case(nom))
 }
 
-/// Touches qui ouvrent et ferment la palette (écrites comme `fenetre::combinaison`). Alt+Espace n'en fait pas partie : il appartient
-/// au lanceur de SpaceNotch (décision D-01 du 01/11) et le retirer d'ici était voulu.
-pub const TOUCHES_PALETTE: [&str; 2] = ["CTRL+K", "CTRL+MAJ+P"];
+/// Touches qui ne viennent pas de la table des commandes mais que l'application tient déjà : on ne peut pas les donner à
+/// une commande (la page Raccourcis les refuse). Win+E est une clé de Windows (defaut.rs), Alt+Espace est à SpaceNotch ;
+/// Ctrl+L, Alt+D, Ctrl+K, Ctrl+Maj+P et Tab sont des commandes de la table depuis le 14/11 (donc modifiables).
+pub const TOUCHES_FIXES: [(&str, &str); 2] = [("WIN+E", "OUVRIR SPACEFILES"), ("ALT+ESPACE", "LANCEUR DE SPACENOTCH")];
+
+/// Une commande de la table a-t-elle une touche à elle ? (les gestes à la souris et les commandes sans touche : non)
+pub fn a_une_touche(i: usize) -> bool {
+    COMMANDES.get(i).is_some_and(|c| !c.2.is_empty() && !c.2.starts_with("CLIC"))
+}
+
+/// Touche réellement en vigueur pour la commande `i` : celle choisie dans `raccourcis` (« TOUCHE=Commande »), sinon celle de la table
+pub fn touche_effective(i: usize, raccourcis: &[String]) -> String {
+    let Some(c) = COMMANDES.get(i) else { return String::new() };
+    let nom = format!("{:?}", c.0);
+    raccourcis
+        .iter()
+        .filter_map(|x| x.split_once('='))
+        .find(|(_, n)| n.trim().eq_ignore_ascii_case(&nom))
+        .map_or_else(|| c.2.to_string(), |(t, _)| t.trim().to_uppercase())
+}
+
+/// Qui tient déjà `combo` ? Le libellé de l'autre commande (ou de la touche fixe), sans compter la commande `i` elle-même.
+/// Une touche que sa commande a quittée est libre. `None` : on peut la donner.
+pub fn occupant(combo: &str, i: usize, raccourcis: &[String]) -> Option<&'static str> {
+    if let Some((_, quoi)) = TOUCHES_FIXES.iter().find(|(t, _)| *t == combo) {
+        return Some(quoi);
+    }
+    (0..COMMANDES.len()).filter(|&j| j != i && a_une_touche(j)).find(|&j| touche_effective(j, raccourcis) == combo).map(|j| COMMANDES[j].1)
+}
+
+/// La liste `raccourcis` des réglages une fois la commande `i` liée à `combo` (`None` : la touche d'origine est rétablie).
+/// Une touche identique à celle de la table n'est pas enregistrée : le fichier ne garde que ce qui change.
+pub fn raccourcis_avec(raccourcis: &[String], i: usize, combo: Option<&str>) -> Vec<String> {
+    let Some(c) = COMMANDES.get(i) else { return raccourcis.to_vec() };
+    let nom = format!("{:?}", c.0);
+    let mut v: Vec<String> = raccourcis.iter().filter(|x| x.split_once('=').is_none_or(|(_, n)| !n.trim().eq_ignore_ascii_case(&nom))).cloned().collect();
+    if let Some(t) = combo.filter(|t| *t != c.2) {
+        v.push(format!("{t}={nom}"));
+    }
+    v
+}
 
 pub const COMMANDES: &[(Commande, &str, &str, &str)] = &[
     (Commande::Ouvrir, "OUVRIR", "ENTREE", "open lancer"),
@@ -197,6 +248,8 @@ pub const COMMANDES: &[(Commande, &str, &str, &str)] = &[
     (Commande::DeplacerPlateau, "DEPLACER LE PLATEAU ICI", "", "plateau deposer deplacer tampon panier"),
     (Commande::ViderPlateau, "VIDER LE PLATEAU", "", "plateau effacer retirer tampon panier"),
     (Commande::ComparerTextes, "COMPARER LES DEUX FICHIERS TEXTE CHOISIS", "", "comparer diff differences texte fichiers lignes"),
+    (Commande::ExporterEcarts, "COPIER LES ECARTS DES DEUX PANNEAUX (MARKDOWN)", "", "exporter ecarts differences double panneau comparer markdown presse-papiers synchronisation trace"),
+    (Commande::ExporterEcartsCsv, "COPIER LES ECARTS DES DEUX PANNEAUX (CSV)", "", "exporter ecarts differences double panneau comparer csv tableur excel presse-papiers synchronisation"),
     (Commande::ArracherOnglet, "ARRACHER L'ONGLET DANS UNE NOUVELLE FENETRE", "", "onglet detacher fenetre separer arracher"),
     (Commande::RattacherFenetre, "RATTACHER CETTE FENETRE A UNE AUTRE", "", "onglets fusionner rattacher fenetre regrouper"),
     (Commande::VoirPanneau, "VOIR LE PANNEAU DE CONFIGURATION ICI", "", "panneau configuration controlpanel parametres reglages windows"),
@@ -211,6 +264,11 @@ pub const COMMANDES: &[(Commande, &str, &str, &str)] = &[
     (Commande::ViderCorbeille, "VIDER LA CORBEILLE", "", "corbeille vider poubelle nettoyer"),
     (Commande::PoidsSonore, "POIDS SONORE", "", "son tic survol taille dossier poids"),
     (Commande::PartageProche, "PARTAGE A PROXIMITE", "", "telephone android nothing phone link partager envoyer proche"),
+    (Commande::Palette, "PALETTE DE COMMANDES", "CTRL+K", "palette commandes chercher lancer"),
+    (Commande::PaletteSecondaire, "PALETTE DE COMMANDES (SECONDE TOUCHE)", "CTRL+MAJ+P", "palette commandes seconde touche variante"),
+    (Commande::SaisirChemin, "SAISIR UN CHEMIN", "CTRL+L", "chemin adresse taper saisir"),
+    (Commande::SaisirCheminSecondaire, "SAISIR UN CHEMIN (SECONDE TOUCHE)", "ALT+D", "chemin adresse taper saisir seconde touche variante"),
+    (Commande::BasculerPanneau, "PASSER A L'AUTRE PANNEAU (DOUBLE PANNEAU)", "TAB", "panneau double autre basculer tab"),
     (Commande::Historique, "HISTORIQUE DES OPERATIONS", "CTRL+MAJ+H", "annuler defaire refaire journal copies suppressions"),
     (Commande::Regrouper(1), "REGROUPER PAR DATE", "", "sections aujourd'hui hier semaine mois grouper"),
     (Commande::Regrouper(2), "REGROUPER PAR TYPE", "", "sections extension grouper"),
@@ -233,6 +291,11 @@ pub const COMMANDES: &[(Commande, &str, &str, &str)] = &[
     (Commande::ImageSansMeta, "RETIRER LES METADONNEES", "", "image photo exif gps lieu vie privee nettoyer"),
     (Commande::Sha256, "EMPREINTE SHA-256 (COPIEE)", "CTRL+ALT+H", "hash somme controle checksum"),
     (Commande::Debloquer, "DEBLOQUER (RETIRER L'ORIGINE INTERNET)", "", "debloquer unblock zone identifier internet telecharge securite"),
+    (Commande::QuiUtilise, "QUI UTILISE CE FICHIER ?", "", "qui utilise fichier verrouille ouvert bloque programme occupe lock"),
+    (Commande::Aide, "AIDE : TOUCHES ET RACCOURCIS", "F1", "aide touches raccourcis clavier espace palette ctrl k comment"),
+    (Commande::ChercherReglage, "CHERCHER UN RÉGLAGE", "", "reglage reglages option parametre chercher trouver ou se trouve"),
+    (Commande::Journal, "JOURNAL : DERNIÈRES ERREURS", "", "journal erreurs erreur plantage probleme pourquoi echec log"),
+    (Commande::Operations, "OPÉRATIONS : EN COURS, PAUSE, ÉCHECS", "", "operations copie deplacement transfert pause annuler arreter echec cause progression file attente"),
     (Commande::Zip, "COMPRESSER EN ZIP", "CTRL+ALT+Z", "archive zipper"),
     (Commande::SeptZip, "COMPRESSER EN 7Z", "", "archive 7zip"),
     (Commande::Extraire, "EXTRAIRE ICI", "CTRL+ALT+X", "decompresser dezipper archive unzip"),
@@ -308,7 +371,7 @@ fn icone_commande(c: Commande) -> Icone {
         Commande::Terminal | Commande::VsCode => Icone::Code,
         Commande::RechercheGlobale | Commande::ReconstruireIndex => Icone::Disque,
         Commande::TrierNom | Commande::TrierDate | Commande::TrierType | Commande::TrierTaille | Commande::TrierCroissant | Commande::TrierDecroissant => Icone::Bureau,
-        Commande::Reglages | Commande::Sons | Commande::PoidsSonore | Commande::Palette | Commande::Administrateur | Commande::ModeCapture => Icone::Reglages,
+        Commande::Reglages | Commande::Sons | Commande::PoidsSonore | Commande::Palette | Commande::PaletteSecondaire | Commande::Administrateur | Commande::ModeCapture => Icone::Reglages,
         _ => Icone::Fichier,
     }
 }
@@ -354,6 +417,12 @@ pub enum Action {
     AutreAction,
     /// Ligne d'information : Entrée ne fait rien
     Rien,
+    /// Recherche d'un réglage : ouvrir la page (catégorie) et choisir sa ligne
+    AllerReglage(usize, usize),
+    /// Centre d'opérations : pause ou reprise de l'opération de cet onglet
+    PauseOperation(usize),
+    /// Centre d'opérations : arrêt de l'opération de cet onglet (et de sa file)
+    AnnulerOperation(usize),
 }
 
 /// Ce que la palette demande
@@ -373,6 +442,49 @@ pub enum Mode {
     Glyphe(Vec<String>),
     /// Règle de rangement : « types > dossier »
     Regle,
+    /// Recherche d'un réglage : (catégorie, rang de la ligne, titre, détail) de chaque réglage de la page
+    Reglage(Vec<(usize, usize, String, String)>),
+    /// Dernières traces graves du journal : (date et origine, message), chemins retirés
+    Journal(Vec<(String, String)>),
+    /// Centre d'opérations (N-01) : ce qui tourne, ce qui attend, ce qui vient de finir, tous onglets confondus
+    Operations(Vec<LigneOp>),
+}
+
+/// Une ligne du centre d'opérations
+#[derive(Clone, Debug, PartialEq)]
+pub struct LigneOp {
+    pub genre: GenreLigneOp,
+    pub titre: String,
+    pub detail: String,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum GenreLigneOp {
+    /// Opération qui tourne dans cet onglet (rang dans `tous()`) : pause et annulation possibles
+    EnCours(usize),
+    /// Derrière celle qui tourne
+    EnFile,
+    /// Finie : réussie, annulée ou en échec (le détail porte la cause)
+    Finie { echec: bool },
+}
+
+/// Lignes du centre d'opérations pour la requête `q` (déjà en minuscules). Une opération qui tourne donne deux lignes : la
+/// pause (ou la reprise) et l'arrêt, chacune lançable à Entrée ; le reste est informatif (un échec garde sa cause en détail).
+fn items_operations(lignes: &[LigneOp], q: &str) -> Vec<Item> {
+    let garde = |l: &LigneOp| q.is_empty() || score(&l.titre, q).is_some() || score(&l.detail, q).is_some();
+    let mut v = Vec::new();
+    for l in lignes.iter().filter(|l| garde(l)) {
+        match l.genre {
+            GenreLigneOp::EnCours(k) => {
+                let en_pause = l.detail.contains("EN PAUSE");
+                v.push(Item::nouveau(format!("{} · {}", if en_pause { "REPRENDRE" } else { "PAUSE" }, l.titre), l.detail.clone(), Icone::Horloge, Action::PauseOperation(k), "OPÉRATIONS"));
+                v.push(Item::nouveau(format!("ARRÊTER · {}", l.titre), "ANNULE AUSSI LA FILE DE CET ONGLET".to_string(), Icone::Horloge, Action::AnnulerOperation(k), "OPÉRATIONS"));
+            }
+            GenreLigneOp::EnFile => v.push(Item::nouveau(l.titre.clone(), l.detail.clone(), Icone::Horloge, Action::Rien, "EN FILE")),
+            GenreLigneOp::Finie { echec } => v.push(Item::nouveau(l.titre.clone(), l.detail.clone(), Icone::Horloge, Action::Rien, if echec { "ÉCHEC" } else { "TERMINÉES" })),
+        }
+    }
+    v
 }
 
 #[derive(Clone)]
@@ -513,8 +625,9 @@ pub fn defilement_visible(actuel: f32, haut: f32, hauteur: f32, visible: f32, to
     let mut d = actuel;
     if haut < d {
         d = haut;
-    } else if haut + hauteur > d + visible {
-        d = haut + hauteur - visible;
+    } else if haut + hauteur + LISTE_BAS > d + visible {
+        // Garde la marge du bas (`LISTE_BAS`) : sans elle la ligne choisie touchait le pied et paraissait coupée (A-09)
+        d = haut + hauteur + LISTE_BAS - visible;
     }
     d.clamp(0.0, (total - visible).max(0.0))
 }
@@ -782,6 +895,19 @@ impl Palette {
         Self { mode: Mode::Regle, ..Self::nouvelle() }
     }
 
+    /// Palette qui cherche parmi ces réglages (catégorie, rang de la ligne, titre, détail)
+    pub fn reglage(liste: Vec<(usize, usize, String, String)>) -> Self {
+        Self { mode: Mode::Reglage(liste), ..Self::nouvelle() }
+    }
+
+    pub fn journal(traces: Vec<(String, String)>) -> Self {
+        Self { mode: Mode::Journal(traces), ..Self::nouvelle() }
+    }
+
+    pub fn operations(lignes: Vec<LigneOp>) -> Self {
+        Self { mode: Mode::Operations(lignes), ..Self::nouvelle() }
+    }
+
     pub fn note(dossier: &str, texte: &str) -> Self {
         Self { mode: Mode::Note(dossier.to_string()), saisie: Edition::champ(texte), ..Self::nouvelle() }
     }
@@ -849,6 +975,9 @@ impl Palette {
             Mode::Renommer(n) => format!("NOUVEAU NOM POUR {n}"),
             Mode::Note(_) => "NOTE DU DOSSIER (VIDE : SUPPRIMER)".into(),
             Mode::Regle => "TYPES > DOSSIER COMPLET · EX : PDF DOCX > D:\\DOCUMENTS\\FACTURES".into(),
+            Mode::Reglage(l) => format!("CHERCHER UN RÉGLAGE ({} AU TOTAL)", l.len()),
+            Mode::Journal(t) => format!("JOURNAL · {} TRACE(S) GRAVE(S) · CHEMINS MASQUÉS", t.len()),
+            Mode::Operations(l) => format!("OPÉRATIONS · {} EN COURS OU EN FILE · ENTRÉE : PAUSE OU ARRÊT", l.iter().filter(|x| !matches!(x.genre, GenreLigneOp::Finie { .. })).count()),
             Mode::Glyphe(d) => format!("GLYPH POUR {} DOSSIER{}", d.len(), if d.len() > 1 { "S" } else { "" }),
             Mode::Session(n) => format!("NOM DE LA SESSION ({n} ONGLET{}) · NOUVELLE OU A REMPLACER", if *n > 1 { "S" } else { "" }),
         }
@@ -894,7 +1023,7 @@ impl Palette {
                 for x in s.sessions {
                     let nom = x.split('|').next().unwrap_or("");
                     if score(nom, &q).is_some() {
-                        v.push(item(format!("REMPLACER « {nom} »"), format!("SESSION · {} ONGLET{}", x.split('|').count() - 1, if x.split('|').count() > 2 { "S" } else { "" }), Action::EnregistrerSession(nom.to_string())));
+                        v.push(item(format!("REMPLACER « {nom} »"), format!("SESSION · {} ONGLET{}", crate::reglages::onglets_de_session(x).len(), if crate::reglages::onglets_de_session(x).len() > 1 { "S" } else { "" }), Action::EnregistrerSession(nom.to_string())));
                     }
                 }
             }
@@ -915,6 +1044,40 @@ impl Palette {
                 if let Some(r) = crate::rangement::Regle::analyser(&self.requete()) {
                     v.push(item(format!("AJOUTER : {}", r.libelle()), "RÈGLE DE RANGEMENT".into(), Action::AjouterRegle(r.ecrire())));
                 }
+            }
+            Mode::Reglage(liste) => {
+                let mut trouves: Vec<(i32, &(usize, usize, String, String))> = liste
+                    .iter()
+                    .filter_map(|r| {
+                        if q.is_empty() {
+                            return Some((0, r));
+                        }
+                        // Le titre prime sur le détail
+                        score(&r.2, &q).map(|s| (s + 1000, r)).or_else(|| score(&r.3, &q).map(|s| (s, r)))
+                    })
+                    .collect();
+                trouves.sort_by_key(|t| std::cmp::Reverse(t.0));
+                for (_, (cat, rang, titre, detail)) in trouves {
+                    let page = crate::page::CATEGORIES.get(*cat).map_or(String::new(), |c| c.to_uppercase());
+                    let sous = if detail.is_empty() { page } else { format!("{page} · {}", detail.to_uppercase()) };
+                    v.push(Item::nouveau(titre.to_uppercase(), sous, Icone::Reglages, Action::AllerReglage(*cat, *rang), "RÉGLAGES"));
+                }
+            }
+            Mode::Journal(traces) => {
+                if traces.is_empty() {
+                    v.push(Item::nouveau("AUCUNE ERREUR DANS LE JOURNAL", "TOUT VA BIEN", Icone::Reglages, Action::Rien, "JOURNAL"));
+                }
+                for (origine, message) in traces {
+                    if q.is_empty() || score(message, &q).is_some() || score(origine, &q).is_some() {
+                        v.push(Item::nouveau(message.to_uppercase(), origine.to_uppercase(), Icone::Reglages, Action::Rien, "JOURNAL"));
+                    }
+                }
+            }
+            Mode::Operations(lignes) => {
+                if lignes.is_empty() {
+                    v.push(Item::nouveau("AUCUNE OPÉRATION", "RIEN EN COURS, RIEN FINI DEPUIS L'OUVERTURE", Icone::Horloge, Action::Rien, "OPÉRATIONS"));
+                }
+                v.extend(items_operations(lignes, &q));
             }
             Mode::Renommer(ancien) => {
                 if !q.is_empty() && &q != ancien {
@@ -1082,7 +1245,7 @@ impl Palette {
         for x in s.sessions {
             let nom = x.split('|').next().unwrap_or("");
             if let Some(sc) = score(nom, q).or_else(|| score("session", q).map(|x| x - 100)) {
-                let n = x.split('|').count() - 1;
+                let n = crate::reglages::onglets_de_session(x).len();
                 v.push((sc + 30, Item::nouveau(nom.to_string(), format!("SESSION · {n} ONGLET{}", pluriel_s(n)), Icone::Dossier, Action::OuvrirSession(nom.to_string()), "PARTOUT")));
             }
         }
@@ -1704,6 +1867,53 @@ impl Palette {
 mod tests {
     use super::*;
     use std::collections::HashSet;
+
+    /// Rang d'une commande dans la table, par son nom de variante
+    fn rang(nom: &str) -> usize {
+        COMMANDES.iter().position(|c| format!("{:?}", c.0) == nom).unwrap_or_else(|| panic!("commande {nom} absente"))
+    }
+
+    /// Page Raccourcis éditable : une touche prise par une autre commande ou par une touche fixe est refusée, une touche
+    /// quittée est libre, et le fichier ne garde que ce qui change
+    #[test]
+    fn raccourcis_conflits_et_liste() {
+        let (renommer, copier) = (rang("Renommer"), rang("Copier"));
+        assert_eq!(touche_effective(renommer, &[]), "F2");
+        // Touche d'une autre commande, touche fixe, et touche libre
+        assert_eq!(occupant("CTRL+C", renommer, &[]), Some("COPIER"));
+        assert_eq!(occupant("CTRL+K", renommer, &[]), Some("PALETTE DE COMMANDES"));
+        assert_eq!(occupant("ALT+ESPACE", renommer, &[]), Some("LANCEUR DE SPACENOTCH"));
+        assert_eq!(occupant("CTRL+MAJ+Y", renommer, &[]), None);
+        // Sa propre touche n'est pas un conflit
+        assert_eq!(occupant("F2", renommer, &[]), None);
+        // Renommer passe sur Ctrl+Maj+Y : F2 est libre, Ctrl+Maj+Y est pris
+        let l = raccourcis_avec(&[], renommer, Some("CTRL+MAJ+Y"));
+        assert_eq!(l, vec!["CTRL+MAJ+Y=Renommer".to_string()]);
+        assert_eq!(touche_effective(renommer, &l), "CTRL+MAJ+Y");
+        assert_eq!(occupant("F2", copier, &l), None);
+        assert_eq!(occupant("CTRL+MAJ+Y", copier, &l), Some("RENOMMER"));
+        // Un nouveau choix remplace l'ancien (une seule ligne par commande)
+        let l = raccourcis_avec(&l, renommer, Some("CTRL+ALT+R"));
+        assert_eq!(l, vec!["CTRL+ALT+R=Renommer".to_string()]);
+        // Les choix des autres commandes restent
+        let l = raccourcis_avec(&l, copier, Some("CTRL+MAJ+C"));
+        assert_eq!(l.len(), 2);
+        // Rétablir : la ligne disparaît ; reprendre la touche d'origine ne s'enregistre pas
+        assert_eq!(raccourcis_avec(&l, renommer, None), vec!["CTRL+MAJ+C=Copier".to_string()]);
+        assert_eq!(raccourcis_avec(&l, renommer, Some("F2")), vec!["CTRL+MAJ+C=Copier".to_string()]);
+        // Une commande hors table ne change rien
+        assert_eq!(raccourcis_avec(&l, 99_999, Some("F9")), l);
+    }
+
+    /// Chaque touche de la table est bien une combinaison que le clavier sait produire, et aucune n'est prise deux fois
+    /// (sauf les paires par mode, comme F5)
+    #[test]
+    fn touches_de_la_table_sans_conflit_avec_les_fixes() {
+        for (j, c) in COMMANDES.iter().enumerate().filter(|(j, _)| a_une_touche(*j)) {
+            assert!(!TOUCHES_FIXES.iter().any(|(t, _)| *t == c.2), "{} reprend la touche fixe {}", c.1, c.2);
+            assert_eq!(touche_effective(j, &[]), c.2);
+        }
+    }
 
     fn sources_vides() -> Sources<'static> {
         Sources { epingles: &[], recents: &[], recents_elements: Vec::new(), fichiers: Vec::new(), groupes: &[], sessions: &[], selection: Vec::new(), dossier_ouvert: None, volet: Vec::new(), autre_panneau: None }
@@ -2388,10 +2598,12 @@ mod tests {
         // `scrollIntoView({block: 'nearest'})` : rien ne bouge si la ligne est visible
         assert_eq!(defilement_visible(0.0, 34.0, 46.0, 330.0, 800.0), 0.0);
         // Ligne sous la fenêtre : juste de quoi la montrer ; au-dessus : son haut
-        assert_eq!(defilement_visible(0.0, 400.0, 46.0, 330.0, 800.0), 116.0);
+        assert_eq!(defilement_visible(0.0, 400.0, 46.0, 330.0, 800.0), 124.0);
         assert_eq!(defilement_visible(300.0, 100.0, 46.0, 330.0, 800.0), 100.0);
         // Jamais au-delà du contenu ni en dessous de zéro
         assert_eq!(defilement_visible(0.0, 790.0, 46.0, 330.0, 800.0), 470.0);
+        // Ligne juste dans la fenêtre mais sans la marge du bas : on remonte de LISTE_BAS
+        assert_eq!(defilement_visible(0.0, 280.0, 46.0, 330.0, 800.0), 4.0);
         assert_eq!(defilement_visible(50.0, 0.0, 46.0, 330.0, 200.0), 0.0);
     }
 
@@ -2806,5 +3018,30 @@ mod tests {
         let avant = q.cle_liste();
         q.entrer(false);
         assert_ne!(q.cle_liste(), avant);
+    }
+
+    #[test]
+    fn le_centre_d_operations_donne_pause_arret_file_et_cause() {
+        let l = |genre, titre: &str, detail: &str| LigneOp { genre, titre: titre.into(), detail: detail.into() };
+        let lignes = vec![
+            l(GenreLigneOp::EnCours(2), "COPIE · 3 ÉLÉMENTS", "PRÉPARATION · 0 % · ONGLET 3"),
+            l(GenreLigneOp::EnFile, "SUPPRESSION · 1 ÉLÉMENT", "EN FILE · N°1 · ONGLET 3"),
+            l(GenreLigneOp::Finie { echec: true }, "COPIE · 2 ÉLÉMENTS", "LE PARTAGE RÉSEAU N'EST PLUS ACCESSIBLE · IL Y A 4 MIN"),
+        ];
+        let items = items_operations(&lignes, "");
+        // Une opération qui tourne : pause puis arrêt, visant le même onglet ; le reste est informatif
+        assert_eq!(items.len(), 4);
+        assert!(items[0].libelle.starts_with("PAUSE · COPIE") && matches!(items[0].action, Action::PauseOperation(2)));
+        assert!(items[1].libelle.starts_with("ARRÊTER") && matches!(items[1].action, Action::AnnulerOperation(2)));
+        assert!(matches!(items[2].action, Action::Rien) && matches!(items[3].action, Action::Rien));
+        assert!(items[3].detail.contains("PARTAGE RÉSEAU"), "la cause de l'échec reste lisible");
+        // En pause, la même ligne propose la reprise
+        let en_pause = vec![l(GenreLigneOp::EnCours(0), "COPIE", "EN PAUSE · 40 %")];
+        assert!(items_operations(&en_pause, "")[0].libelle.starts_with("REPRENDRE"));
+        // La requête filtre sur le titre comme sur le détail
+        assert_eq!(items_operations(&lignes, "partage").len(), 1);
+        assert_eq!(crate::app::age_court(5), "IL Y A 5 S");
+        assert_eq!(crate::app::age_court(125), "IL Y A 2 MIN");
+        assert_eq!(crate::app::age_court(7300), "IL Y A 2 H");
     }
 }

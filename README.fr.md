@@ -11,14 +11,67 @@
 </p>
 
 <p align="center">
-  <code>exe de 3,81 Mo</code> · <code>résident de 16 Mo</code> · <code>640 tests</code> · <code>1 WebView facultatif</code>
+  <a href="https://github.com/nicoo-o/SpaceFiles/releases/latest"><b>▶ TÉLÉCHARGER LA v0.1.0 (pré-version) · zip portable · Windows 11</b></a><br>
+  <sub>Exécutable non signé : Windows vous avertira. <a href="#confiance-">Pourquoi, et comment vérifier le fichier ▸</a></sub>
+</p>
+
+<p align="center">
+  <img src="docs/readme/vitrine-sombre-palette.png" alt="Palette de commandes de SpaceFiles, thème sombre" width="860">
+</p>
+
+<p align="center">
+  <code>exe de 4,43 Mo</code> · <code>résident de 16 Mo</code> · <code>692 tests</code> · <code>1 WebView facultatif</code>
 </p>
 
 ---
 
-> **ÉTAT ▸ EN DÉVELOPPEMENT.** Aucune version publiée, aucun binaire à télécharger. Tout ce qui suit existe dans
-> `main` aujourd'hui ; ce qui manque est dans [LIMITES CONNUES ▸](#limites-connues-). Un chiffre sur cette page est un
+> **ÉTAT ▸ PREMIÈRE PRÉ-VERSION (v0.1.0).** Un zip portable est publié ; il n'est ni signé ni mis à jour
+> automatiquement. Ce qui manque est dans [LIMITES CONNUES ▸](#limites-connues-). Un chiffre sur cette page est un
 > chiffre mesuré.
+
+## CONFIANCE ▸
+
+On vous demande de lancer un programme non signé, venu d'un inconnu. Voici ce qui est vrai, et comment le vérifier.
+
+- **Windows vous avertira.** L'exe n'a pas de certificat de signature de code (il est payant ; voir
+  [`docs/release/signature-et-mises-a-jour.md`](docs/release/signature-et-mises-a-jour.md)). SmartScreen affiche
+  « Windows a protégé votre PC » : cliquer sur **Informations complémentaires**, puis **Exécuter quand même**. Si
+  Smart App Control est actif, il peut refuser le fichier net ; c'est la règle de Windows, pas quelque chose à contourner ici.
+- **Vérifier le fichier.** La release porte `SHA256SUMS.txt`. Dans PowerShell :
+  `Get-FileHash .\SpaceFiles-v0.1.0-portable.zip -Algorithm SHA256` doit afficher la même empreinte.
+- **Aucune télémétrie, aucun compte, aucune recherche de mise à jour.** La seule connexion sortante du code est un
+  test d'accessibilité sur le port 445 d'un stockage réseau que vous avez configuré vous-même.
+- **Ce qu'il écrit.** Réglages et caches dans `%APPDATA%\SpaceFiles` et `%LOCALAPPDATA%\SpaceFiles`. Dans le code
+  source, la seule écriture dans le registre est le réglage facultatif « explorateur par défaut »
+  (<kbd>Win</kbd>+<kbd>E</kbd>) ; le zip n'a pas d'installeur.
+- **Lire le code.** Il est entièrement ici, sous licence MIT. Windows 10 n'a pas été testé.
+
+## VOIR ▸
+
+<p align="center">
+  <img src="docs/readme/vitrine-sombre-liste.png" alt="Vue liste, sombre" width="430">
+  <img src="docs/readme/vitrine-clair-liste.png" alt="Vue liste, clair" width="430">
+  <img src="docs/readme/vitrine-sombre-grille.png" alt="Vue grille, sombre" width="430">
+  <img src="docs/readme/vitrine-sombre-double.png" alt="Double panneau, sombre" width="430">
+  <img src="docs/readme/vitrine-sombre-apercu.png" alt="Coup d'œil sur une image, sombre" width="430">
+  <img src="docs/readme/vitrine-clair-double.png" alt="Double panneau, clair" width="430">
+</p>
+<p align="center"><sub>Un dossier de démonstration avec des fichiers inventés.</sub></p>
+
+## FACE À L'EXPLORATEUR WINDOWS ▸
+
+Pas un verdict : la liste de ce qui diffère. L'Explorateur de Windows est mieux intégré au système, au cloud et à
+tous les autres programmes ; SpaceFiles ne cherche pas à le remplacer sur ce terrain.
+
+| | Explorateur Windows 11 | SpaceFiles |
+|---|---|---|
+| Double panneau | non | oui (<kbd>F6</kbd>), avec comparaison de dossiers |
+| Colonnes Miller | non | oui |
+| Palette de commandes | non | oui (<kbd>Ctrl</kbd>+<kbd>K</kbd>) |
+| Recherche | index Windows Search | index maison, avec filtres |
+| Langue | celle du système | français seulement |
+| Signé par Microsoft | oui | non |
+| Interface | système | matrice de points, une seule police, sombre et clair |
 
 ## OUVRIR ▸
 
@@ -64,11 +117,11 @@ Pas d'adjectifs. Des chiffres, avec leurs limites.
 
 | Quoi | Mesuré | Remarque |
 |---|---|---|
-| Exécutable | 3,81 Mo (3 810 304 octets) | build release, LTO, `panic = abort`, 14 novembre 2026 |
+| Exécutable | 4,43 Mo (4 433 920 octets) | build release, LTO, `panic = abort`, police Doto embarquée (+0,46 Mo), 14 novembre 2026 |
 | Processus résident | 16 Mo de working set | la part qui reste en mémoire pour <kbd>Win</kbd>+<kbd>E</kbd> |
 | Dossier de 200 000 entrées | listé en 0,9 s, 195 Mo | une seule mesure, pas une moyenne |
 | Index de 2,5 millions d'éléments | ~4 min 30, 110 Mo | parcours à priorité basse |
-| Tests | 640 réussis, 0 échec, 7 ignorés | `cargo test`, 14 novembre 2026 |
+| Tests | 692 réussis, 0 échec, 8 ignorés | `cargo test`, 14 novembre 2026 |
 | Dépendances directes | 4 crates (30 au total) | `windows`, `windows-core`, `regex`, `webview2-com` |
 
 ## BRANCHER ▸
@@ -100,11 +153,11 @@ comment `desinstaller.ps1` le retire (les données sont gardées, sauf demande c
 
 ## LIMITES CONNUES ▸
 
-- **Pas de version publiée, pas de binaire signé, pas de mise à jour automatique.** À construire soi-même, ou attendre.
-  Un exe téléchargé déclenche SmartScreen : comparer son SHA-256 (`tools/install/empreinte.ps1`). WebView2 est facultatif (aperçu HTML seulement).
+- **Pré-version, pas de binaire signé, pas de mise à jour automatique.** L'exe déclenche SmartScreen (voir
+  [CONFIANCE ▸](#confiance-)). Ou le construire soi-même. WebView2 est facultatif (aperçu HTML seulement).
+- **Le zip est portable : pas d'installeur.** `installer.ps1` ne marche que depuis les sources (raccourci, processus
+  résident, <kbd>Win</kbd>+<kbd>E</kbd>).
 - **En français seulement** : interface, commentaires et documentation.
-- **Pas encore de capture sur cette page.** Les vraies montrent les dossiers de l'auteur ; des captures propres sont
-  sur la liste.
 - SFTP, WebDAV, sauvegarde NAS et MTP sont gelés derrière un réglage `experimental`, désactivé pour un profil neuf.
 - Non couvert par les vérifications automatiques : tout ce qui demande une vraie souris (survol, menu clic droit,
   lasso), un second écran d'un autre DPI, le plein écran.
@@ -116,8 +169,7 @@ comment `desinstaller.ps1` le retire (les données sont gardées, sauf demande c
   reste fermé.
 - **Aucune télémétrie, aucune recommandation personnalisée** : le volet « recommandés » de l'Explorateur Windows n'est
   pas un objectif.
-- **Aucune mise à jour automatique en tâche de fond** : le binaire se remplace à la main, le jour où une version
-  existera.
+- **Aucune mise à jour automatique en tâche de fond** : le binaire se remplace à la main.
 - **Aucun moteur d'archive maison** : `tar.exe` couvre zip, tar et 7z dans les deux sens ; la compression ne se
   réimplémente pas.
 - **Aucune place de marché d'extensions, aucun compagnon mobile** : un seul auteur, un seul binaire.
