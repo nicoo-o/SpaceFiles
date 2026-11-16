@@ -173,9 +173,12 @@ pub fn placer(x0: f32, x1: f32, mesurer: &dyn Fn(&str) -> f32) -> Vec<Place> {
         let n = groupes.iter().filter(|g| !g.is_empty()).count();
         groupes.iter().flatten().map(|&o| largeur(o, texte, mesurer) + ESPACE).sum::<f32>() + SEPARATION * n.saturating_sub(1) as f32
     };
-    let complet: Vec<Vec<Outil>> = GAUCHE.iter().map(|g| g.to_vec()).collect();
+    let profil = crate::profil::actuel();
+    // Table unique des profils : un bouton dont la commande est cachée en Simple disparaît, « Outils » aussi
+    let visible = |o: &Outil| o.commande().map_or(*o != Outil::Outils || profil == crate::profil::Profil::Expert, |c| crate::profil::commande_visible(profil, c));
+    let complet: Vec<Vec<Outil>> = GAUCHE.iter().map(|g| g.iter().copied().filter(|o| visible(o)).collect()).collect();
     let reduit: Vec<Vec<Outil>> = complet.iter().map(|g| g.iter().copied().filter(|o| !SECONDAIRES.contains(o)).collect()).collect();
-    let mut droite: Vec<Vec<Outil>> = DROITE.iter().map(|g| g.to_vec()).collect();
+    let mut droite: Vec<Vec<Outil>> = DROITE.iter().map(|g| g.iter().copied().filter(|o| visible(o)).collect()).collect();
     let place = |g: &[Vec<Outil>], d: &[Vec<Outil>], t: bool| total(g, t) + total(d, t) + SEPARATION * 2.0;
     // Par préférence : libellés avant Partager / Propriétés, et les vues avant tout le reste
     let essais = [(&complet, true), (&reduit, true), (&complet, false), (&reduit, false)];

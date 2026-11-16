@@ -86,6 +86,148 @@ pub(crate) unsafe fn texte_lu(hwnd: HWND, f: &mut Fenetre, r: ocr::Resultat) {
 
 /// Marque des messages WM_COPYDATA qui portent des onglets (V6) : « NE » + 1
 pub(crate) const ONGLETS_COPIES: usize = 0x4E45_0001;
+/// Chemins acceptés au plus dans une charge `ONGLETS_COPIES` (au-delà : la charge entière est refusée)
+pub(crate) const ONGLETS_MAX: usize = 50;
+
+/// Pourquoi une charge `ONGLETS_COPIES` est refusée
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum RefusOnglets {
+    /// Plus de 64 Ko
+    TropGrosse,
+    /// Longueur nulle ou impaire (UTF-16 tronqué)
+    Longueur,
+    /// Aucun chemin (que des séparateurs)
+    Vide,
+    /// Plus de `ONGLETS_MAX` chemins
+    TropDeChemins,
+}
+
+/// Relit la charge d'un `WM_COPYDATA` `ONGLETS_COPIES` : des chemins absolus en UTF-16 séparés par des sauts de ligne. Pure : ne
+/// touche ni le disque ni le réseau (c'est le fil de travail qui vérifie que chaque chemin est un dossier). N'importe quel
+/// processus du même utilisateur peut écrire à la fenêtre : taille bornée (64 Ko), longueur paire et non nulle, au plus
+/// `ONGLETS_MAX` chemins, séparateurs vides ignorés, chemins relatifs ignorés (ils dépendraient du dossier courant de ce
+/// processus), caractère nul ou surrogate isolé refusés avec la ligne concernée.
+pub(crate) fn lire_onglets_copies(octets: &[u8]) -> std::result::Result<Vec<std::path::PathBuf>, RefusOnglets> {
+    if octets.len() > eco::reutiliser::CHARGE_MAX {
+        return Err(RefusOnglets::TropGrosse);
+    }
+    if octets.is_empty() || !octets.len().is_multiple_of(2) {
+        return Err(RefusOnglets::Longueur);
+    }
+    let unites: Vec<u16> = octets.as_chunks::<2>().0.iter().map(|p| u16::from_le_bytes([p[0], p[1]])).collect();
+    let texte = String::from_utf16_lossy(&unites);
+    let mut chemins = Vec::new();
+    for ligne in texte.lines().filter(|l| !l.is_empty()) {
+        if chemins.len() == ONGLETS_MAX {
+            return Err(RefusOnglets::TropDeChemins);
+        }
+        let chemin = std::path::PathBuf::from(ligne);
+        // Chemins de périphérique (`\\.\pipe\…`, `\\?\GLOBALROOT\…`) : `is_dir` les ouvrirait, ce ne sont pas des dossiers
+        let peripherique = ligne.starts_with(r"\\.\") || ligne.to_ascii_uppercase().starts_with(r"\\?\GLOBALROOT");
+        if chemin.is_absolute() && !peripherique && !ligne.contains(['\0', '\u{FFFD}']) {
+            chemins.push(chemin);
+        }
+    }
+    if chemins.is_empty() {
+        return Err(RefusOnglets::Vide);
+    }
+    Ok(chemins)
+}
+
+/// Onglets reçus d'une autre fenêtre, dont les dossiers ont été vérifiés par un fil court, en attente d'être ouverts par la fenêtre
+/// à qui ils sont destinés (même schéma que `OUVERTURES` : le message posté ne porte aucun pointeur)
+pub(crate) static ONGLETS_RECUS: std::sync::Mutex<std::collections::VecDeque<(isize, Vec<String>)>> = std::sync::Mutex::new(std::collections::VecDeque::new());
+/// Fils de vérification des onglets reçus en vol (4 au plus, toutes fenêtres du processus confondues)
+static FILS_ONGLETS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+/// Charges d'onglets en attente de leur message (bornée : une fenêtre qui ne les prend pas ne fait pas grossir la file)
+const ONGLETS_RECUS_MAX: usize = 16;
+
+/// Réception de `ONGLETS_COPIES` (RATTACHER, envoyé par une autre fenêtre). Rend vrai quand la charge est valide et que sa
+/// vérification est lancée : c'est la réponse `1` du `WM_COPYDATA`, que l'expéditeur lit pour fermer sa fenêtre. Aucun accès
+/// disque ni réseau ici : un partage réseau mort bloquerait la fenêtre ; `is_dir` se fait dans un fil court, le résultat est
+/// déposé dans `ONGLETS_RECUS` et `WM_ONGLETS_COPIES` (sans pointeur) demande à la fenêtre de l'ouvrir. Refus (`0`, l'expéditeur
+/// garde ses onglets) : charge invalide, fenêtre sans état, trop de vérifications en vol. Un dossier devenu introuvable entre
+/// l'envoi et la vérification n'ouvre simplement pas d'onglet, comme avant. Limite connue (relecture du 16/11) : la réponse `1`
+/// part avant la vérification et l'expéditeur ferme alors sa fenêtre ; si aucun dossier n'est visible de cette fenêtre (lecteur
+/// réseau mappé propre à une session élevée, par exemple) ou si la file est pleine, ses onglets sont perdus sans message ; le
+/// code d'avant répondait déjà `1` quand aucun dossier ne passait son filtre. Un retrait sur échec d'envoi vide toutes les
+/// charges de la fenêtre, pas seulement celle de ce fil (même cas rare).
+///
+/// SAFETY (appelant) : même contrat que `recevoir_ouvrir_ici` (traitement de `WM_COPYDATA` de la fenêtre `hwnd`, sur son fil, `cd`
+/// lu depuis le `lparam` non nul de ce message).
+pub(crate) unsafe fn recevoir_onglets_copies(hwnd: HWND, cd: &windows::Win32::System::DataExchange::COPYDATASTRUCT) -> bool {
+    use eco::reutiliser::{liberer, reserver, CHARGE_MAX, FILS_MAX};
+    if cd.lpData.is_null() || cd.cbData as usize > CHARGE_MAX {
+        return false;
+    }
+    // SAFETY: contrat de l'appelant (cbData octets lisibles pendant l'appel) ; la taille est bornée à 64 Ko juste au-dessus et
+    // `lire_onglets_copies` copie ce qu'elle garde avant le retour
+    let octets = std::slice::from_raw_parts(cd.lpData as *const u8, cd.cbData as usize);
+    let Ok(chemins) = lire_onglets_copies(octets) else { return false };
+    // Pas d'`etat_de` : l'appel peut tomber pendant une modale qui tient `&mut Fenetre` (voir `recevoir_ouvrir_ici`)
+    if GetWindowLongPtrW(hwnd, GWLP_USERDATA) == 0 || !reserver(&FILS_ONGLETS, FILS_MAX) {
+        return false;
+    }
+    let fenetre = hwnd.0 as isize;
+    let lance = std::thread::Builder::new()
+        .name("onglets-copies".into())
+        .spawn(move || {
+            let dossiers: Vec<String> = chemins.iter().filter(|c| c.is_dir()).map(|c| c.to_string_lossy().into_owned()).collect();
+            if !dossiers.is_empty() {
+                let depose = {
+                    let mut file = ONGLETS_RECUS.lock().unwrap_or_else(|e| e.into_inner());
+                    let place = file.len() < ONGLETS_RECUS_MAX;
+                    if place {
+                        file.push_back((fenetre, dossiers));
+                    }
+                    place
+                };
+                if depose {
+                    // SAFETY: aucun pointeur dans le message ; si la fenêtre n'existe plus le post échoue et la charge est retirée
+                    let poste = unsafe { PostMessageW(HWND(fenetre as *mut _), WM_ONGLETS_COPIES, WPARAM(0), LPARAM(0)) };
+                    if poste.is_err() {
+                        prendre_onglets_recus(fenetre);
+                    }
+                }
+            }
+            liberer(&FILS_ONGLETS);
+        })
+        .is_ok();
+    if !lance {
+        liberer(&FILS_ONGLETS);
+    }
+    lance
+}
+
+/// Retire, dans l'ordre, les dossiers déposés pour cette fenêtre ; ceux des autres fenêtres restent
+pub(crate) fn prendre_onglets_recus(fenetre: isize) -> Vec<String> {
+    let mut file = ONGLETS_RECUS.lock().unwrap_or_else(|e| e.into_inner());
+    let mut pris = Vec::new();
+    file.retain(|(h, d)| {
+        if *h == fenetre {
+            pris.extend(d.iter().cloned());
+            false
+        } else {
+            true
+        }
+    });
+    pris
+}
+
+/// Suite de `recevoir_onglets_copies` : un onglet par dossier vérifié. Même fermeture préalable que `ouvrir_ici` (menu, palette,
+/// renommage…) : l'ouverture arrive maintenant de façon asynchrone, au milieu d'une interaction.
+pub(crate) unsafe fn ouvrir_onglets_copies(hwnd: HWND, f: &mut Fenetre, dossiers: Vec<String>) {
+    fermer_menu(f);
+    f.palette = None;
+    f.lot = None;
+    f.galerie = None;
+    f.depot_droit = None;
+    f.app.annuler_renommage();
+    for d in dossiers {
+        f.nouvel_onglet(hwnd, Emplacement::dossier(&d));
+    }
+    let _ = InvalidateRect(hwnd, None, false);
+}
 
 /// Envoie ces dossiers à une autre fenêtre de l'explorateur (pas celle-ci). Vrai si elle les a reçus.
 pub(crate) unsafe fn envoyer_onglets(hwnd: HWND, dossiers: &[String]) -> bool {
@@ -138,7 +280,10 @@ pub(crate) unsafe fn recevoir_ouvrir_ici(hwnd: HWND, cd: &windows::Win32::System
     // juste au-dessus, et `decoder` copie ce qu'il garde avant que l'appel ne rende la main.
     let octets = std::slice::from_raw_parts(cd.lpData as *const u8, cd.cbData as usize);
     let Some(charge) = decoder(octets) else { return false };
-    if trop_ancienne(charge.tick, maintenant_ms()) || etat_de(hwnd).is_none() {
+    // Pas d'`etat_de` ici : l'appel peut tomber pendant une modale qui tient `&mut Fenetre` ; on regarde seulement si la fenêtre
+    // a un état (pointeur non nul), sans le lire
+    // Pendant une modale `WM_OUVRIR_ICI` est retenu : accepter ferait attendre le résident 4 s pour rien (il se replie)
+    if trop_ancienne(charge.tick, maintenant_ms()) || GetWindowLongPtrW(hwnd, GWLP_USERDATA) == 0 || crate::fenetre::modale_en_cours() {
         return false;
     }
     if !reserver(&FILS_OUVRIR_ICI, FILS_MAX) {
@@ -154,8 +299,8 @@ pub(crate) unsafe fn recevoir_ouvrir_ici(hwnd: HWND, cd: &windows::Win32::System
     let lance = std::thread::Builder::new()
         .name("ouvrir-ici".into())
         .spawn(move || {
-            let r = resoudre_ouverture(&charge.chemin, charge.reveler, |p| std::path::Path::new(p).is_dir());
-            if eco::reutiliser::deposer(&OUVERTURES, fenetre, r) {
+            let (dossier, nom) = resoudre_ouverture(&charge.chemin, charge.reveler, |p| std::path::Path::new(p).is_dir());
+            if eco::reutiliser::deposer(&OUVERTURES, fenetre, (dossier, nom, charge.tick)) {
                 // SAFETY: aucun pointeur dans le message ; si la fenêtre n'existe plus le post échoue et le résultat
                 // déposé est retiré tout de suite (rien ne reste dans la file).
                 let poste = unsafe { PostMessageW(HWND(fenetre as *mut _), WM_OUVRIR_ICI, WPARAM(0), LPARAM(0)) };
@@ -361,11 +506,15 @@ pub(crate) unsafe fn ouvrir_galerie(hwnd: HWND, f: &mut Fenetre) {
     let chemin = chemin.filter(|_| fichier);
     let mut g = Galerie::vierge(numero, e.nom.clone(), detail, icones::pour(&e), chemin.clone(), e.ext.clone());
     // HTML, SVG… : la visionneuse web (scripts et réseau coupés) montre la page ; sans runtime WebView2, l'aperçu texte habituel
-    g.web = chemin.is_some() && crate::webvue::est_web(&e.ext) && crate::webvue::disponible();
+    // Une page sur un partage réseau n'est pas confiée au contrôle : le filtre refuse toute ressource d'un hôte réseau (une
+    // authentification NTLM partirait vers lui), le document lui-même serait donc refusé et l'aperçu resterait blanc
+    let sur_reseau = chemin.as_deref().is_some_and(crate::webvue::chemin_reseau);
+    g.web = chemin.is_some() && !sur_reseau && crate::webvue::est_web(&e.ext) && crate::webvue::disponible();
     let web = g.web;
-    // Sans runtime WebView2 : le dire une fois, sinon le source brut passe pour un défaut d'affichage (repli essayé le 14/11)
+    // Source affiché au lieu de la page : le dire une fois, sinon le source brut passe pour un défaut d'affichage (repli essayé le 14/11)
     if !web && chemin.is_some() && crate::webvue::est_web(&e.ext) {
-        f.app.annoncer("WEBVIEW2 ABSENT · SOURCE DE LA PAGE AFFICHE", false);
+        let message = if sur_reseau { "PAGE SUR LE RESEAU · SOURCE AFFICHE" } else { "WEBVIEW2 ABSENT · SOURCE DE LA PAGE AFFICHE" };
+        f.app.annoncer(message, false);
     }
     // Office, RTF… : gestionnaire d'aperçu de Windows, seulement si l'auteur l'a activé (P-01) ; l'aperçu habituel sert de repli
     g.systeme = !web && chemin.is_some() && reglages::actuels().apercu_systeme && crate::hote_apercu::disponible_pour(&e.ext);
@@ -482,5 +631,77 @@ unsafe fn redemander_echelle(hwnd: HWND, g: &mut Galerie) {
         if let Some(c) = g.chemin.clone() {
             apercu::charger_galerie(hwnd, g.numero, c, g.ext.clone(), g.page, voulue);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests_onglets_copies {
+    use super::*;
+
+    fn charge(texte: &str) -> Vec<u8> {
+        texte.encode_utf16().flat_map(|u| u.to_le_bytes()).collect()
+    }
+
+    #[test]
+    fn des_chemins_absolus_separes_par_des_sauts_de_ligne_sont_lus() {
+        let r = lire_onglets_copies(&charge("C:\\Users\\a\nD:\\Projets\r\nE:\\")).unwrap();
+        assert_eq!(r, vec![std::path::PathBuf::from(r"C:\Users\a"), r"D:\Projets".into(), r"E:\".into()]);
+    }
+
+    #[test]
+    fn les_separateurs_vides_sont_ignores() {
+        let r = lire_onglets_copies(&charge("\n\nC:/a\n\n\nC:/b\n")).unwrap();
+        assert_eq!(r.len(), 2);
+    }
+
+    #[test]
+    fn une_charge_de_plus_de_64_ko_est_refusee() {
+        assert_eq!(lire_onglets_copies(&vec![b'a'; eco::reutiliser::CHARGE_MAX + 2]), Err(RefusOnglets::TropGrosse));
+        // Pile 64 Ko : pas refusée pour sa taille
+        assert_ne!(lire_onglets_copies(&vec![0u8; eco::reutiliser::CHARGE_MAX]), Err(RefusOnglets::TropGrosse));
+    }
+
+    #[test]
+    fn une_longueur_nulle_ou_impaire_est_refusee() {
+        assert_eq!(lire_onglets_copies(&[]), Err(RefusOnglets::Longueur));
+        let mut impaire = charge("C:/a");
+        impaire.pop();
+        assert_eq!(lire_onglets_copies(&impaire), Err(RefusOnglets::Longueur));
+    }
+
+    #[test]
+    fn plus_de_cinquante_chemins_sont_refuses_et_cinquante_passent() {
+        let n = |k: usize| (0..k).map(|i| format!("C:/d{i}")).collect::<Vec<_>>().join("\n");
+        assert_eq!(lire_onglets_copies(&charge(&n(ONGLETS_MAX))).unwrap().len(), ONGLETS_MAX);
+        assert_eq!(lire_onglets_copies(&charge(&n(ONGLETS_MAX + 1))), Err(RefusOnglets::TropDeChemins));
+    }
+
+    #[test]
+    fn rien_d_utilisable_est_refuse() {
+        assert_eq!(lire_onglets_copies(&charge("\n\r\n\n")), Err(RefusOnglets::Vide));
+        // Relatif : dépendrait du dossier courant de la fenêtre qui reçoit
+        assert_eq!(lire_onglets_copies(&charge("dossier\n../x")), Err(RefusOnglets::Vide));
+        // Périphériques : jamais ouverts par `is_dir`
+        assert_eq!(lire_onglets_copies(&charge("\\\\.\\pipe\\x\n\\\\?\\GlobalRoot\\Device\\y")), Err(RefusOnglets::Vide));
+        assert_eq!(lire_onglets_copies(&charge("\\\\?\\C:\\long")).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn un_nul_ou_un_surrogate_isole_ecarte_la_ligne_seulement() {
+        let mut octets = charge("C:/a\nC:/b");
+        // Surrogate isolé 0xD800 à la place du « b » final : la ligne devient « C:/? » (remplacement)
+        let n = octets.len();
+        octets[n - 2] = 0x00;
+        octets[n - 1] = 0xD8;
+        assert_eq!(lire_onglets_copies(&octets).unwrap(), vec![std::path::PathBuf::from("C:/a")]);
+        assert_eq!(lire_onglets_copies(&charge("C:/a\0b\nC:/c")).unwrap(), vec![std::path::PathBuf::from("C:/c")]);
+    }
+
+    #[test]
+    fn la_file_rend_seulement_les_dossiers_de_la_fenetre() {
+        ONGLETS_RECUS.lock().unwrap().extend([(7, vec!["C:/a".to_string()]), (9, vec!["C:/z".to_string()]), (7, vec!["C:/b".to_string()])]);
+        assert_eq!(prendre_onglets_recus(7), vec!["C:/a".to_string(), "C:/b".to_string()]);
+        assert_eq!(prendre_onglets_recus(7), Vec::<String>::new());
+        assert_eq!(prendre_onglets_recus(9), vec!["C:/z".to_string()]);
     }
 }

@@ -61,6 +61,11 @@ pub enum Commande {
     Annuler,
     Refaire,
     Sons,
+    /// Bascule entre les profils Simple et Expert (`profil.rs`)
+    BasculerProfil,
+    /// Ouvre le dossier de destination de la première pastille qui en a un (copie ou déplacement) : sans souris, la pastille n'a
+    /// pas d'autre chemin que le bouton visuel
+    OuvrirDestination,
     Couper,
     Copier,
     Coller,
@@ -150,7 +155,7 @@ pub fn commande_experimentale(c: Commande) -> Option<crate::reglages::Experiment
 
 /// Une commande est-elle atteignable (palette, menus, raccourcis) avec ce réglage ?
 pub fn commande_permise(experimental: bool, c: Commande) -> bool {
-    commande_experimentale(c).is_none_or(|g| crate::reglages::fonction_experimentale_permise(experimental, g))
+    commande_experimentale(c).is_none_or(|g| crate::reglages::fonction_experimentale_permise(experimental, g)) && crate::profil::commande_visible(crate::profil::actuel(), c)
 }
 
 /// Commande, libellé, raccourci, mots qui la retrouvent aussi
@@ -327,6 +332,8 @@ pub const COMMANDES: &[(Commande, &str, &str, &str)] = &[
     (Commande::Annuler, "ANNULER LA DERNIERE ACTION", "CTRL+Z", "defaire undo"),
     (Commande::Refaire, "REFAIRE CE QUI VIENT D'ETRE ANNULE", "CTRL+Y", "retablir redo"),
     (Commande::Sons, "ACTIVER / COUPER LES SONS", "CTRL+M", "muet"),
+    (Commande::BasculerProfil, "PASSER EN MODE SIMPLE / EXPERT", "CTRL+MAJ+E", "profil simple expert mode facile avance debutant complet"),
+    (Commande::OuvrirDestination, "OUVRIR LE DOSSIER DE DESTINATION", "CTRL+MAJ+O", "destination dossier copie deplacement operation pastille"),
     (Commande::Reglages, "RÉGLAGES", "CTRL+,", "reglages options parametres"),
 ];
 
@@ -371,7 +378,7 @@ fn icone_commande(c: Commande) -> Icone {
         Commande::Terminal | Commande::VsCode => Icone::Code,
         Commande::RechercheGlobale | Commande::ReconstruireIndex => Icone::Disque,
         Commande::TrierNom | Commande::TrierDate | Commande::TrierType | Commande::TrierTaille | Commande::TrierCroissant | Commande::TrierDecroissant => Icone::Bureau,
-        Commande::Reglages | Commande::Sons | Commande::PoidsSonore | Commande::Palette | Commande::PaletteSecondaire | Commande::Administrateur | Commande::ModeCapture => Icone::Reglages,
+        Commande::Reglages | Commande::BasculerProfil | Commande::Sons | Commande::PoidsSonore | Commande::Palette | Commande::PaletteSecondaire | Commande::Administrateur | Commande::ModeCapture => Icone::Reglages,
         _ => Icone::Fichier,
     }
 }

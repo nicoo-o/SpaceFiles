@@ -289,6 +289,20 @@ impl Pastille {
     }
 }
 
+/// Nom d'un bouton lu par un lecteur d'écran : les boutons ne sont que des dessins (✕, ⏸), sans texte. La pause dit ce qu'elle
+/// fera (« Mettre en pause » ou « Reprendre »), pas son état.
+pub fn nom_bouton(p: &Pastille, b: Bouton) -> &'static str {
+    match b {
+        Bouton::Pause if p.en_pause => "Reprendre",
+        Bouton::Pause => "Mettre en pause",
+        Bouton::Annuler => "Annuler l'opération",
+        Bouton::Destination => "Ouvrir le dossier de destination",
+        Bouton::Fermer => "Fermer",
+        Bouton::AnnulerAction => "Annuler la dernière action",
+        Bouton::Afficher => "Afficher dans le dossier",
+    }
+}
+
 /// Ce bouton existe-t-il sur cette pastille ? Un clic arrivé avec un rang périmé ne doit jamais agir sur une autre pastille
 /// (une file qui a avancé, une pastille retirée) : le bouton visé doit faire partie de la pastille trouvée au rang.
 pub fn bouton_autorise(p: &Pastille, b: Bouton) -> bool {
@@ -914,6 +928,22 @@ mod tests {
         assert!(expiree(Genre::Erreur, 10_000));
         assert!(!expiree(Genre::Annulation, 9999));
         assert!(expiree(Genre::Annulation, 10_000));
+    }
+
+    /// Chaque bouton visuel a un nom parlé, distinct des autres boutons de sa pastille (un lecteur d'écran ne doit pas lire deux fois
+    /// la même chose), et la pause change de nom quand elle est active
+    #[test]
+    fn noms_des_boutons_parles() {
+        let tous = [Bouton::Pause, Bouton::Annuler, Bouton::Destination, Bouton::Fermer, Bouton::AnnulerAction, Bouton::Afficher];
+        let mut vus = std::collections::HashSet::new();
+        for b in tous {
+            let n = nom_bouton(&op("COPIE · 1 ÉLÉMENT", 0.5), b);
+            assert!(!n.is_empty() && vus.insert(n), "{b:?} : nom vide ou en double");
+        }
+        let mut p = op("COPIE · 1 ÉLÉMENT", 0.5);
+        assert_eq!(nom_bouton(&p, Bouton::Pause), "Mettre en pause");
+        p.en_pause = true;
+        assert_eq!(nom_bouton(&p, Bouton::Pause), "Reprendre");
     }
 
     #[test]

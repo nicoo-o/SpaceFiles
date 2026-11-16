@@ -297,9 +297,22 @@ clavier) traite la demande ainsi :
    sans zéro final : `<r>\n<tick>\n<chemin>` (les `\n` sont de vrais sauts de ligne U+000A). `<r>` vaut `1` si `reveal` est vrai,
    `0` sinon ; `<tick>` est l'instant d'envoi en entier décimal (`GetTickCount64`, millisecondes, commun à toute la session) ;
    `<chemin>` est le chemin déjà validé et normalisé. Envoi par `SendMessageTimeoutW` (`SMTO_ABORTIFHUNG`, **2 000 ms** au plus).
-   Réponse `1` = acceptée ; tout le reste (`0`, délai, fenêtre figée, aucune fenêtre) = **repli** : la demande est lancée comme
-   sans `reuse` (`--ouvrir` / `--montrer`). Seul un **échec immédiat pour accès refusé** (`ERROR_ACCESS_DENIED`, fenêtre élevée) fait
-   essayer la fenêtre suivante ; un délai ou une réponse `0` ne passent pas à la suivante.
+   Réponse `1` = **acceptée, pas encore ouverte** (confirmation, point 3 bis) ; tout le reste (`0`, délai, fenêtre figée, aucune
+   fenêtre) = **repli** : la demande est lancée comme sans `reuse` (`--ouvrir` / `--montrer`). Seul un **échec immédiat pour accès
+   refusé** (`ERROR_ACCESS_DENIED`, fenêtre élevée) fait essayer la fenêtre suivante ; un délai ou une réponse `0` ne passent pas à la
+   suivante.
+3 bis. **Confirmation de l'ouverture réelle (lot 3 du plan du 16/11/2026, R35).** Avant l'envoi, le résident crée un événement
+   Windows **nommé** `Local\SpaceFiles.OuvrirIci.<tick>` (`<tick>` = celui de la charge ; le même utilisateur, la même session ; le résident
+   traite une demande à la fois). La fenêtre ne le signale (`OpenEventW` + `SetEvent`) qu'**après** avoir réellement ouvert l'onglet,
+   sur son fil d'interface. Après une réponse `1`, le résident attend **au plus 4 000 ms** (à partir de la réponse) l'un de ces deux
+   signes : l'événement signalé (**ouvert** : rien d'autre à faire), ou la **fin du processus de la fenêtre** (elle a disparu entre
+   l'acceptation et l'ouverture : **repli immédiat**). Sans signe au bout de 4 000 ms (consultation du disque qui traîne, file pleine,
+   fenêtre figée), le résident se **replie** : il lance une nouvelle fenêtre (`--ouvrir` / `--montrer`). Pour qu'un repli ne donne
+   jamais deux ouvertures, la fenêtre **n'ouvre pas** une demande dont l'instant d'envoi a plus de **3 500 ms** au moment où elle
+   allait l'ouvrir (le résident s'est alors déjà replié, ou va le faire). Aucun message du protocole des tubes ne change : la
+   réponse `{"opened":true}` du tube garde le sens « demande en file » (voir plus bas) ; **SpaceNotch et le Hub n'ont rien à
+   accepter de plus**. Seul le résident a changé de comportement : une ouverture réutilisée n'est comptée comme faite qu'après la
+   confirmation de la fenêtre, jamais sur la seule acceptation.
 4. **Réception (dans la fenêtre).** N'importe quel processus du même utilisateur peut écrire à une fenêtre : la fenêtre ne fait
    pas confiance à l'expéditeur. Elle refuse (`0`) toute autre marque, toute charge de plus de **64 Ko**, de longueur impaire (UTF-16
    tronqué), avec un surrogate isolé, sans les deux `\n`, dont le premier champ n'est pas `0` ou `1`, dont l'instant n'est pas un
@@ -310,10 +323,19 @@ clavier) traite la demande ainsi :
    partage réseau mort ne fige pas la fenêtre). Le fil dépose le résultat dans une file protégée du processus et poste à la fenêtre
    `WM_OUVRIR_ICI` **sans paramètre** ; sur son fil d'interface la fenêtre vide la file pour son handle, ferme ce qui visait l'onglet
    affiché (menu, palette, renommage par lot, renommage en cours, galerie) et ouvre un **nouvel onglet** sur le dossier résolu avec
-   l'élément choisi.
+   l'élément choisi. **Avant** d'ouvrir l'onglet, la fenêtre ouvre l'événement de confirmation du point 3 bis (droit de le lever) ;
+   s'il est absent (le résident s'est replié et l'a fermé) ou refusé (résident élevé, ancienne version), elle **n'ouvre rien** : le
+   résident lance sa propre fenêtre, donc pas de doublon. Elle lève l'événement une fois l'onglet réellement ouvert. Elle refuse
+   aussi (`0`) toute demande reçue pendant une boîte de dialogue ouverte (l'ouverture serait retenue) : le résident se replie tout
+   de suite au lieu d'attendre 4 s.
 
-Limites connues. (a) La réponse `1` veut dire « acceptée et en cours », pas « l'onglet est ouvert » : l'onglet apparaît juste
-après la réponse. Une fenêtre fermée pendant ce court intervalle perd la demande, sans repli. (b) Une fenêtre qui met plus de 2 s à
+Limites connues. (a) La réponse `1` veut dire « acceptée et en cours », pas « l'onglet est ouvert » : l'onglet est confirmé par
+l'événement du point 3 bis. La **fin du processus** de la fenêtre fait replier le résident tout de suite (une fenêtre fermée dans un
+processus qui reste vivant, en revanche, attend le délai) ; une fenêtre qui n'ouvre rien (file de 16 résultats pleine, état
+absent) le fait replier après 4 000 ms et elle est alors sautée 10 s : pas de perte, un retard de 4 s au plus.
+Risque résiduel : une ouverture en double si la fenêtre ouvre l'événement et décide d'ouvrir l'onglet au même instant où le résident
+expire (course de quelques millisecondes, jamais une perte). Un processus du même utilisateur peut deviner le nom de l'événement et
+fausser une confirmation (il peut déjà écrire à la fenêtre) : acceptée, sans nonce. (b) Une fenêtre qui met plus de 2 s à
 répondre est tenue pour absente : le résident se replie, et si l'ancienne traite le message plus tard, l'âge de la charge
 (> 1 500 ms) lui fait répondre `0` sans rien ouvrir. Reste un intervalle étroit, entre 1 500 ms et 2 000 ms, où la fenêtre a refusé
 sans que le résident ait encore renoncé : il se replie alors sur le `0`, un seul lancement. (c) Avec plusieurs fenêtres, seule la
@@ -322,8 +344,12 @@ plus haute est essayée sauf accès refusé (jusqu'à 3). (d) Le premier plan r�
 est posée**, remplace la recherche par celle d'une fenêtre **message-only** de cette classe, sans exiger de visibilité ni
 d'exécutable identique (le pid du résident reste exclu) ; en usage normal elle est ignorée.
 
-**Ce que « ouvert » veut dire.** Réponse `result: {"opened":true}` dès que la demande est dans la file du résident. La fenêtre
-n'est pas attendue, et rien ne dit qu'elle s'affichera (chemin introuvable, session verrouillée…).
+**Ce que « ouvert » veut dire.** Réponse `result: {"opened":true}` dès que la demande est dans la file du résident (le tube
+répond avant tout lancement : un client comme SpaceNotch n'attend que 300 ms). La fenêtre n'est pas attendue, et rien ne dit
+qu'elle s'affichera (chemin introuvable, session verrouillée…). **Ce que le résident garantit** (R35) : une demande acceptée en
+file n'est pas perdue parce qu'une fenêtre réutilisée a disparu ou n'a rien ouvert : sans confirmation de l'ouverture réelle
+(point 3 bis ci-dessus), il lance sa propre fenêtre. Le contrat « aucun état intermédiaire » du tube est donc volontaire : on n'a
+pas ajouté `accepted` / `opening` / `failed`, qui obligeraient SpaceNotch et le Hub à les connaître.
 
 **Limite de débit.** Pour tous les clients ensemble : au plus **5 ouvertures par seconde glissante**, une **rafale de 5** puis une
 ouverture de plus **toutes les 2 s** (seau), **20 par minute** au plus, et 8 demandes en attente de lancement ; au-delà

@@ -207,6 +207,9 @@ pub fn tranche_date(ft: u64) -> u32 {
 pub fn lancer(hwnd: HWND, chemin: &str) {
     let w: Vec<u16> = chemin.encode_utf16().chain(std::iter::once(0)).collect();
     let verbe: Vec<u16> = "open\0".encode_utf16().collect();
+    // Avec une fenêtre propriétaire, le Shell peut montrer une boîte d'erreur ou de choix (boucle modale) pendant que l'appelant
+    // tient l'état de la fenêtre : voir `GardeModale`. Sans fenêtre, rien ne distribue à notre procédure.
+    let _garde = if hwnd.0.is_null() { None } else { Some(crate::fenetre::GardeModale::nouvelle(hwnd)) };
     // SAFETY: les tampons finissent par 0 et vivent jusqu'au retour des appels
     let mut r = unsafe { ShellExecuteW(hwnd, PCWSTR(verbe.as_ptr()), PCWSTR(w.as_ptr()), PCWSTR::null(), PCWSTR::null(), SW_SHOWNORMAL) };    if r.0 as isize <= 32 {
         // Sans fenêtre propriétaire ni verbe : le Shell choisit l'action par défaut
@@ -357,16 +360,6 @@ pub fn nombre(n: usize) -> String {
 pub fn maintenant() -> u64 {
     let t = unsafe { windows::Win32::System::SystemInformation::GetSystemTimeAsFileTime() };
     (t.dwHighDateTime as u64) << 32 | t.dwLowDateTime as u64
-}
-
-pub fn annee_courante() -> u32 {
-    let mut st = SYSTEMTIME::default();
-    let f = maintenant();
-    let ft = FILETIME { dwLowDateTime: f as u32, dwHighDateTime: (f >> 32) as u32 };
-    unsafe {
-        let _ = FileTimeToSystemTime(&ft, &mut st);
-    }
-    st.wYear as u32
 }
 
 /// FILETIME (UTC) d'une date donnée en heure locale

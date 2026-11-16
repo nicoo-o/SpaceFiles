@@ -154,6 +154,10 @@ pub(crate) fn terminal_externe(f: &mut Fenetre) {
 /// Exécute une commande (palette ou raccourci)
 pub(crate) unsafe fn executer(hwnd: HWND, f: &mut Fenetre, c: Commande) {
     // Sauvegarde NAS et MTP : fermés tant que `experimental` est faux, même par un raccourci choisi dans les réglages
+    if !crate::profil::commande_visible(crate::profil::actuel(), c) {
+        f.app.annoncer("FONCTION DU MODE EXPERT : CTRL+MAJ+E POUR Y PASSER", true);
+        return;
+    }
     if !palette::commande_permise(reglages::experimental(), c) {
         f.app.annoncer(reglages::MESSAGE_EXPERIMENTAL, true);
         return;
@@ -384,7 +388,7 @@ pub(crate) unsafe fn executer(hwnd: HWND, f: &mut Fenetre, c: Commande) {
             } else if envoyer_onglets(hwnd, &dossiers) {
                 let _ = PostMessageW(hwnd, WM_CLOSE, WPARAM(0), LPARAM(0));
             } else {
-                f.app.annoncer("AUCUNE AUTRE FENETRE SPACEFILES", true);
+                f.app.annoncer("RATTACHEMENT REFUSE (AUCUNE AUTRE FENETRE LIBRE)", true);
             }
         }
         Commande::SauvegardeDestination => {
@@ -495,6 +499,8 @@ pub(crate) unsafe fn executer(hwnd: HWND, f: &mut Fenetre, c: Commande) {
             if let Ok(exe) = std::env::current_exe() {
                 let exe = HSTRING::from(exe.as_os_str());
                 let args = HSTRING::from(format!("\"{dossier}\""));
+                // La demande d'élévation attend la réponse de l'utilisateur avec cette fenêtre pour propriétaire : voir `GardeModale`
+                let _garde = crate::fenetre::GardeModale::nouvelle(hwnd);
                 ShellExecuteW(hwnd, w!("runas"), &exe, &args, windows::core::PCWSTR::null(), SW_SHOWNORMAL);
             }
         }
@@ -548,6 +554,24 @@ pub(crate) unsafe fn executer(hwnd: HWND, f: &mut Fenetre, c: Commande) {
         Commande::Actualiser => f.app.charger(hwnd),
         Commande::Annuler => f.app.annuler_derniere(hwnd),
         Commande::Refaire => f.app.refaire(hwnd),
+        Commande::BasculerProfil => {
+            let nouveau = crate::profil::actuel().autre();
+            reglages::modifier(|r| r.profil = nouveau);
+            // Le double panneau n'existe pas en Simple : on le ferme pour ne pas laisser un volet sans commande
+            if nouveau == crate::profil::Profil::Simple && f.second.is_some() {
+                f.double_panneau(hwnd);
+            }
+            // Le tiroir Historique n'a plus de commande pour s'ouvrir ni se fermer en Simple : on le rentre
+            if nouveau == crate::profil::Profil::Simple && f.historique {
+                menus::basculer_historique(hwnd, f);
+            }
+            f.app.annoncer(if nouveau == crate::profil::Profil::Simple { "MODE SIMPLE" } else { "MODE EXPERT" }, false);
+        }
+        Commande::OuvrirDestination => {
+            if !f.ouvrir_destination(hwnd) {
+                f.app.annoncer("AUCUN DOSSIER À OUVRIR", false);
+            }
+        }
         Commande::Sons => {
             let actifs = !sons::ACTIFS.load(Ordering::Relaxed);
             reglages::modifier(|r| r.sons = actifs);

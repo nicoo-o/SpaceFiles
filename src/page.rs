@@ -91,6 +91,8 @@ pub enum Element {
     Essentiel,
     /// Interrupteur des fonctions expérimentales (SFTP, WebDAV, sauvegarde NAS, MTP)
     Experimental,
+    /// Profil Simple ou Expert (Ctrl+Maj+E) : Simple ne montre que les actions de base
+    Profil,
 }
 
 impl Element {
@@ -126,7 +128,7 @@ impl Element {
             Element::UnClic => Icone::Raccourci,
             Element::ConflitDefaut => Icone::Document,
             Element::CopieVerifiee | Element::DisqueIndexe(_) | Element::EffacerIndex => Icone::Disque,
-            Element::Experimental | Element::Version => Icone::Code,
+            Element::Experimental | Element::Version | Element::Profil => Icone::Code,
             Element::TelechargementsNavigateur | Element::Importer => Icone::Telechargement,
             Element::NettoyerArchives | Element::Exporter => Icone::Archive,
             Element::Animations => Icone::Video,
@@ -326,6 +328,7 @@ pub fn lignes(r: &Reglages, detectes: &[Lieu], ajoutes: &[Lieu], par_defaut: boo
     l(Element::CopieVerifiee, "Copie vérifiée", "Vers un NAS, un partage ou une clé : compare chaque fichier à l'original (SHA-256) après la copie.", oui(r.copie_verifiee));
     let limite = if r.limite_reseau_mo == 0 { "Sans limite".to_string() } else { format!("{} Mo/s", r.limite_reseau_mo) };
     l(Element::LimiteReseau, "Vitesse des copies réseau", "Copies vers ou depuis un NAS : laisse de la bande passante au reste.", Valeur::Choix(limite));
+    l(Element::Profil, "Profil", "Simple : actions de base seulement. Expert : tout (double panneau, marques, historique…). Ctrl+Maj+E bascule.", Valeur::Choix(if r.profil == crate::profil::Profil::Simple { "Simple" } else { "Expert" }.into()));
     l(Element::Experimental, "Fonctions expérimentales", "SFTP, WebDAV, sauvegarde NAS, MTP : peu testés.", oui(r.experimental));
 
     l(Element::Section(CATEGORIES[6]), "", "", Valeur::Rien);
@@ -370,7 +373,7 @@ pub fn lignes(r: &Reglages, detectes: &[Lieu], ajoutes: &[Lieu], par_defaut: boo
     }
     // Une touche peut servir deux commandes selon le mode (F5 : actualiser en simple panneau, copier en double) : les deux
     // lignes restent, chacune avec son libellé
-    for (i, c) in crate::palette::COMMANDES.iter().enumerate().filter(|(i, _)| crate::palette::a_une_touche(*i)) {
+    for (i, c) in crate::palette::COMMANDES.iter().enumerate().filter(|(i, c)| crate::palette::a_une_touche(*i) && crate::profil::commande_visible(r.profil, c.0)) {
         let touche = crate::palette::touche_effective(i, &r.raccourcis);
         let modifiee = touche != c.2;
         let texte = if modifiee { format!("{} · modifiée", touche_lisible(&touche)) } else { touche_lisible(&touche) };
@@ -758,7 +761,7 @@ mod tests {
             Depart | RestaurerOnglets | ParDefaut | WinE => 2,
             VoletDense | Arbre | SectionVolet(_) | Epingle(_) => 3,
             Extensions | VueDefaut | Caches | Essentiel | DatesRelatives | EtatCloud | Apercu | ApercuSysteme => 4,
-            UnClic | Ressort | ConflitDefaut | CopieVerifiee | LimiteReseau | Experimental => 5,
+            UnClic | Ressort | ConflitDefaut | CopieVerifiee | LimiteReseau | Experimental | Profil => 5,
             TelechargementsNavigateur | NettoyageJours | NettoyerCopies | NettoyerArchives | RangerAuto | Regle(_) => 6,
             DisqueIndexe(_) | Exclu(_) | Reconstruire => 7,
             RetenirRecents | EffacerRecents | EffacerIndex => 8,

@@ -6,7 +6,7 @@
 // décide, dans son propre processus, s'il s'agit d'un dossier (ouvert) ou d'autre chose (dossier parent, élément choisi).
 // « Ouvert » veut dire « la demande est en file », pas « la fenêtre est affichée ». Avec `reuse`, le fil de lancement
 // essaie d'abord de confier le chemin à une fenêtre déjà ouverte (`reutiliser.rs`) et ne lance une nouvelle fenêtre que
-// si aucune ne convient, la refuse ou ne répond pas.
+// si aucune ne convient, la refuse, ne répond pas, ou n'a pas confirmé l'ouverture réelle de l'onglet (R35).
 
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -190,7 +190,7 @@ impl Ouvreur {
 }
 
 /// Le fil de lancement : une demande après l'autre. Il vit tant que l'`Ouvreur` existe (l'envoi fermé le fait sortir).
-/// Une demande `reuse` essaie d'abord une fenêtre ouverte (au plus 2 s d'attente) ; si elle ne l'accepte pas, la demande
+/// Une demande `reuse` essaie d'abord une fenêtre ouverte (au plus 2 s pour la réponse, puis 4 s pour la confirmation de l'ouverture) ; si elle ne l'accepte pas, la demande
 /// est lancée comme n'importe quelle autre : `reuse` ne perd jamais une ouverture.
 fn boucle_de_lancement(reception: Receiver<Demande>, lancer: Lanceur, reutiliser: Reutilisateur) {
     use windows::Win32::System::Com::{CoInitializeEx, CoUninitialize, COINIT_APARTMENTTHREADED, COINIT_DISABLE_OLE1DDE};

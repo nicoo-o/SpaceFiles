@@ -242,6 +242,49 @@ unsafe fn echouer(parent: HWND, raison: String) -> windows::core::Result<()> {
     Ok(())
 }
 
+/// Vrai pour `file:///chemin` **local** : trois barres puis un chemin qui ne commence pas lui-même par une barre.
+/// `file://hote/partage` (hôte), `file:////hote/partage` et `file:///\\hote\partage` (trois ou quatre barres, mais Windows y lit
+/// le partage `\\hote\partage`) ouvriraient un chemin réseau et enverraient une authentification NTLM à un hôte inconnu :
+/// refusés. Le contrôle écrit `\` comme `/` pour le schéma `file`, d'où la normalisation ; `%2F` et `%5C` en tête sont refusés
+/// par prudence. Tout ce qui n'est pas reconnu est refusé (le doute profite au refus).
+fn fichier_local(uri: &str) -> bool {
+    let u = uri.replace('\\', "/").to_ascii_lowercase();
+    match u.strip_prefix("file:///") {
+        Some(reste) => !(reste.starts_with('/') || reste.starts_with("%2f") || reste.starts_with("%5c")),
+        None => false,
+    }
+}
+
+/// Navigation de la page : seulement un fichier local (un lien vers un autre fichier de l'ordinateur) ou `about:blank`
+fn navigation_permise(uri: &str) -> bool {
+    fichier_local(uri) || uri.eq_ignore_ascii_case("about:blank")
+}
+
+/// Ressource demandée par la page (image, feuille de style, cadre…) : un fichier local, ou un contenu qui ne sort pas du
+/// document (`data:`, `blob:`, `about:`). http(s), ftp, `ws:`, `javascript:`, hôte réseau, tout le reste : refusé.
+fn ressource_permise(uri: &str) -> bool {
+    let u = uri.to_ascii_lowercase();
+    fichier_local(uri) || u.starts_with("data:") || u.starts_with("blob:") || u.starts_with("about:")
+}
+
+/// Chemin d'un partage réseau (`\\serveur\partage\…`, `\\?\UNC\…`, `//serveur/…`) : jamais confié au contrôle, qui refuse
+/// de toute façon les ressources réseau (le document lui-même serait refusé). Un lecteur réseau monté en `Z:` n'est pas
+/// reconnu ici : son chemin est local pour Windows, et le partage est celui que l'auteur a lui-même choisi d'ouvrir.
+pub fn chemin_reseau(chemin: &str) -> bool {
+    let c = chemin.replace('/', "\\");
+    if !c.starts_with("\\\\") {
+        return false;
+    }
+    // `\\?\C:\…` et `\\.\C:\…` : chemins locaux au préfixe long ; `\\?\UNC\…` : réseau
+    for prefixe in ["\\\\?\\", "\\\\.\\"] {
+        if let Some(reste) = c.strip_prefix(prefixe) {
+            let r = reste.as_bytes();
+            return !(r.len() >= 2 && r[0].is_ascii_alphabetic() && r[1] == b':');
+        }
+    }
+    true
+}
+
 /// Réglages de sécurité du contrôle et transmission des touches d'aperçu à la fenêtre principale
 unsafe fn configurer(parent: HWND, c: &ICoreWebView2Controller, env: &ICoreWebView2Environment) -> windows::core::Result<()> {
     let w = c.CoreWebView2()?;
@@ -261,11 +304,8 @@ unsafe fn configurer(parent: HWND, c: &ICoreWebView2Controller, env: &ICoreWebVi
     let nav = NavigationStartingEventHandler::create(Box::new(|_, args| {
         if let Some(args) = args {
             let mut uri = PWSTR::null();
-            if args.Uri(&mut uri).is_ok() {
-                let uri = take_pwstr(uri).to_ascii_lowercase();
-                if !(uri.starts_with("file:") || uri.starts_with("about:blank")) {
-                    args.SetCancel(true)?;
-                }
+            if args.Uri(&mut uri).is_ok() && !navigation_permise(&take_pwstr(uri)) {
+                args.SetCancel(true)?;
             }
         }
         Ok(())
@@ -296,9 +336,7 @@ unsafe fn configurer(parent: HWND, c: &ICoreWebView2Controller, env: &ICoreWebVi
         if let Some(args) = args {
             let mut uri = PWSTR::null();
             args.Request()?.Uri(&mut uri)?;
-            let uri = take_pwstr(uri).to_ascii_lowercase();
-            // « file:/// » (chemin local) passe ; « file://hote/ » (partage réseau), http(s), ftp… sont refusés
-            if !(uri.starts_with("file:///") || uri.starts_with("data:") || uri.starts_with("about:") || uri.starts_with("blob:")) {
+            if !ressource_permise(&take_pwstr(uri)) {
                 let refus = env.CreateWebResourceResponse(None::<&windows::Win32::System::Com::IStream>, 403, &HSTRING::from("Refusé"), &HSTRING::new())?;
                 args.SetResponse(&refus)?;
             }
@@ -346,6 +384,102 @@ mod tests {
     #[test]
     fn url_de_partage_reseau() {
         assert_eq!(url_fichier(r"\\nas\docs\a#1.html"), "file://nas/docs/a%231.html");
+    }
+
+    #[test]
+    fn fichiers_locaux_permis() {
+        for u in [
+            "file:///C:/Dossier/page.html",
+            "file:///c:/dossier/page%20x.html",
+            "FILE:///C:/A/b.html",
+            "file:///C:\\A\\b.html",
+            "file:///D:/a#ancre",
+            "file:///C:/%C3%A9t%C3%A9/a.htm",
+        ] {
+            assert!(navigation_permise(u) && ressource_permise(u), "doit passer : {u}");
+        }
+    }
+
+    #[test]
+    fn chemins_reseau_refuses_sous_toutes_les_ecritures() {
+        for u in [
+            "file://hote/partage/x.png",
+            "file://HOTE/partage/x.png",
+            "file:////hote/partage/x.png",
+            "file://///hote/partage/x.png",
+            "file:///\\\\hote\\partage\\x.png",
+            "file:///\\hote\\partage",
+            "file:///%5C%5Chote/x",
+            "file:///%5chote/x",
+            "file:///%2f%2fhote/x",
+            "file:///%2Fhote/x",
+            "file:\\\\hote\\partage",
+            "file:/hote/x",
+            "file://localhost/C:/x.png",
+            "file://127.0.0.1/c$/x.png",
+            "file:",
+            "file://",
+        ] {
+            assert!(!navigation_permise(u), "navigation refusée : {u}");
+            assert!(!ressource_permise(u), "ressource refusée : {u}");
+        }
+    }
+
+    #[test]
+    fn schemas_inattendus_refuses() {
+        for u in [
+            "http://exemple.fr/x.png",
+            "HTTPS://exemple.fr/",
+            "ftp://hote/x",
+            "ws://hote/",
+            "wss://hote/",
+            "javascript:alert(1)",
+            "ms-appx:///x",
+            "ms-appx-web:///x",
+            "edge://settings",
+            "chrome://version",
+            "view-source:file:///C:/a.html",
+            "filesystem:file:///C:/a.html",
+            "search-ms:query=a",
+            "mailto:a@b.fr",
+            "\\\\hote\\partage\\x.png",
+            "C:\\a\\b.html",
+            "//hote/x",
+            "",
+            " file:///C:/a.html",
+        ] {
+            assert!(!navigation_permise(u), "navigation refusée : {u:?}");
+            assert!(!ressource_permise(u), "ressource refusée : {u:?}");
+        }
+    }
+
+    #[test]
+    fn contenu_du_document_seulement() {
+        // La navigation n'accepte que fichier local et about:blank ; la page peut en plus charger data:, blob:, about:
+        assert!(navigation_permise("about:blank") && navigation_permise("ABOUT:BLANK"));
+        assert!(!navigation_permise("about:srcdoc") && !navigation_permise("data:text/html,x") && !navigation_permise("blob:null/1"));
+        for u in ["data:image/png;base64,AAAA", "DATA:text/css,a{}", "blob:file:///C:/x", "about:blank", "about:srcdoc"] {
+            assert!(ressource_permise(u), "ressource permise : {u}");
+        }
+    }
+
+    #[test]
+    fn urls_fabriquees_par_url_fichier() {
+        // Ce que `appliquer` envoie au contrôle : local passe, réseau est refusé, même avec les préfixes longs
+        assert!(navigation_permise(&url_fichier(r"C:\a\b.html")));
+        assert!(navigation_permise(&url_fichier(r"\\?\C:\a\b.html")));
+        assert!(!navigation_permise(&url_fichier(r"\\nas\docs\a.html")));
+        assert!(!navigation_permise(&url_fichier(r"\\?\UNC\nas\docs\a.html")));
+    }
+
+    #[test]
+    fn chemins_reseau_reconnus() {
+        for c in [r"\\nas\docs\a.html", r"\\?\UNC\nas\docs\a.html", "//nas/docs/a.html", r"\\.\UNC\nas\x"] {
+            assert!(chemin_reseau(c), "réseau : {c}");
+        }
+        for c in [r"C:\a\b.html", r"\\?\C:\a\b.html", r"\\.\C:\a", r"\\?\c:\a", "a.html", ""] {
+            assert!(!chemin_reseau(c), "local : {c}");
+        }
     }
 
     #[test]

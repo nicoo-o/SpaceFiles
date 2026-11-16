@@ -58,6 +58,7 @@ mod page;
 mod palette;
 mod pastilles;
 mod pixel;
+mod profil;
 mod raccourci;
 mod service_recherche;
 mod reglages;

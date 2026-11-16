@@ -3,6 +3,11 @@
 use crate::*;
 pub(crate) extern "system" fn procedure(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     unsafe {
+        // Une boucle modale (menu du Shell, glisser, « Ouvrir avec… ») distribue nos messages pendant que son appelant peut tenir
+        // `&mut Fenetre` : ceux qui prennent l'état attendent ici, avant tout `etat_de` (voir `retenir_si_modale`)
+        if let Some(r) = retenir_si_modale(hwnd, msg, wparam, lparam) {
+            return r;
+        }
         match msg {
             WM_NCCREATE => {
                 let cs = &*(lparam.0 as *const CREATESTRUCTW);
@@ -141,10 +146,6 @@ pub(crate) extern "system" fn procedure(hwnd: HWND, msg: u32, wparam: WPARAM, lp
             // La compression lancée par la palette a fini : message à part de WM_OUTIL, pour qu'une autre tâche (empreinte, OCR…) qui
             // finit pendant ce temps ne passe pas pour la sienne
             WM_PALETTE_TACHE => {
-                // Pendant une modale l'appelant tient `&mut Fenetre` : la réponse est gardée et reposte à sa fin
-                if retenir_palette(msg, lparam) {
-                    return LRESULT(0);
-                }
                 let r = Box::from_raw(lparam.0 as *mut Fini);
                 if let Some(f) = etat_de(hwnd) {
                     f.app.annoncer(r.message.clone(), r.erreur);
@@ -213,11 +214,6 @@ pub(crate) extern "system" fn procedure(hwnd: HWND, msg: u32, wparam: WPARAM, lp
             // la lecture se fait dans `navigateur`, jamais de disque ici). Pixel et la grille suivent ; une marque NOUVEAU
             // changée repeint la liste, sinon seule la bande des pastilles.
             navigateur::WM_TELECHARGEMENT => {
-                // Pendant une boucle modale (menu du Shell, glisser, boîte de choix) l'appelant tient `&mut Fenetre` : on ne le
-                // reprend pas, le message est retenu et reposté à la fin de la modale (`GardeModale`)
-                if retenir_telechargement() {
-                    return LRESULT(0);
-                }
                 if let Some(f) = etat_de(hwnd) {
                     regler_activite(hwnd, f);
                     if navigateur::marques_modifiees() {
@@ -238,9 +234,6 @@ pub(crate) extern "system" fn procedure(hwnd: HWND, msg: u32, wparam: WPARAM, lp
             }
 
             WM_PALETTE_RECHERCHE => {
-                if retenir_palette(msg, lparam) {
-                    return LRESULT(0);
-                }
                 let b = Box::from_raw(lparam.0 as *mut (String, Option<Vec<palette::Trouve>>));
                 if let Some(f) = etat_de(hwnd) {
                     let (requete, trouves) = *b;
@@ -251,9 +244,6 @@ pub(crate) extern "system" fn procedure(hwnd: HWND, msg: u32, wparam: WPARAM, lp
             }
 
             WM_PALETTE_LECTURE => {
-                if retenir_palette(msg, lparam) {
-                    return LRESULT(0);
-                }
                 let b = Box::from_raw(lparam.0 as *mut assistant::Lecture);
                 if let Some(f) = etat_de(hwnd) {
                     recevoir_lecture(hwnd, f, *b);
@@ -691,15 +681,19 @@ pub(crate) extern "system" fn procedure(hwnd: HWND, msg: u32, wparam: WPARAM, lp
                     // Glisser : vers une autre application ou un dossier de la liste
                     if let Cible::Ligne(i) = cible {
                         if f.app.marques.contains(&i) {
+                            // `UpdateWindow` envoie WM_PAINT en synchrone et `DragDetect` laisse passer les messages envoyés par un
+                            // autre processus (WM_COPYDATA…) : ces deux appels rentrent dans la procédure, qui reprend `etat_de`.
+                            // `f` n'est donc plus lu après eux ; tout ce qu'il faut est lu avant, l'état est repris après.
+                            let chemins = f.app.chemins_choisis();
                             let _ = UpdateWindow(hwnd);
                             let mut pt = POINT { x: x_lparam(lparam), y: y_lparam(lparam) };
                             let _ = ClientToScreen(hwnd, &mut pt);
-                            if DragDetect(hwnd, pt).as_bool() {
-                                let chemins = f.app.chemins_choisis();
+                            let glisse = DragDetect(hwnd, pt).as_bool();
+                            if glisse {
                                 if !chemins.is_empty() {
                                     let _ = coquille::glisser(hwnd, &chemins);
                                 }
-                            } else {
+                            } else if let Some(f) = etat_de(hwnd) {
                                 if let Some(i) = differe {
                                     f.app.choisir_seul(i);
                                 }
@@ -1078,20 +1072,27 @@ pub(crate) extern "system" fn procedure(hwnd: HWND, msg: u32, wparam: WPARAM, lp
             WM_TIMER if wparam.0 == MINUTERIE_PALETTE_LANCE => minuteries::timer_lancement_palette(hwnd),
 
             // Windows s'arrête : la session s'écrit tout de suite, sans attendre la minuterie
+            // Réponse synchrone, donc non retenable : pendant une modale (qui tient `&mut Fenetre`) l'état n'est pas lu, la session
+            // écrite par la minuterie reste celle de la dernière sauvegarde
             WM_QUERYENDSESSION => {
-                if let Some(f) = etat_de(hwnd) {
-                    sauver_session(f);
+                if !modale_en_cours() {
+                    if let Some(f) = etat_de(hwnd) {
+                        sauver_session(f);
+                    }
                 }
                 LRESULT(1)
             }
 
-            // Arrêt confirmé : la session est enregistrée proprement, le marqueur part (le processus peut être tué sans WM_DESTROY)
+            // Arrêt confirmé : la session est enregistrée proprement, le marqueur part (le processus peut être tué sans WM_DESTROY).
+            // Le marqueur part dans tous les cas : il ne dépend pas de l'état de la fenêtre
             WM_ENDSESSION => {
                 if wparam.0 != 0 {
-                    if let Some(f) = etat_de(hwnd) {
-                        sauver_session(f);
-                        lever_marqueur();
+                    if !modale_en_cours() {
+                        if let Some(f) = etat_de(hwnd) {
+                            sauver_session(f);
+                        }
                     }
+                    lever_marqueur();
                 }
                 LRESULT(0)
             }
@@ -1356,6 +1357,7 @@ pub(crate) extern "system" fn procedure(hwnd: HWND, msg: u32, wparam: WPARAM, lp
                     VK_3 if alt && !ctrl && !maj => Some(Commande::Etiquette3),
                     VK_G if ctrl && !alt => Some(Commande::NouveauGroupe),
                     VK_A if ctrl && maj => Some(Commande::Administrateur),
+                    VK_O if ctrl && maj && !alt => Some(Commande::OuvrirDestination),
                     _ => None,
                 };
                 if let Some(c) = commande.filter(|_| f.app.edition.is_none()) {
@@ -1569,11 +1571,19 @@ pub(crate) extern "system" fn procedure(hwnd: HWND, msg: u32, wparam: WPARAM, lp
             }
 
             WM_DPICHANGED => {
+                // Pendant une modale ce bras n'est pas atteint : `retenir_si_modale` replace la fenêtre et laisse `WM_APPARENCE`
+                // appliquer l'échelle (voir `ECHELLE_EN_ATTENTE`)
+                // Un message forgé par un autre processus peut porter un pointeur nul (`panic = abort`) : écarté en entier, comme
+                // dans le bras des modales (`mod.rs`), sans quoi un `wparam` nul poserait un DPI de 0
+                if lparam.0 == 0 {
+                    return LRESULT(0);
+                }
                 if let Some(f) = etat_de(hwnd) {
                     f.dpi = if dpi_force().is_some() { dpi_de(hwnd) } else { (wparam.0 & 0xFFFF) as u32 } as f32;
                     f.rendu.changer_dpi();
                     // Les coordonnées du pointeur sont en DIP d'une échelle qui change : le reflet attend le prochain WM_MOUSEMOVE
                     f.pointeur = None;
+                    // SAFETY: pour WM_DPICHANGED, `lparam` pointe sur un RECT valable pendant l'appel (contrat de Windows)
                     let r = &*(lparam.0 as *const RECT);
                     let _ = SetWindowPos(hwnd, None, r.left, r.top, r.right - r.left, r.bottom - r.top, SWP_NOZORDER | SWP_NOACTIVATE);
                 }
@@ -1593,6 +1603,13 @@ pub(crate) extern "system" fn procedure(hwnd: HWND, msg: u32, wparam: WPARAM, lp
                 rafraichir_apparence(hwnd);
                 // Activité, réduction, mouvement réduit (Windows, shared.json) : relus ici, hors de tout traitement qui tient `f`
                 if let Some(f) = etat_de(hwnd) {
+                    // Changement d'échelle reçu pendant une modale : la fenêtre a déjà été replacée, l'état le rattrape ici
+                    if ECHELLE_EN_ATTENTE.swap(false, std::sync::atomic::Ordering::SeqCst) {
+                        f.dpi = dpi_de(hwnd) as f32;
+                        f.rendu.changer_dpi();
+                        f.pointeur = None;
+                        let _ = InvalidateRect(hwnd, None, false);
+                    }
                     f.active = GetActiveWindow() == hwnd;
                     f.reduite = IsIconic(hwnd).as_bool();
                     // Mouvement réduit changé (Windows, shared.json) : le halo apparaît ou disparaît sans attendre la souris
@@ -1632,7 +1649,8 @@ pub(crate) extern "system" fn procedure(hwnd: HWND, msg: u32, wparam: WPARAM, lp
             // Alt relâché seul : pas de « mode menu » (il n'y a pas de barre de menus et il avalerait les touches suivantes)
             WM_SYSCOMMAND if (wparam.0 & 0xFFF0) as u32 == SC_KEYMENU && lparam.0 == 0 => LRESULT(0),
 
-            // Onglets envoyés par une autre fenêtre (RATTACHER) : chacun s'ouvre ici s'il est un dossier qui existe
+            // Onglets envoyés par une autre fenêtre (RATTACHER) : la charge est relue ici, les dossiers sont vérifiés par un fil
+            // court (jamais d'accès disque ni réseau dans ce gestionnaire), puis WM_ONGLETS_COPIES les ouvre
             WM_COPYDATA => {
                 if lparam.0 == 0 {
                     return LRESULT(0);
@@ -1650,27 +1668,39 @@ pub(crate) extern "system" fn procedure(hwnd: HWND, msg: u32, wparam: WPARAM, lp
                 if modale_en_cours() {
                     return LRESULT(0);
                 }
-                // SAFETY: l'expéditeur garantit cbData octets lisibles pendant l'appel (contrat de WM_COPYDATA)
-                let u = std::slice::from_raw_parts(cd.lpData as *const u16, cd.cbData as usize / 2);
-                let Some(f) = etat_de(hwnd) else { return LRESULT(0) };
-                for chemin in String::from_utf16_lossy(u).lines().filter(|c| std::path::Path::new(c).is_dir()).take(50) {
-                    f.nouvel_onglet(hwnd, Emplacement::dossier(chemin));
+                // 1 = charge valide et vérification lancée, 0 = refusée (l'expéditeur garde ses onglets)
+                LRESULT(recevoir_onglets_copies(hwnd, cd) as isize)
+            }
+
+            // Fin de la vérification des dossiers de `recevoir_onglets_copies` : un onglet par dossier, sur le fil d'interface
+            WM_ONGLETS_COPIES => {
+                // Aucun pointeur : un message forgé ne fait que vider la file plus tôt
+                let dossiers = prendre_onglets_recus(hwnd.0 as isize);
+                if !dossiers.is_empty() {
+                    if let Some(f) = etat_de(hwnd) {
+                        ouvrir_onglets_copies(hwnd, f, dossiers);
+                    }
                 }
-                let _ = InvalidateRect(hwnd, None, false);
-                LRESULT(1)
+                LRESULT(0)
             }
 
             // Fin de la consultation du disque de `recevoir_ouvrir_ici` : l'onglet s'ouvre ici, sur le fil d'interface
             WM_OUVRIR_ICI => {
-                // Pendant une modale le résultat reste déposé ; le message revient à sa fin
-                if retenir_ouvrir_ici() {
-                    return LRESULT(0);
-                }
                 // Aucun pointeur dans ce message : un message forgé ne fait que vider la file plus tôt (voir `OUVERTURES`)
                 let a_ouvrir = eco::reutiliser::vider(&OUVERTURES, hwnd.0 as isize);
                 if let Some(f) = etat_de(hwnd) {
-                    for o in a_ouvrir {
-                        ouvrir_ici(hwnd, f, o);
+                    for (dossier, nom, tick) in a_ouvrir {
+                        // Le résident attend une confirmation (voir `reutiliser::confirmer`) : trop tard, il s'est replié sur
+                        // une nouvelle fenêtre et ouvrir ici aussi donnerait deux ouvertures
+                        if eco::reutiliser::trop_tard_pour_ouvrir(tick, eco::reutiliser::maintenant_ms()) {
+                            continue;
+                        }
+                        // L'événement s'ouvre AVANT : absent ou refusé, le résident ne l'attend plus (ou ne peut pas être
+                        // prévenu) et ouvre sa propre fenêtre : ouvrir ici donnerait deux ouvertures
+                        let Some(confirmation) = eco::reutiliser::ouvrir_confirmation(tick) else { continue };
+                        ouvrir_ici(hwnd, f, (dossier, nom));
+                        // Seulement APRÈS l'ouverture réelle de l'onglet : « acceptée » ne suffit pas au résident
+                        confirmation.lever();
                     }
                 }
                 LRESULT(0)
@@ -1684,12 +1714,10 @@ pub(crate) extern "system" fn procedure(hwnd: HWND, msg: u32, wparam: WPARAM, lp
 
             accessibilite::WM_UIA_ACTION => {
                 // Action d'un lecteur d'écran (motifs Selection et Invoke), postée par le fil de UI Automation
-                let Some((action, k, nom)) = accessibilite::prendre_action() else { return LRESULT(0) };
-                // Une modale tient `&mut Fenetre` en dessous de nous : on n'y touche pas
-                if modale_en_cours() {
-                    return LRESULT(0);
-                }
-                if let Some(f) = etat_de(hwnd) {
+                // Retenu pendant une modale (il n'arrive donc ici qu'une fois l'état libre). Un message retenu en double ne compte
+                // qu'une fois (voir `FileRetenue`) : la file d'actions se vide donc en boucle, sans en laisser
+                while let Some((action, k, nom)) = accessibilite::prendre_action() {
+                    let Some(f) = etat_de(hwnd) else { break };
                     // Sur la page des réglages la liste du dossier n'est pas affichée ; la ligne doit porter encore le nom que le lecteur a lu
                     if f.page_lue().is_none() && f.app.entrees.get(k).is_some_and(|e| e.nom == nom) {
                         match action {
@@ -1712,6 +1740,15 @@ pub(crate) extern "system" fn procedure(hwnd: HWND, msg: u32, wparam: WPARAM, lp
                         let _ = InvalidateRect(hwnd, None, false);
                     }
                 }
+                // Boutons des pastilles (Invoke) : retrouvés par clé et libellé, jamais par rang
+                while let Some((cle, libelle, occurrence, bouton)) = accessibilite::prendre_action_pastille() {
+                    let Some(f) = etat_de(hwnd) else { break };
+                    // Refusée (pastille disparue, modale ouverte) : le lecteur d'écran a déjà reçu « fait », la barre d'état le dit
+                    if !f.bouton_pastille_uia(hwnd, cle, &libelle, occurrence, bouton) {
+                        f.app.annoncer("ACTION IMPOSSIBLE", false);
+                    }
+                    let _ = InvalidateRect(hwnd, None, false);
+                }
                 LRESULT(0)
             }
 
@@ -1719,7 +1756,8 @@ pub(crate) extern "system" fn procedure(hwnd: HWND, msg: u32, wparam: WPARAM, lp
                 Some(r) => {
                     // Premier lecteur d'écran : l'instantané n'existait pas, il se remplit tout de suite puis à chaque dessin
                     if let Some(f) = etat_de(hwnd) {
-                        let noms: Vec<String> = f.pastilles().iter().map(|(p, _)| p.nom_accessible()).collect();
+                        let noms = accessibilite::PastilleLue::lues(f.pastilles().iter().map(|(p, _)| p));
+                        accessibilite::pastilles_cachees(f.modale());
                         let lue = f.page_lue();
                         accessibilite::maj(hwnd, &f.app, &noms, lue.as_ref(), f.geo_accessible(hwnd));
                     }
@@ -1766,7 +1804,8 @@ pub(crate) extern "system" fn procedure(hwnd: HWND, msg: u32, wparam: WPARAM, lp
                         f.pastille_fixee = None;
                     }
                     let pastille_ouverte = f.pastille_ouverte(liste_pastilles.len());
-                    let noms: Vec<String> = liste_pastilles.iter().map(|p| p.nom_accessible()).collect();
+                    let noms = accessibilite::PastilleLue::lues(&liste_pastilles);
+                    accessibilite::pastilles_cachees(f.modale());
                     let lue = f.page_lue();
                     accessibilite::maj(hwnd, &f.app, &noms, lue.as_ref(), f.geo_accessible(hwnd));
                     let (l, h) = taille_client(hwnd);
@@ -1947,6 +1986,8 @@ pub(crate) extern "system" fn procedure(hwnd: HWND, msg: u32, wparam: WPARAM, lp
             }
 
             WM_DESTROY => {
+                // Une ouverture déposée juste avant la destruction ne doit pas occuper la file (16 places, toutes fenêtres)
+                eco::reutiliser::vider(&OUVERTURES, hwnd.0 as isize);
                 // Le contrôle WebView2 se ferme avec la fenêtre vivante, pas au destructeur du fil (après la boucle de messages)
                 crate::webvue::fermer(hwnd);
                 crate::hote_apercu::fermer();
@@ -1957,7 +1998,11 @@ pub(crate) extern "system" fn procedure(hwnd: HWND, msg: u32, wparam: WPARAM, lp
                 // cours peut finir, son résultat est jeté par la génération)
                 navigateur::arreter();
                 // Session : onglets ouverts et dernier dossier, pour la prochaine ouverture
-                if let Some(f) = etat_de(hwnd) {
+                // Défense : WM_CLOSE est retenu pendant une modale, donc on n'arrive ici sous une modale que par un DestroyWindow
+                // venu d'ailleurs. L'appelant de la modale tient encore `&mut Fenetre` : on n'y touche pas et on ne la libère pas
+                // (fuite voulue, le processus s'arrête avec la fenêtre)
+                let sous_modale = modale_en_cours();
+                if let Some(f) = if sous_modale { None } else { etat_de(hwnd) } {
                     fermer_formulaire(f);
                     sauver_session(f);
                     // Fenêtre détruite en pleine animation : le fil de synchronisation sur l'écran s'arrête
@@ -1965,13 +2010,15 @@ pub(crate) extern "system" fn procedure(hwnd: HWND, msg: u32, wparam: WPARAM, lp
                         arret.store(true, std::sync::atomic::Ordering::Release);
                     }
                     // Fermeture normale : le marqueur part avec la dernière fenêtre principale
-                    lever_marqueur();
                 }
+                lever_marqueur();
                 glyph::progression(hwnd, None);
                 let p = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut Fenetre;
                 if !p.is_null() {
                     SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
-                    drop(Box::from_raw(p));
+                    if !sous_modale {
+                        drop(Box::from_raw(p));
+                    }
                 }
                 PostQuitMessage(0);
                 LRESULT(0)

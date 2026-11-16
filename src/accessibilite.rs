@@ -7,6 +7,7 @@
 // Les constantes de UI Automation gardent leur nom Windows (UIA_NamePropertyId…), même dans les motifs
 #![allow(non_upper_case_globals)]
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 
 use windows::core::{implement, IUnknownImpl, Interface, Result, BSTR, VARIANT};
@@ -27,7 +28,87 @@ pub const ACTION_OUVRIR: usize = 3;
 
 use crate::app::App;
 use crate::icones;
+use crate::pastilles::{self, Bouton, Pastille};
 use crate::systeme;
+
+/// Ce qu'un lecteur d'écran sait d'une pastille : son nom lu, ses boutons nommés, et de quoi la reconnaître d'un dessin à
+/// l'autre (clé + libellé) et repérer un changement d'état sans réagir à chaque pour cent d'avancement.
+#[derive(Clone, Default, PartialEq, Debug)]
+pub struct PastilleLue {
+    pub nom: String,
+    pub cle: u64,
+    pub libelle: String,
+    /// Rang parmi les pastilles de même clé et de même libellé (les fins et erreurs portent la clé 0 : deux onglets qui finissent
+    /// « COPIE · 3 ÉLÉMENTS » ne se distinguent que par là)
+    pub occurrence: usize,
+    /// État grossier : genre, pause, phase, message. Le pourcentage et les vitesses n'y sont pas (un message par pour cent
+    /// noierait le lecteur d'écran).
+    pub etat: String,
+    /// Boutons visibles de la pastille, avec leur nom lu
+    pub boutons: Vec<(Bouton, String)>,
+}
+
+impl PastilleLue {
+    pub fn depuis(p: &Pastille) -> Self {
+        // Un téléchargement change de mot de droite à chaque tick (taille, vitesse) : seule sa phase compte
+        let mot = if matches!(p.genre, pastilles::Genre::Telechargement(_)) { None } else { p.etiquette.as_deref() };
+        PastilleLue {
+            nom: p.nom_accessible(),
+            cle: p.cle,
+            libelle: p.libelle.clone(),
+            occurrence: 0,
+            etat: format!("{:?}|{}|{:?}|{:?}", p.genre, p.en_pause, mot, p.message),
+            boutons: p.boutons.iter().map(|&b| (b, pastilles::nom_bouton(p, b).to_string())).collect(),
+        }
+    }
+
+    /// Toutes les pastilles de la liste, avec leur rang d'occurrence
+    pub fn lues<'a>(liste: impl IntoIterator<Item = &'a Pastille>) -> Vec<PastilleLue> {
+        let mut v: Vec<PastilleLue> = liste.into_iter().map(PastilleLue::depuis).collect();
+        for k in 0..v.len() {
+            v[k].occurrence = v[..k].iter().filter(|o| o.meme(&v[k])).count();
+        }
+        v
+    }
+
+    /// Même pastille d'un dessin à l'autre ?
+    fn meme(&self, autre: &PastilleLue) -> bool {
+        self.cle == autre.cle && self.libelle == autre.libelle
+    }
+}
+
+/// Ce qui a changé entre deux listes de pastilles : de quoi lever les événements UIA
+#[derive(Default, PartialEq, Debug)]
+struct Changements {
+    /// Rangs (dans la nouvelle liste) des pastilles apparues
+    apparues: Vec<usize>,
+    /// Rangs des pastilles déjà là dont l'état a changé (fini, erreur, pause, phase)
+    changees: Vec<usize>,
+    /// L'ensemble des enfants de la fenêtre n'est plus le même (apparition, disparition, ordre ou boutons)
+    structure: bool,
+}
+
+fn changements(avant: &[PastilleLue], apres: &[PastilleLue]) -> Changements {
+    let mut c = Changements::default();
+    // Chaque ancienne pastille ne sert qu'une fois : deux copies de même nom ne se confondent pas
+    let mut prises = vec![false; avant.len()];
+    for (k, n) in apres.iter().enumerate() {
+        match avant.iter().enumerate().find(|(j, o)| !prises[*j] && o.meme(n)) {
+            None => c.apparues.push(k),
+            Some((j, o)) => {
+                prises[j] = true;
+                if o.etat != n.etat {
+                    c.changees.push(k);
+                }
+            }
+        }
+    }
+    c.structure = !c.apparues.is_empty()
+        || prises.iter().any(|p| !p)
+        || avant.len() != apres.len()
+        || avant.iter().zip(apres).any(|(o, n)| !o.meme(n) || o.boutons != n.boutons);
+    c
+}
 
 /// Plus de lignes que cela : seules les premières sont décrites (un dossier de 50 000 fichiers ne bloque pas le dessin)
 const MAX_LIGNES: usize = 1000;
@@ -42,8 +123,8 @@ struct Instantane {
     /// Lignes sélectionnées (la sélection multiple de la liste)
     choisies: Vec<usize>,
     statut: String,
-    /// Nom lu de chaque pastille d'opération, dans l'ordre d'affichage
-    pastilles: Vec<String>,
+    /// Chaque pastille, dans l'ordre d'affichage (celles que « +N » cache y sont aussi : un lecteur d'écran les atteint)
+    pastilles: Vec<PastilleLue>,
     rect: RECT,
     /// Rectangle écran (pixels) de chaque ligne quand on sait le calculer (vue liste du dossier) ; vide sinon, la ligne prend alors
     /// le rectangle de la fenêtre. Une ligne hors de la zone visible porte un rectangle nul.
@@ -67,6 +148,8 @@ enum Id {
     Ligne(usize),
     Statut,
     Pastille(usize),
+    /// Bouton `j` de la pastille `k` (Pause, Annuler, Destination, Fermer…)
+    Bouton(usize, usize),
 }
 
 #[implement(IRawElementProviderSimple, IRawElementProviderFragment, IRawElementProviderFragmentRoot, ISelectionProvider, ISelectionItemProvider, IInvokeProvider)]
@@ -99,7 +182,7 @@ impl IRawElementProviderSimple_Impl for Fournisseur_Impl {
         match (self.id, motif) {
             (Id::Liste, UIA_SelectionPatternId) => moi.to_interface::<ISelectionProvider>().cast(),
             (Id::Ligne(_), UIA_SelectionItemPatternId) => moi.to_interface::<ISelectionItemProvider>().cast(),
-            (Id::Ligne(_), UIA_InvokePatternId) => moi.to_interface::<IInvokeProvider>().cast(),
+            (Id::Ligne(_) | Id::Bouton(..), UIA_InvokePatternId) => moi.to_interface::<IInvokeProvider>().cast(),
             _ => Err(E_FAIL.into()),
         }
     }
@@ -110,13 +193,17 @@ impl IRawElementProviderSimple_Impl for Fournisseur_Impl {
             Id::Liste => lire(|i| i.dossier.clone()).unwrap_or_default(),
             Id::Ligne(k) => lire(|i| i.lignes.get(k).cloned()).flatten().unwrap_or_default(),
             Id::Statut => lire(|i| i.statut.clone()).unwrap_or_default(),
-            Id::Pastille(k) => lire(|i| i.pastilles.get(k).cloned()).flatten().unwrap_or_default(),
+            Id::Pastille(k) => lire(|i| i.pastilles.get(k).map(|p| p.nom.clone())).flatten().unwrap_or_default(),
+            Id::Bouton(k, j) => lire(|i| i.pastilles.get(k).and_then(|p| p.boutons.get(j)).map(|(_, n)| n.clone())).flatten().unwrap_or_default(),
         };
         let type_ = match self.id {
             Id::Fenetre => UIA_PaneControlTypeId,
             Id::Liste => UIA_ListControlTypeId,
             Id::Ligne(_) => UIA_ListItemControlTypeId,
-            Id::Statut | Id::Pastille(_) => UIA_TextControlTypeId,
+            Id::Statut => UIA_TextControlTypeId,
+            // Une pastille qui porte des boutons est un groupe nommé, pas un simple texte
+            Id::Pastille(_) => UIA_GroupControlTypeId,
+            Id::Bouton(..) => UIA_ButtonControlTypeId,
         };
         Ok(match propriete {
             UIA_NamePropertyId => VARIANT::from(BSTR::from(nom())),
@@ -147,8 +234,15 @@ impl IRawElementProviderFragment_Impl for Fournisseur_Impl {
         let n = nombre();
         let p = nombre_pastilles();
         let autre = |id| Ok(fournisseur(h, id));
-        // Enfants de la fenêtre : la liste, la barre d'état, puis les pastilles
+        // Nombre de boutons de la pastille `k` : ce sont ses enfants
+        let nb = |k: usize| lire(|i| i.pastilles.get(k).map_or(0, |p| p.boutons.len())).unwrap_or(0);
+        // Enfants de la fenêtre : la liste, la barre d'état, puis les pastilles (chacune porte ses boutons)
         match (self.id, direction) {
+            (Id::Pastille(k), NavigateDirection_FirstChild) if nb(k) > 0 => autre(Id::Bouton(k, 0)),
+            (Id::Pastille(k), NavigateDirection_LastChild) if nb(k) > 0 => autre(Id::Bouton(k, nb(k) - 1)),
+            (Id::Bouton(k, _), NavigateDirection_Parent) => autre(Id::Pastille(k)),
+            (Id::Bouton(k, j), NavigateDirection_NextSibling) if j + 1 < nb(k) => autre(Id::Bouton(k, j + 1)),
+            (Id::Bouton(k, j), NavigateDirection_PreviousSibling) if j > 0 => autre(Id::Bouton(k, j - 1)),
             (Id::Fenetre, NavigateDirection_FirstChild) => autre(Id::Liste),
             (Id::Fenetre, NavigateDirection_LastChild) if p > 0 => autre(Id::Pastille(p - 1)),
             (Id::Fenetre, NavigateDirection_LastChild) => autre(Id::Statut),
@@ -176,6 +270,8 @@ impl IRawElementProviderFragment_Impl for Fournisseur_Impl {
             Id::Statut => (2, 0),
             Id::Ligne(k) => (3, k as i32),
             Id::Pastille(k) => (4, k as i32),
+            // Une pastille porte au plus quatre boutons : k * 8 + j reste unique
+            Id::Bouton(k, j) => (5, (k * 8 + j) as i32),
         };
         // SAFETY: tableau de 3 entiers créé puis rempli ; sa propriété passe à UI Automation
         unsafe {
@@ -249,6 +345,48 @@ fn demander(hwnd: isize, action: usize, ligne: usize) -> Result<()> {
     r
 }
 
+/// Clics de lecteur d'écran sur un bouton de pastille, lus par la fenêtre dans l'ordre : (clé, libellé, occurrence, bouton). La
+/// pastille se retrouve par sa clé, son libellé et son rang d'occurrence, pas par son rang : la liste a pu changer entre le moment où le lecteur l'a lue et
+/// celui où la fenêtre agit.
+static ACTIONS_PASTILLES: Mutex<std::collections::VecDeque<(u64, String, usize, Bouton)>> = Mutex::new(std::collections::VecDeque::new());
+
+/// Prochain clic de bouton de pastille en attente (fil d'interface)
+pub fn prendre_action_pastille() -> Option<(u64, String, usize, Bouton)> {
+    ACTIONS_PASTILLES.lock().unwrap_or_else(|e| e.into_inner()).pop_front()
+}
+
+/// Vrai quand une fenêtre modale (palette, menu, galerie…) cache les pastilles : `Invoke` le dit au lecteur d'écran au lieu de
+/// répondre « fait » à une action que la fenêtre refuserait
+static PASTILLES_CACHEES: AtomicBool = AtomicBool::new(false);
+
+/// À appeler avant `maj` : une modale cache-t-elle les pastilles ?
+pub fn pastilles_cachees(cachees: bool) {
+    PASTILLES_CACHEES.store(cachees, Ordering::Relaxed);
+}
+
+/// Vrai quand l'instantané n'a pas suivi les dessins (aucun lecteur d'écran à l'écoute, ou premier dessin) : la comparaison des
+/// pastilles ne vaut alors rien et ne doit rien annoncer
+static INSTANTANE_PERIME: AtomicBool = AtomicBool::new(true);
+
+fn demander_bouton(hwnd: isize, k: usize, j: usize) -> Result<()> {
+    if crate::fenetre::modale_en_cours() || PASTILLES_CACHEES.load(Ordering::Relaxed) {
+        return Err(windows::core::HRESULT(UIA_E_ELEMENTNOTENABLED as i32).into());
+    }
+    // Le bouton que le lecteur a lu : s'il n'existe plus dans l'instantané, l'élément n'est plus là
+    let Some((cle, libelle, occurrence, bouton)) =
+        lire(|i| i.pastilles.get(k).and_then(|p| p.boutons.get(j).map(|(b, _)| (p.cle, p.libelle.clone(), p.occurrence, *b)))).flatten()
+    else {
+        return Err(windows::core::HRESULT(UIA_E_ELEMENTNOTAVAILABLE as i32).into());
+    };
+    ACTIONS_PASTILLES.lock().unwrap_or_else(|e| e.into_inner()).push_back((cle, libelle, occurrence, bouton));
+    // SAFETY: `PostMessageW` accepte n'importe quel fil ; une fenêtre détruite renvoie simplement une erreur
+    let r = unsafe { PostMessageW(HWND(hwnd as *mut _), WM_UIA_ACTION, WPARAM(0), LPARAM(0)) };
+    if r.is_err() {
+        ACTIONS_PASTILLES.lock().unwrap_or_else(|e| e.into_inner()).pop_back();
+    }
+    r
+}
+
 impl ISelectionProvider_Impl for Fournisseur_Impl {
     fn GetSelection(&self) -> Result<*mut SAFEARRAY> {
         let choisies = lire(|i| i.choisies.clone()).unwrap_or_default();
@@ -311,6 +449,7 @@ impl IInvokeProvider_Impl for Fournisseur_Impl {
     fn Invoke(&self) -> Result<()> {
         match self.id {
             Id::Ligne(k) => demander(self.hwnd, ACTION_OUVRIR, k),
+            Id::Bouton(k, j) => demander_bouton(self.hwnd, k, j),
             _ => Err(E_FAIL.into()),
         }
     }
@@ -441,10 +580,11 @@ pub struct PageLue {
 
 /// À appeler à chaque dessin : met l'instantané à jour et prévient le lecteur d'écran de ce qui a changé.
 /// `page` : la page des réglages quand elle est affichée (elle remplace alors la liste du dossier).
-pub fn maj(hwnd: HWND, app: &App, pastilles: &[String], page: Option<&PageLue>, geo: Option<Geo>) {
+pub fn maj(hwnd: HWND, app: &App, pastilles: &[PastilleLue], page: Option<&PageLue>, geo: Option<Geo>) {
     // `geo` : géométrie du panneau actif quand les rectangles de lignes sont calculables
     // SAFETY: lecture d'un compteur global de UI Automation
     if !unsafe { UiaClientsAreListening() }.as_bool() {
+        INSTANTANE_PERIME.store(true, Ordering::Relaxed);
         return;
     }
     let dossier = match page {
@@ -472,6 +612,8 @@ pub fn maj(hwnd: HWND, app: &App, pastilles: &[String], page: Option<&PageLue>, 
     };
     let texte = statut(app);
     let (focus_change, statut_change, liste_change);
+    // Pastilles apparues, changées d'état ou disparues depuis le dessin précédent : (changements, noms lus de la nouvelle liste)
+    let pastilles_vues;
     {
         let mut g = INSTANTANE.lock().unwrap_or_else(|e| e.into_inner());
         let i = g.get_or_insert_with(Instantane::default);
@@ -503,6 +645,12 @@ pub fn maj(hwnd: HWND, app: &App, pastilles: &[String], page: Option<&PageLue>, 
         };
         statut_change = i.statut != texte;
         i.statut = texte.clone();
+        // Au retour d'un lecteur d'écran, l'ancienne liste est périmée : on ne l'annonce pas comme « apparue »
+        pastilles_vues = if INSTANTANE_PERIME.swap(false, Ordering::Relaxed) {
+            Changements { structure: true, ..Changements::default() }
+        } else {
+            changements(&i.pastilles, pastilles)
+        };
         i.pastilles = pastilles.to_vec();
         let mut r = RECT::default();
         // SAFETY: `r` est valide pour l'écriture
@@ -529,6 +677,21 @@ pub fn maj(hwnd: HWND, app: &App, pastilles: &[String], page: Option<&PageLue>, 
                 let _ = UiaRaiseNotificationEvent(&p, NotificationKind_Other, NotificationProcessing_ImportantMostRecent, &BSTR::from(texte), &BSTR::from("statut"));
             }
         }
+        // Les pastilles apparaissent et disparaissent sans que rien ne prenne le focus : sans événement, un lecteur d'écran
+        // ne saurait jamais qu'une copie vient de finir ou d'échouer. Structure d'abord (l'arbre a changé), puis une annonce
+        // par pastille apparue (toutes, dans l'ordre) ou dont l'état a changé (seulement la plus récente).
+        if pastilles_vues.structure {
+            if let Ok(racine) = fournisseur(h, Id::Fenetre).cast::<IRawElementProviderSimple>() {
+                let _ = UiaRaiseStructureChangedEvent(&racine, StructureChangeType_ChildrenInvalidated, std::ptr::null_mut(), 0);
+            }
+        }
+        for (rangs, traitement) in [(&pastilles_vues.apparues, NotificationProcessing_All), (&pastilles_vues.changees, NotificationProcessing_ImportantMostRecent)] {
+            for &k in rangs {
+                if let (Ok(p), Some(l)) = (fournisseur(h, Id::Pastille(k)).cast::<IRawElementProviderSimple>(), pastilles.get(k)) {
+                    let _ = UiaRaiseNotificationEvent(&p, NotificationKind_ActionCompleted, traitement, &BSTR::from(l.nom.as_str()), &BSTR::from("pastille"));
+                }
+            }
+        }
     }
 }
 
@@ -536,10 +699,17 @@ pub fn maj(hwnd: HWND, app: &App, pastilles: &[String], page: Option<&PageLue>, 
 mod tests {
     use super::*;
 
+    /// L'instantané et les files d'actions sont globaux : les essais qui les touchent passent l'un après l'autre
+    static VERROU_ESSAI: Mutex<()> = Mutex::new(());
+    fn verrou() -> std::sync::MutexGuard<'static, ()> {
+        VERROU_ESSAI.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
     #[test]
     fn arbre_de_fournisseurs() {
+        let _v = verrou();
         use windows::core::Interface;
-        *INSTANTANE.lock().unwrap() = Some(Instantane { lignes: vec!["a.txt, TXT".into(), "b".into()], focus: Some(1), dossier: "ESSAI".into(), statut: "2 ELEMENTS".into(), pastilles: vec!["Copie, 42 pour cent".into()], ..Default::default() });
+        *INSTANTANE.lock().unwrap() = Some(Instantane { lignes: vec!["a.txt, TXT".into(), "b".into()], focus: Some(1), dossier: "ESSAI".into(), statut: "2 ELEMENTS".into(), pastilles: vec![PastilleLue { nom: "Copie, 42 pour cent".into(), ..Default::default() }], ..Default::default() });
         let racine = fournisseur(0, Id::Fenetre);
         let liste = unsafe { racine.Navigate(NavigateDirection_FirstChild) }.unwrap();
         let ligne = unsafe { liste.Navigate(NavigateDirection_FirstChild) }.unwrap();
@@ -575,6 +745,125 @@ mod tests {
         let morte: IRawElementProviderSimple = fournisseur(1, Id::Ligne(1)).cast().unwrap();
         let p: IInvokeProvider = unsafe { morte.GetPatternProvider(UIA_InvokePatternId) }.unwrap().cast().unwrap();
         assert!(unsafe { p.Invoke() }.is_err());
+    }
+
+    fn lue(p: &Pastille) -> PastilleLue {
+        PastilleLue::depuis(p)
+    }
+
+    /// Une pastille d'opération expose ses boutons comme enfants nommés, chacun avec le motif Invoke ; la pastille elle-même n'en a pas
+    #[test]
+    fn boutons_de_pastille_exposes_avec_invoke() {
+        let _v = verrou();
+        use windows::core::Interface;
+        let copie = Pastille::operation("COPIE · 3 ÉLÉMENTS".into(), 0.42, false, Some(r"C:\dest".into())).avec_cle(7);
+        let erreur = Pastille::erreur("DÉPLACEMENT · 1 ÉLÉMENT".into(), "accès refusé".into());
+        *INSTANTANE.lock().unwrap() = Some(Instantane { pastilles: vec![lue(&copie), lue(&erreur)], ..Default::default() });
+        let simple = |id| -> IRawElementProviderSimple { fournisseur(0, id).cast().unwrap() };
+        let nom = |id| unsafe { simple(id).GetPropertyValue(UIA_NamePropertyId) }.unwrap().to_string();
+        // Destination, Pause, Annuler dans l'ordre de la pastille ; l'erreur n'a que Fermer
+        assert_eq!(nom(Id::Bouton(0, 0)), "Ouvrir le dossier de destination");
+        assert_eq!(nom(Id::Bouton(0, 1)), "Mettre en pause");
+        assert_eq!(nom(Id::Bouton(0, 2)), "Annuler l'opération");
+        assert_eq!(nom(Id::Bouton(1, 0)), "Fermer");
+        assert_eq!(nom(Id::Bouton(5, 0)), "", "un bouton absent n'a pas de nom");
+        for id in [Id::Bouton(0, 0), Id::Bouton(0, 1), Id::Bouton(0, 2), Id::Bouton(1, 0)] {
+            assert!(unsafe { simple(id).GetPatternProvider(UIA_InvokePatternId) }.is_ok(), "{id:?} : Invoke");
+            let t = unsafe { simple(id).GetPropertyValue(UIA_ControlTypePropertyId) }.unwrap();
+            assert_eq!(i32::try_from(&t).unwrap(), UIA_ButtonControlTypeId.0, "{id:?} : bouton");
+        }
+        assert!(unsafe { simple(Id::Pastille(0)).GetPatternProvider(UIA_InvokePatternId) }.is_err(), "la pastille n'est pas un bouton");
+        // Navigation : pastille > boutons, frères dans l'ordre, retour au parent
+        let premier = unsafe { fournisseur(0, Id::Pastille(0)).Navigate(NavigateDirection_FirstChild) }.unwrap();
+        let deuxieme = unsafe { premier.Navigate(NavigateDirection_NextSibling) }.unwrap();
+        let s: IRawElementProviderSimple = deuxieme.cast().unwrap();
+        assert_eq!(unsafe { s.GetPropertyValue(UIA_NamePropertyId) }.unwrap().to_string(), "Mettre en pause");
+        let dernier = unsafe { fournisseur(0, Id::Pastille(0)).Navigate(NavigateDirection_LastChild) }.unwrap();
+        assert!(unsafe { dernier.Navigate(NavigateDirection_NextSibling) }.is_err());
+        let parent: IRawElementProviderSimple = unsafe { dernier.Navigate(NavigateDirection_Parent) }.unwrap().cast().unwrap();
+        assert_eq!(unsafe { parent.GetPropertyValue(UIA_NamePropertyId) }.unwrap().to_string(), "Copie, 42 pour cent");
+        assert!(unsafe { fournisseur(0, Id::Pastille(1)).Navigate(NavigateDirection_FirstChild) }.is_ok(), "l'erreur a son bouton Fermer");
+        *INSTANTANE.lock().unwrap() = Some(Instantane { pastilles: vec![lue(&Pastille::attente("COPIE".into()))], ..Default::default() });
+        assert!(unsafe { fournisseur(0, Id::Pastille(0)).Navigate(NavigateDirection_FirstChild) }.is_err(), "une pastille en attente n'a pas de bouton");
+        // Identifiants d'exécution distincts : un doublon ferait confondre deux boutons au lecteur d'écran
+        let mut vus = std::collections::HashSet::new();
+        for (k, j) in [(0usize, 0usize), (0, 1), (0, 2), (1, 0), (1, 1), (2, 0)] {
+            assert!(vus.insert(k * 8 + j));
+        }
+    }
+
+    /// Un Invoke sur un bouton vers une fenêtre qui n'existe pas échoue proprement et ne laisse rien en file ; un bouton qui n'existe
+    /// plus répond « élément indisponible »
+    #[test]
+    fn invoke_de_bouton_sans_fenetre_ne_laisse_rien_en_file() {
+        let _v = verrou();
+        use windows::core::Interface;
+        let copie = Pastille::operation("COPIE · 1 ÉLÉMENT".into(), 0.1, false, None).avec_cle(3);
+        *INSTANTANE.lock().unwrap() = Some(Instantane { pastilles: vec![lue(&copie)], ..Default::default() });
+        while prendre_action_pastille().is_some() {}
+        let simple = |id| -> IRawElementProviderSimple { fournisseur(1, id).cast().unwrap() };
+        let invoquer = |id| -> Result<()> { let p: IInvokeProvider = unsafe { simple(id).GetPatternProvider(UIA_InvokePatternId) }.unwrap().cast().unwrap(); unsafe { p.Invoke() } };
+        assert!(invoquer(Id::Bouton(0, 0)).is_err(), "fenêtre morte (handle 1)");
+        assert!(prendre_action_pastille().is_none(), "l'action est retirée quand le message n'a pas pu partir");
+        let e = invoquer(Id::Bouton(0, 9)).unwrap_err();
+        assert_eq!(e.code(), windows::core::HRESULT(UIA_E_ELEMENTNOTAVAILABLE as i32), "bouton absent");
+        let e = invoquer(Id::Bouton(4, 0)).unwrap_err();
+        assert_eq!(e.code(), windows::core::HRESULT(UIA_E_ELEMENTNOTAVAILABLE as i32), "pastille absente");
+    }
+
+    /// Deux fins de même libellé (clé 0, deux onglets) se distinguent par leur rang d'occurrence, et une modale refuse l'Invoke
+    #[test]
+    fn occurrences_et_modale() {
+        let _v = verrou();
+        use windows::core::Interface;
+        let fin = Pastille::fin("COPIE · 3 ÉLÉMENTS".into(), Some(r"C:".into()));
+        let autre = Pastille::fin("DÉPLACEMENT · 1 ÉLÉMENT".into(), None);
+        let v = PastilleLue::lues(&[fin.clone(), autre.clone(), fin.clone()]);
+        assert_eq!(v.iter().map(|p| p.occurrence).collect::<Vec<_>>(), vec![0, 0, 1]);
+        *INSTANTANE.lock().unwrap() = Some(Instantane { pastilles: v, ..Default::default() });
+        while prendre_action_pastille().is_some() {}
+        pastilles_cachees(true);
+        let simple: IRawElementProviderSimple = fournisseur(1, Id::Bouton(2, 0)).cast().unwrap();
+        let p: IInvokeProvider = unsafe { simple.GetPatternProvider(UIA_InvokePatternId) }.unwrap().cast().unwrap();
+        let e = unsafe { p.Invoke() }.unwrap_err();
+        pastilles_cachees(false);
+        assert_eq!(e.code(), windows::core::HRESULT(UIA_E_ELEMENTNOTENABLED as i32), "modale ouverte : refusé, pas « fait »");
+        assert!(prendre_action_pastille().is_none());
+    }
+
+    #[test]
+    fn changements_de_pastilles() {
+        let copie = |part: f32| Pastille::operation("COPIE · 3 ÉLÉMENTS".into(), part, false, None);
+        let fin = Pastille::fin("COPIE · 3 ÉLÉMENTS".into(), None);
+        let erreur = Pastille::erreur("COPIE · 3 ÉLÉMENTS".into(), "disque plein".into());
+        let l = |v: &[Pastille]| -> Vec<PastilleLue> { PastilleLue::lues(v) };
+        // Rien avant, une pastille : elle apparaît
+        let c = changements(&[], &l(&[copie(0.1)]));
+        assert_eq!((c.apparues.as_slice(), c.changees.as_slice(), c.structure), (&[0][..], &[][..], true));
+        // Le pourcentage seul ne dit rien (un message par pour cent noierait le lecteur d'écran), mais le nom lu suit
+        let (a, b) = (l(&[copie(0.10)]), l(&[copie(0.11)]));
+        assert_ne!(a[0].nom, b[0].nom);
+        assert_eq!(changements(&a, &b), Changements::default());
+        // Pause : changement d'état, et le bouton change de nom (donc de structure)
+        let pause = Pastille::operation("COPIE · 3 ÉLÉMENTS".into(), 0.5, true, None);
+        let c = changements(&l(&[copie(0.5)]), &l(&[pause.clone()]));
+        assert_eq!(c.changees, vec![0]);
+        assert!(c.apparues.is_empty() && c.structure);
+        // Fini, puis échec : même libellé, état différent
+        assert_eq!(changements(&l(&[copie(1.0)]), &l(&[fin.clone()])).changees, vec![0]);
+        assert_eq!(changements(&l(&[copie(0.3)]), &l(&[erreur.clone()])).changees, vec![0]);
+        // Disparition : la structure change, sans annonce
+        let c = changements(&l(&[fin.clone()]), &[]);
+        assert!(c.structure && c.apparues.is_empty() && c.changees.is_empty());
+        // Deux pastilles de même libellé (cle 0) : chaque ancienne ne sert qu'une fois, la seconde est une apparition
+        let c = changements(&l(&[fin.clone()]), &l(&[fin.clone(), fin.clone()]));
+        assert_eq!(c.apparues, vec![1]);
+        // Téléchargement : taille et vitesse changent à chaque tick sans événement ; fini = changement d'état
+        let tele = |phase, mot: &str| Pastille::telechargement(phase, "photo.jpg".into(), mot.into(), 42);
+        let en_cours = |mot: &str| tele(pastilles::PhaseTelechargement::EnCours, mot);
+        assert_eq!(changements(&l(&[en_cours("1,0 mo")]), &l(&[en_cours("2,0 mo")])), Changements::default());
+        let c = changements(&l(&[en_cours("2,0 mo")]), &l(&[tele(pastilles::PhaseTelechargement::Fini, "TÉLÉCHARGÉ · 2,0 mo")]));
+        assert_eq!(c.changees, vec![0]);
     }
 
     /// Le centre du rectangle d'un élément doit retomber sur cet élément au test de clic, dans chaque vue : sinon un lecteur d'écran

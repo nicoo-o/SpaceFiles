@@ -53,6 +53,57 @@ pub(crate) unsafe fn menu_statut(hwnd: HWND, f: &mut Fenetre, x: f32, y: f32) {
 
 /// Mise en forme d'un menu : libellés, raccourcis, lignes grisées
 pub(crate) fn lignes_menu(a: &App, choix: Vec<Choix>) -> Vec<menu::Ligne> {
+    mettre_en_forme(a, filtrer_profil(crate::profil::actuel(), choix))
+}
+
+/// Retire d'un menu ce que le profil ne montre pas (`profil.rs`), puis les séparations devenues inutiles (en tête, en
+/// queue, doublées) et les sous-menus vidés. Expert : le menu est rendu tel quel.
+pub(crate) fn filtrer_profil(p: crate::profil::Profil, choix: Vec<Choix>) -> Vec<Choix> {
+    if p == crate::profil::Profil::Expert {
+        return choix;
+    }
+    let mut v: Vec<Choix> = Vec::new();
+    for c in choix {
+        match c {
+            Choix::Commande(cmd, coche) => {
+                if crate::profil::commande_visible(p, cmd) {
+                    v.push(Choix::Commande(cmd, coche));
+                }
+            }
+            Choix::Autre(libelle, x) => {
+                if crate::profil::autre_visible(p, &x) {
+                    v.push(Choix::Autre(libelle, x));
+                }
+            }
+            Choix::Sous(titre, sous) => {
+                if crate::profil::sous_visible(p, titre) {
+                    let sous = filtrer_profil(p, sous);
+                    if sous.iter().any(|s| !matches!(s, Choix::Separation)) {
+                        v.push(Choix::Sous(titre, sous));
+                    }
+                }
+            }
+            Choix::Icones(icones) => {
+                let icones: Vec<_> = icones.into_iter().filter(|(_, cmd)| crate::profil::commande_visible(p, *cmd)).collect();
+                if !icones.is_empty() {
+                    v.push(Choix::Icones(icones));
+                }
+            }
+            Choix::Separation => {
+                if !matches!(v.last(), None | Some(Choix::Separation)) {
+                    v.push(Choix::Separation);
+                }
+            }
+            Choix::PlusOptions => v.push(Choix::PlusOptions),
+        }
+    }
+    while matches!(v.last(), Some(Choix::Separation)) {
+        v.pop();
+    }
+    v
+}
+
+fn mettre_en_forme(a: &App, choix: Vec<Choix>) -> Vec<menu::Ligne> {
     choix
         .into_iter()
         .map(|c| match c {
@@ -62,7 +113,7 @@ pub(crate) fn lignes_menu(a: &App, choix: Vec<Choix>) -> Vec<menu::Ligne> {
                 menu::Ligne { libelle: libelle.to_string(), raccourci: raccourci.to_string(), coche, actif: commande_possible(a, c), genre: menu::Genre::Commande(c) }
             }
             Choix::Separation => menu::Ligne { libelle: String::new(), raccourci: String::new(), coche: false, actif: false, genre: menu::Genre::Separation },
-            Choix::Sous(titre, v) => menu::Ligne { libelle: titre.to_string(), raccourci: String::new(), coche: false, actif: true, genre: menu::Genre::Sous(lignes_menu(a, v)) },
+            Choix::Sous(titre, v) => menu::Ligne { libelle: titre.to_string(), raccourci: String::new(), coche: false, actif: true, genre: menu::Genre::Sous(mettre_en_forme(a, v)) },
             Choix::PlusOptions => menu::Ligne { libelle: "PLUS D'OPTIONS".into(), raccourci: "MAJ+F10".into(), coche: false, actif: true, genre: menu::Genre::PlusOptions },
             Choix::Icones(v) => menu::Ligne { libelle: String::new(), raccourci: String::new(), coche: false, actif: true, genre: menu::Genre::Icones(v.into_iter().map(|(o, c)| (o, c, commande_possible(a, c))).collect()) },
             // « ● NOM » : ligne cochée (groupe qui contient déjà les éléments)

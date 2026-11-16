@@ -1,6 +1,8 @@
 // Réutiliser une fenêtre SpaceFiles déjà ouverte pour `explorer.open {reuse:true}` (phase 5, lot A). Côté résident :
 // trouver la fenêtre (la plus haute, visible, d'un AUTRE processus lancé depuis le même exécutable), lui envoyer le
-// chemin par `WM_COPYDATA` (marque `OUVRIR_ICI`) et dire si elle l'a accepté. Côté fenêtre : relire la charge sans
+// chemin par `WM_COPYDATA` (marque `OUVRIR_ICI`), puis ATTENDRE qu'elle confirme avoir réellement ouvert l'onglet (événement
+// nommé, voir `confirmer`) ou disparaître : « acceptée » ne suffit pas, sans confirmation le résident ouvre sa propre fenêtre
+// (R35, `docs/ecosystem/protocol.md` point 3 bis). Côté fenêtre : relire la charge sans
 // lui faire confiance (n'importe quel processus du même utilisateur peut écrire à une fenêtre), voir `decoder`, refuser
 // une charge devenue trop vieille (le résident s'est déjà replié), borner les fils en vol et déposer les résultats dans
 // une file protégée (`FileOuvertures`) plutôt que dans un pointeur posté.
@@ -23,6 +25,11 @@ const DELAI_MS: u32 = 2000;
 /// Une charge plus vieille que cela à la réception est refusée sans rien ouvrir : sous les 2 000 ms du résident, qui s'est
 /// alors déjà replié sur une nouvelle fenêtre (sinon l'onglet s'ouvrirait en double)
 pub const AGE_MAX_MS: u64 = 1500;
+/// Après la réponse `1`, le résident attend la confirmation de l'ouverture réelle au plus ce temps, puis se replie
+const CONFIRMATION_MS: u32 = 4000;
+/// Une demande plus vieille que cela au moment d'ouvrir l'onglet n'est PAS ouverte : le résident va se replier (marge de
+/// 500 ms sous `CONFIRMATION_MS` + le temps de la réponse), l'ouvrir aussi donnerait deux ouvertures
+pub const OUVERTURE_AGE_MAX_MS: u64 = 3500;
 /// Au plus ce nombre de fenêtres examinées (une boucle de `FindWindowEx` ne doit jamais tourner sans fin)
 const FENETRES_MAX: usize = 64;
 /// Fenêtres essayées au plus, quand la précédente refuse l'accès (UIPI : fenêtre élevée)
@@ -81,6 +88,39 @@ pub fn decoder(octets: &[u8]) -> Option<Charge> {
 /// le chemin est de toute façon revalidé.
 pub fn trop_ancienne(tick_envoi: u64, maintenant: u64) -> bool {
     maintenant.saturating_sub(tick_envoi) > AGE_MAX_MS
+}
+
+/// La fenêtre doit-elle renoncer à ouvrir cette demande, au moment où elle allait le faire ? Oui si le résident s'est déjà
+/// replié (ou va le faire) : `OUVERTURE_AGE_MAX_MS` depuis l'instant d'envoi.
+pub fn trop_tard_pour_ouvrir(tick_envoi: u64, maintenant: u64) -> bool {
+    maintenant.saturating_sub(tick_envoi) > OUVERTURE_AGE_MAX_MS
+}
+
+/// Nom de l'événement par lequel la fenêtre confirme l'ouverture réelle : propre à la session de l'utilisateur (`Local\`) et
+/// à la demande (l'instant d'envoi, que le résident met dans la charge).
+pub fn nom_confirmation(tick: u64) -> String {
+    format!("Local\\SpaceFiles.OuvrirIci.{tick}")
+}
+
+/// Ce que le résident a vu en attendant la confirmation d'une fenêtre qui avait accepté la demande
+#[derive(Debug, PartialEq, Clone, Copy)]
+pub enum Attente {
+    /// La fenêtre a ouvert l'onglet (événement signalé) : rien d'autre à faire
+    Confirme,
+    /// Le processus de la fenêtre s'est terminé avant de confirmer : repli tout de suite
+    Disparue,
+    /// Rien au bout du délai (disque lent, file pleine, fenêtre figée) : repli
+    Delai,
+}
+
+/// Classe le retour de `WaitForMultipleObjects([événement, processus])` : 0 = événement, 1 = processus, tout le reste
+/// (`WAIT_TIMEOUT`, `WAIT_FAILED`, objet abandonné) vaut « pas de confirmation »
+pub fn classer_attente(retour: u32) -> Attente {
+    match retour {
+        0 => Attente::Confirme,
+        1 => Attente::Disparue,
+        _ => Attente::Delai,
+    }
 }
 
 // ───────────────────────── Choix de la fenêtre (pur) ─────────────────────────
@@ -186,8 +226,9 @@ impl Oubli {
 
 // ───────────────────────── Côté fenêtre : file et compteur (purs) ─────────────────────────
 
-/// Résultat d'une consultation du disque : dossier à ouvrir, élément à choisir
-pub type Ouverture = (String, Option<String>);
+/// Résultat d'une consultation du disque : dossier à ouvrir, élément à choisir, instant d'envoi de la demande (pour la
+/// confirmation, voir `confirmer`)
+pub type Ouverture = (String, Option<String>, u64);
 
 /// Résultats déposés par les fils courts, retirés par la fenêtre à qui ils sont destinés. Le message posté à la fenêtre ne
 /// porte aucun pointeur : un message forgé ne fait que vider cette file plus tôt.
@@ -230,11 +271,12 @@ pub fn liberer(compteur: &AtomicUsize) {
 // ───────────────────────── Win32 ─────────────────────────
 
 use windows::core::{HSTRING, PCWSTR, PWSTR};
-use windows::Win32::Foundation::{CloseHandle, GetLastError, SetLastError, HANDLE, HWND, LPARAM, WIN32_ERROR, WPARAM};
+use windows::Win32::Foundation::{CloseHandle, GetLastError, SetLastError, ERROR_ALREADY_EXISTS, HANDLE, HWND, LPARAM, WIN32_ERROR, WPARAM};
 use windows::Win32::System::DataExchange::COPYDATASTRUCT;
 use windows::Win32::System::SystemInformation::GetTickCount64;
 use windows::Win32::System::Threading::{
-    GetCurrentProcess, OpenProcess, QueryFullProcessImageNameW, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION,
+    CreateEventW, GetCurrentProcess, OpenEventW, OpenProcess, QueryFullProcessImageNameW, SetEvent, WaitForMultipleObjects, EVENT_MODIFY_STATE,
+    PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     AllowSetForegroundWindow, FindWindowExW, GetWindowThreadProcessId, IsWindowVisible, SendMessageTimeoutW, HWND_MESSAGE, SMTO_ABORTIFHUNG, WM_COPYDATA,
@@ -317,10 +359,66 @@ fn chercher(maintenant: u64) -> Vec<(HWND, u32)> {
 
 static OUBLI: Mutex<Oubli> = Mutex::new(Oubli::vide());
 
-/// Envoie la charge à une fenêtre et classe l'issue
-fn envoyer(cible: HWND, chemin: &str, reveler: bool) -> Envoi {
-    // L'instant est pris à chaque envoi : une fenêtre essayée après une autre n'hérite pas d'un âge déjà entamé
-    let charge = encoder(chemin, reveler, maintenant_ms());
+/// Poignée Windows fermée à la sortie
+struct Poignee(HANDLE);
+
+impl Drop for Poignee {
+    fn drop(&mut self) {
+        // SAFETY : handle valide obtenu par l'appelant de `Poignee`, fermé une seule fois ici.
+        let _ = unsafe { CloseHandle(self.0) };
+    }
+}
+
+/// Crée l'événement de confirmation de cette demande. None si le nom existe déjà (un autre l'a pris : un faux signal serait
+/// possible) ou si la création échoue ; l'appelant se replie alors sans rien envoyer.
+fn creer_confirmation(tick: u64) -> Option<Poignee> {
+    let nom = HSTRING::from(nom_confirmation(tick));
+    // SAFETY : `nom` (terminé par 0) vit jusqu'à la fin de l'appel. `SetLastError(0)` avant : sans cela une ancienne erreur
+    // `ERROR_ALREADY_EXISTS` serait lue à la place de celle de l'appel. Manuel (true) : le signal reste levé jusqu'à la lecture.
+    unsafe {
+        SetLastError(WIN32_ERROR(0));
+        let h = CreateEventW(None, true, false, PCWSTR(nom.as_ptr())).ok()?;
+        let poignee = Poignee(h);
+        (GetLastError() != ERROR_ALREADY_EXISTS).then_some(poignee)
+    }
+}
+
+/// Côté fenêtre : droit de lever l'événement de confirmation d'une demande.
+pub struct Confirmation(Poignee);
+
+/// Côté fenêtre, AVANT d'ouvrir l'onglet : ouvre l'événement de cette demande. None si le résident ne l'attend plus (il
+/// s'est replié et l'a fermé : ouvrir ici donnerait deux ouvertures) ou si l'accès est refusé (résident élevé, ancienne
+/// version) : le résident se repliera de toute façon, donc la fenêtre n'ouvre rien.
+pub fn ouvrir_confirmation(tick: u64) -> Option<Confirmation> {
+    let nom = HSTRING::from(nom_confirmation(tick));
+    // SAFETY : `nom` vit jusqu'à la fin de l'appel ; le handle ouvert est fermé par `Poignee`.
+    unsafe { OpenEventW(EVENT_MODIFY_STATE, false, PCWSTR(nom.as_ptr())) }.ok().map(|h| Confirmation(Poignee(h)))
+}
+
+impl Confirmation {
+    /// L'onglet demandé par le résident vient d'être réellement ouvert : lève l'événement.
+    pub fn lever(self) {
+        // SAFETY : handle valide (ouvert par `ouvrir_confirmation`), fermé à la sortie par `Poignee`.
+        let _ = unsafe { SetEvent((self.0).0) };
+    }
+}
+
+/// Attend, au plus `delai_ms`, que la fenêtre confirme (événement) ou disparaisse (fin de son processus)
+fn attendre_confirmation(evenement: &Poignee, pid: u32, delai_ms: u32) -> Attente {
+    // SAFETY : handle limité à l'attente (SYNCHRONIZE), fermé par `Poignee`. Un échec (processus élevé, déjà parti) laisse
+    // seulement l'événement et le délai.
+    let processus = unsafe { OpenProcess(PROCESS_SYNCHRONIZE, false, pid) }.ok().map(Poignee);
+    let mut attendus = vec![evenement.0];
+    if let Some(p) = &processus {
+        attendus.push(p.0);
+    }
+    // SAFETY : les handles de `attendus` sont valides et vivent jusqu'à la fin de l'appel (portés par `evenement` et `processus`).
+    classer_attente(unsafe { WaitForMultipleObjects(&attendus, false, delai_ms) }.0)
+}
+
+/// Envoie la charge à une fenêtre et classe l'issue. `tick` est l'instant d'envoi (il nomme l'événement de confirmation).
+fn envoyer(cible: HWND, chemin: &str, reveler: bool, tick: u64) -> Envoi {
+    let charge = encoder(chemin, reveler, tick);
     let cd = COPYDATASTRUCT { dwData: OUVRIR_ICI, cbData: (charge.len() * 2) as u32, lpData: charge.as_ptr() as *mut _ };
     let mut reponse = 0usize;
     // SAFETY : `cd` et `charge` vivent jusqu'au retour de l'appel (WM_COPYDATA est synchrone : le destinataire copie ce
@@ -334,8 +432,9 @@ fn envoyer(cible: HWND, chemin: &str, reveler: bool) -> Envoi {
     classer(r.0, reponse, erreur)
 }
 
-/// Confie ce chemin à une fenêtre SpaceFiles ouverte. Vrai seulement si elle a répondu `1` (acceptée) ; tout le reste
-/// (aucune fenêtre, `0`, délai de 2 s, fenêtre figée) rend faux et l'appelant lance une nouvelle fenêtre. Une fenêtre qui
+/// Confie ce chemin à une fenêtre SpaceFiles ouverte. Vrai seulement si elle a répondu `1` (acceptée) ET confirmé avoir ouvert
+/// l'onglet (au plus 4 s après) ; tout le reste (aucune fenêtre, `0`, délai de 2 s, fenêtre figée ou disparue, pas de
+/// confirmation) rend faux et l'appelant lance une nouvelle fenêtre. Une fenêtre qui
 /// refuse l'accès tout de suite (UIPI) fait essayer la suivante (3 au plus) ; un délai ou un `0` non.
 pub fn reutiliser_fenetre(chemin: &str, reveler: bool) -> bool {
     let cibles = chercher(maintenant_ms());
@@ -352,10 +451,33 @@ pub fn reutiliser_fenetre(chemin: &str, reveler: bool) -> bool {
             "eco-ouvrir",
             if accorde { "reuse : premier plan accorde a la fenetre cible" } else { "reuse : premier plan refuse par Windows pour la fenetre cible" },
         );
-        match envoyer(cible, chemin, reveler) {
+        // L'instant est pris à chaque envoi : une fenêtre essayée après une autre n'hérite pas d'un âge déjà entamé. L'événement
+        // existe AVANT l'envoi : la fenêtre peut confirmer dès qu'elle a ouvert l'onglet.
+        let tick = maintenant_ms();
+        let Some(confirmation) = creer_confirmation(tick) else {
+            super::trace(crate::journal::Niveau::Avert, "eco-ouvrir", "reuse : confirmation impossible, repli sur une nouvelle fenetre");
+            return false;
+        };
+        match envoyer(cible, chemin, reveler, tick) {
             Envoi::Accepte => {
-                super::trace(crate::journal::Niveau::Info, "eco-ouvrir", "reuse : chemin accepte par la fenetre");
-                return true;
+                // « Acceptée » n'est pas « ouverte » : on ne rend vrai qu'une fois l'onglet réellement ouvert
+                return match attendre_confirmation(&confirmation, pid, CONFIRMATION_MS) {
+                    Attente::Confirme => {
+                        super::trace(crate::journal::Niveau::Info, "eco-ouvrir", "reuse : onglet ouvert dans la fenetre");
+                        true
+                    }
+                    Attente::Disparue => {
+                        super::trace(crate::journal::Niveau::Avert, "eco-ouvrir", "reuse : fenetre disparue avant l'ouverture, repli sur une nouvelle fenetre");
+                        false
+                    }
+                    Attente::Delai => {
+                        // Une fenêtre qui accepte sans ouvrir (bloquée) est sautée un moment : sinon chaque demande suivante
+                        // coûterait 4 s de plus sur ce fil unique
+                        OUBLI.lock().unwrap_or_else(|e| e.into_inner()).noter(cible.0 as isize, maintenant_ms());
+                        super::trace(crate::journal::Niveau::Avert, "eco-ouvrir", "reuse : pas de confirmation, repli sur une nouvelle fenetre");
+                        false
+                    }
+                };
             }
             Envoi::Refuse => {
                 super::trace(crate::journal::Niveau::Info, "eco-ouvrir", "reuse : fenetre qui refuse, repli sur une nouvelle fenetre");
@@ -556,7 +678,7 @@ mod tests {
     #[test]
     fn file_des_ouvertures() {
         let file: FileOuvertures = Mutex::new(VecDeque::new());
-        let o = |d: &str, n: Option<&str>| (d.to_string(), n.map(str::to_string));
+        let o = |d: &str, n: Option<&str>| (d.to_string(), n.map(str::to_string), 0u64);
         assert!(vider(&file, 1).is_empty(), "file vide");
         assert!(deposer(&file, 1, o(r"C:\a", None)));
         assert!(deposer(&file, 2, o(r"C:\b", Some("x"))));
@@ -573,6 +695,91 @@ mod tests {
         assert!(!deposer(&file, 9, o(r"C:\trop", None)), "file pleine : refusée");
         assert_eq!(vider(&file, 9).len(), FILE_MAX);
         assert!(deposer(&file, 9, o(r"C:\apres", None)));
+    }
+
+    // ── Confirmation de l'ouverture réelle (lot 3, R35) ──
+
+    #[test]
+    fn la_fenetre_renonce_a_une_demande_trop_vieille() {
+        assert!(!trop_tard_pour_ouvrir(1_000, 1_000));
+        assert!(!trop_tard_pour_ouvrir(1_000, 1_000 + OUVERTURE_AGE_MAX_MS));
+        assert!(trop_tard_pour_ouvrir(1_000, 1_001 + OUVERTURE_AGE_MAX_MS));
+        assert!(!trop_tard_pour_ouvrir(5_000, 100), "horloge qui recule : âge nul");
+        // La fenêtre renonce toujours AVANT que le résident ne se replie (sinon deux ouvertures)
+        assert!(OUVERTURE_AGE_MAX_MS < u64::from(CONFIRMATION_MS));
+        assert!(AGE_MAX_MS < OUVERTURE_AGE_MAX_MS);
+    }
+
+    #[test]
+    fn nom_de_confirmation_propre_a_la_session_et_a_la_demande() {
+        assert_eq!(nom_confirmation(42), "Local\\SpaceFiles.OuvrirIci.42");
+        assert_ne!(nom_confirmation(1), nom_confirmation(2));
+    }
+
+    #[test]
+    fn attente_classee() {
+        assert_eq!(classer_attente(0), Attente::Confirme);
+        assert_eq!(classer_attente(1), Attente::Disparue);
+        assert_eq!(classer_attente(0x102), Attente::Delai, "WAIT_TIMEOUT");
+        assert_eq!(classer_attente(0xFFFF_FFFF), Attente::Delai, "WAIT_FAILED");
+        assert_eq!(classer_attente(0x80), Attente::Delai, "objet abandonné");
+    }
+
+    #[test]
+    fn un_nom_deja_pris_n_est_pas_reutilise() {
+        let tick = u64::MAX - 1;
+        let premier = creer_confirmation(tick);
+        assert!(premier.is_some());
+        assert!(creer_confirmation(tick).is_none(), "un faux signal serait possible : repli sans envoyer");
+        drop(premier);
+        assert!(creer_confirmation(tick).is_some(), "le nom se libère quand le résident a fini");
+    }
+
+    #[test]
+    fn sans_confirmation_le_resident_se_replie() {
+        // La fenêtre a accepté puis n'ouvre rien (file pleine, état absent, disque qui traîne) : délai, donc repli
+        let tick = u64::MAX - 2;
+        let evenement = creer_confirmation(tick).unwrap();
+        assert_eq!(attendre_confirmation(&evenement, std::process::id(), 60), Attente::Delai);
+    }
+
+    #[test]
+    fn la_confirmation_de_la_fenetre_est_vue() {
+        let tick = u64::MAX - 3;
+        let evenement = creer_confirmation(tick).unwrap();
+        // Comme la fenêtre : l'événement s'ouvre AVANT le travail, se lève APRÈS
+        let fenetre = std::thread::spawn(move || {
+            let confirmation = ouvrir_confirmation(tick).expect("le résident attend : l'événement existe");
+            std::thread::sleep(std::time::Duration::from_millis(40));
+            confirmation.lever();
+        });
+        assert_eq!(attendre_confirmation(&evenement, std::process::id(), 5_000), Attente::Confirme);
+        fenetre.join().unwrap();
+    }
+
+    #[test]
+    fn sans_resident_qui_attend_la_fenetre_n_ouvre_rien() {
+        // Résident déjà replié (événement fermé) ou événement inaccessible : la fenêtre ne doit pas ouvrir un onglet de plus
+        assert!(ouvrir_confirmation(u64::MAX - 4).is_none());
+        let tick = u64::MAX - 5;
+        let evenement = creer_confirmation(tick).unwrap();
+        assert!(ouvrir_confirmation(tick).is_some());
+        drop(evenement);
+        assert!(ouvrir_confirmation(tick).is_none(), "le résident a fermé l'événement en se repliant");
+    }
+
+    #[test]
+    fn la_fenetre_qui_disparait_apres_avoir_accepte_fait_replier_tout_de_suite() {
+        // Le scénario de R35 : acceptée (réponse 1), puis le processus de la fenêtre se termine avant d'avoir ouvert l'onglet.
+        // `Child` garde le handle : le processus terminé reste interrogeable, son pid ne peut pas être réutilisé.
+        let mut enfant = std::process::Command::new("cmd").args(["/c", "exit"]).stdout(std::process::Stdio::null()).spawn().unwrap();
+        // Un tick par test : les tests tournent en parallèle et un nom d'événement déjà pris fait échouer `creer_confirmation`
+        let tick = u64::MAX - 6;
+        let evenement = creer_confirmation(tick).unwrap();
+        let debut = std::time::Instant::now();
+        assert_eq!(attendre_confirmation(&evenement, enfant.id(), 5_000), Attente::Disparue);
+        assert!(debut.elapsed() < std::time::Duration::from_secs(4), "le repli ne attend pas le délai de 4 s");
+        let _ = enfant.wait();
     }
 
     #[test]

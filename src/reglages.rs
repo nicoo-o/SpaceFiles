@@ -266,6 +266,8 @@ pub struct Reglages {
     /// Fonctions peu testées (SFTP, WebDAV, sauvegarde NAS, MTP) : fermées tant que ce réglage est faux.
     /// Absent du fichier mais avec un stockage SFTP / WebDAV déjà ajouté : lu vrai (voir `lire`)
     pub experimental: bool,
+    /// Profil Simple ou Expert (`profil.rs`) ; absent du fichier : Expert, pour ne rien retirer aux installations existantes
+    pub profil: crate::profil::Profil,
     pub stockages: Vec<Stockage>,
     /// Onglets ouverts à la fermeture, et dossier affiché
     pub onglets: Vec<String>,
@@ -345,6 +347,7 @@ impl Default for Reglages {
             glyphes: Vec::new(),
             poids_sonore: false,
             experimental: false,
+            profil: crate::profil::Profil::Expert,
             stockages: Vec::new(),
             onglets: Vec::new(),
             onglet_actif: 0,
@@ -590,7 +593,12 @@ pub fn appliquer(r: &Reglages) {
     DATES_RELATIVES.store(r.dates_relatives, Ordering::Relaxed);
     ETAT_CLOUD.store(r.etat_cloud, Ordering::Relaxed);
     let propre = *LOCAL.lock().unwrap_or_else(|e| e.into_inner());
-    COLONNES.store(propre.map_or(r.colonnes, |p| p.0), Ordering::Relaxed);
+    // En Simple, les colonnes en plus (dimensions, durée, auteur, origine, signataire) ne s'affichent pas ; le réglage gardé n'est pas touché
+    let mut colonnes = propre.map_or(r.colonnes, |p| p.0);
+    if r.profil == crate::profil::Profil::Simple {
+        colonnes &= !(COL_DIMENSIONS | COL_DUREE | COL_AUTEUR | COL_ORIGINE | COL_SIGNE);
+    }
+    COLONNES.store(colonnes, Ordering::Relaxed);
     TAILLE_LIGNES.store(propre.map_or(r.taille_lignes, |p| p.1), Ordering::Relaxed);
     EXTENSIONS.store(r.extensions, Ordering::Relaxed);
     VOLET_DENSE.store(r.volet_dense, Ordering::Relaxed);
@@ -610,6 +618,7 @@ pub fn appliquer(r: &Reglages) {
     VOLET_MASQUE.store(r.volet_masque, Ordering::Relaxed);
     CHRONOLOGIE.store(r.chronologie, Ordering::Relaxed);
     POIDS_SONORE.store(r.poids_sonore, Ordering::Relaxed);
+    crate::profil::fixer(r.profil);
     EXPERIMENTAL.store(r.experimental, Ordering::Relaxed);
     EXPERIMENTAL_LU.store(true, Ordering::Relaxed);
     crate::glyphes::recharger(&r.glyphes);
@@ -858,7 +867,7 @@ pub fn reinitialiser() {
     modifier(|r| {
         let ancien = std::mem::take(r);
         // Les stockages, épingles, balises et récents restent : on ne perd pas ses données en remettant l'apparence à zéro
-        *r = Reglages { stockages: ancien.stockages, epingles: ancien.epingles, balises: ancien.balises, recents: ancien.recents, tris: ancien.tris, vues: ancien.vues, dispositions: ancien.dispositions, groupes: ancien.groupes, membres: ancien.membres, regroupements: ancien.regroupements, sessions: ancien.sessions, regles: ancien.regles, sauvegarde_dest: ancien.sauvegarde_dest, sauvegarde: ancien.sauvegarde, reprises: ancien.reprises, non_fiables: ancien.non_fiables, notes: ancien.notes, glyphes: ancien.glyphes, experimental: ancien.experimental, ..Reglages::default() };
+        *r = Reglages { stockages: ancien.stockages, epingles: ancien.epingles, balises: ancien.balises, recents: ancien.recents, tris: ancien.tris, vues: ancien.vues, dispositions: ancien.dispositions, groupes: ancien.groupes, membres: ancien.membres, regroupements: ancien.regroupements, sessions: ancien.sessions, regles: ancien.regles, sauvegarde_dest: ancien.sauvegarde_dest, sauvegarde: ancien.sauvegarde, reprises: ancien.reprises, non_fiables: ancien.non_fiables, notes: ancien.notes, glyphes: ancien.glyphes, experimental: ancien.experimental, profil: ancien.profil, ..Reglages::default() };
     });
 }
 
@@ -966,6 +975,8 @@ fn ecrire(r: &Reglages) -> String {
     s += &format!("poids_sonore = {}\n", r.poids_sonore);
     s += "\n# Fonctions expérimentales : SFTP, WebDAV, sauvegarde NAS, MTP (peu testées)\n";
     s += &format!("experimental = {}\n", r.experimental);
+    s += "\n# Profil : simple (actions de base seulement) ou expert (tout)\n";
+    s += &format!("profil = \"{}\"\n", r.profil.cle());
     s += "\n# Session (écrit à la fermeture)\n";
     let onglets: Vec<String> = r.onglets.iter().map(|o| texte_toml(o)).collect();
     s += &format!("onglets = [{}]\n", onglets.join(", "));
@@ -1061,6 +1072,9 @@ fn lire_valeur(v: &str) -> Option<Valeur> {
 }
 
 fn lire(texte: &str) -> Reglages {
+    // Un fichier retouché dans le Bloc-notes ou PowerShell 5.1 porte un BOM (U+FEFF) que `trim` ne retire pas : la
+    // première clé (ou un `[[stockage]]` en tête) était ignorée et revenait à sa valeur par défaut
+    let texte = texte.strip_prefix('\u{FEFF}').unwrap_or(texte);
     let mut r = Reglages::default();
     let mut stockage: Option<Stockage> = None;
     let mut cle_experimental = false;
@@ -1143,6 +1157,7 @@ fn lire(texte: &str) -> Reglages {
                 r.experimental = b;
                 cle_experimental = true;
             }
+            ("profil", Valeur::Texte(t)) => r.profil = crate::profil::Profil::depuis(&t),
             ("etat_cloud", Valeur::Bool(b)) => r.etat_cloud = b,
             ("onglets", Valeur::Liste(l)) => r.onglets = l,
             ("onglet_actif", Valeur::Nombre(n)) => r.onglet_actif = n.max(0) as usize,
@@ -1172,6 +1187,16 @@ fn lire(texte: &str) -> Reglages {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn profil_aller_retour_et_defaut() {
+        use crate::profil::Profil;
+        let mut r = super::Reglages::default();
+        assert_eq!(r.profil, Profil::Expert);
+        r.profil = Profil::Simple;
+        assert_eq!(super::lire(&super::ecrire(&r)).profil, Profil::Simple);
+        assert_eq!(super::lire("").profil, Profil::Expert);
+    }
+
     #[test]
     fn session_avec_et_sans_champs() {
         use super::{champ_de_session, onglets_de_session};
@@ -1567,5 +1592,18 @@ sons = false
         let octets = b"sons = false\nnote = \"caf\xe9\"\n";
         let r = lire(&String::from_utf8_lossy(octets));
         assert!(!r.sons);
+    }
+
+    #[test]
+    fn fichier_avec_bom() {
+        // Octets EF BB BF en tête (Bloc-notes, PowerShell 5.1) : la première clé compte, comme sans BOM
+        assert!(Reglages::default().sons, "le test suppose que `sons` vaut vrai par défaut");
+        let r = lire(&String::from_utf8_lossy(b"\xEF\xBB\xBFsons = false\n"));
+        assert!(!r.sons, "la première clé après le BOM était ignorée");
+        let r = lire(&String::from_utf8_lossy(b"\xEF\xBB\xBF# commentaire\nsons = false\n"));
+        assert!(!r.sons);
+        // Le BOM seul, ou au milieu du texte, ne casse rien
+        assert!(lire("\u{FEFF}").sons);
+        assert!(!lire("sons = false\n\u{FEFF}\n").sons);
     }
 }

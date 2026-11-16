@@ -1840,10 +1840,10 @@ impl Rendu {
         match c {
             'b' => BLANC,
             'g' => rgba(140, 140, 140, 1.0),
-            'a' => rgba(0xE8, 0xA3, 0x17, 1.0),
-            'v' => rgba(0x7B, 0xD8, 0x8F, 1.0),
-            'u' => rgba(0x6A, 0xA9, 0xFF, 1.0),
-            'p' => rgba(0xB5, 0x8C, 0xFF, 1.0),
+            'a' => GROUPE_AMBRE,
+            'v' => GROUPE_VERT,
+            'u' => GROUPE_BLEU,
+            'p' => GROUPE_VIOLET,
             _ => GROUPE_ROUGE,
         }
     }
@@ -3621,7 +3621,7 @@ impl Rendu {
                 }
             }
             // Balise de couleur : un point devant l'icône
-            if let Some(b) = app.chemin_de(e).and_then(|p| outils::balise(&p)) {
+            if let Some(b) = app.chemin_de(e).and_then(|p| outils::balise(&p)).filter(|_| crate::profil::balises_visibles()) {
                 self.couleur(c, &Self::couleur_balise(b));
                 rt.FillEllipse(&ellipse(cx - 13.5, cy, 2.6), &c.pinceau);
             }
@@ -3679,7 +3679,7 @@ impl Rendu {
                     let ouvert = if let Emplacement::Groupe(n) = &app.emplacement { Some(n.as_str()) } else { None };
                     let mut xg = (zone_nom.left + self.mesurer(&e.nom, &f.liste) + 14.0).min(zone_texte.right + 8.0);
                     // Étiquette (lot 16, `.sq`) : 1 à 3 carrés juste après le nom, avant les pastilles de groupes
-                    if let Some(n) = etiquette {
+                    if let Some(n) = etiquette.filter(|_| crate::profil::balises_visibles()) {
                         let x_carres = zone_nom.left + self.mesurer_nom(e, &f.liste) + 8.0;
                         if x_carres + largeur_etiquette(n) <= zone_texte.right {
                             self.carres_etiquette(c, x_carres, cy, n);
@@ -4254,7 +4254,7 @@ impl Rendu {
                     }
                 }
             }
-            if let Some(b) = chemin.as_deref().and_then(outils::balise) {
+            if let Some(b) = chemin.as_deref().and_then(outils::balise).filter(|_| crate::profil::balises_visibles()) {
                 self.couleur(c, &Self::couleur_balise(b));
                 rt.FillEllipse(&ellipse(x + 6.0, y + 12.0, 3.2), &c.pinceau);
             }
@@ -4263,7 +4263,7 @@ impl Rendu {
                 self.texte(c, &f.petit, &g.to_string(), rect(x + cote - 14.0, y + 3.0, 14.0, 18.0));
             }
             // Étiquette (lot 16) : les carrés au bas de la vignette, à gauche (le nom centré dessous garde toute sa place)
-            if let Some(n) = chemin.as_deref().filter(|_| crate::etiquettes::existe_une()).and_then(crate::etiquettes::de) {
+            if let Some(n) = chemin.as_deref().filter(|_| crate::profil::balises_visibles() && crate::etiquettes::existe_une()).and_then(crate::etiquettes::de) {
                 self.carres_etiquette(c, x + 8.0, y + cote - 10.0, n);
             }
             if app.survol == Cible::Ligne(i) || (choisie && app.marques.len() > 1) {

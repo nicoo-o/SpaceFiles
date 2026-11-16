@@ -68,8 +68,15 @@ impl Drop for VerrouProcessus {
 
 // ───────────────────────── Garde de sécurité ─────────────────────────
 
+/// `%TEMP%` en forme longue. Sur le serveur GitHub, `TEMP` est donné en nom court 8.3 (`C:\Users\RUNNER~1\…`) alors que
+/// Windows rend les chemins en forme longue (`runneradmin`) : sans cette forme, la garde et les comparaisons de bilans
+/// échouent (CI du 16/11, huit tests).
+fn temp_long() -> PathBuf {
+    PathBuf::from(super::developper(&std::env::temp_dir().to_string_lossy()))
+}
+
 fn racine_du_banc(nom: &str) -> PathBuf {
-    std::env::temp_dir().join(format!("spacefiles-matrice-{}-{nom}", std::process::id()))
+    temp_long().join(format!("spacefiles-matrice-{}-{nom}", std::process::id()))
 }
 
 /// Forme comparable d'un chemin : sans préfixe `\\?\`, barres arrière, minuscules, sans barre finale
@@ -81,7 +88,7 @@ fn normaliser(s: &str) -> String {
 /// dossier du banc sous `%TEMP%`. Un bug de test ne doit jamais pouvoir toucher les fichiers de l'auteur.
 fn garde(racine: &Path, chemin: &str) {
     let r = normaliser(&racine.to_string_lossy());
-    let temp = normaliser(&std::env::temp_dir().to_string_lossy());
+    let temp = normaliser(&temp_long().to_string_lossy());
     assert!(r.starts_with(&format!("{temp}\\spacefiles-matrice-")), "GARDE : la racine {r} n'est pas un dossier du banc sous %TEMP%");
     let c = normaliser(chemin);
     assert!(!c.is_empty(), "GARDE : chemin vide");
@@ -145,7 +152,7 @@ fn retirer_de_la_corbeille(r: &str) {
 /// (`%TEMP%\spacefiles-matrice-…`), même si le bilan d'une opération ne l'a pas annoncé (voir le chemin > 260). Ne touche
 /// jamais à un élément d'une autre origine.
 fn balayer_corbeille() {
-    let temp = normaliser(&std::env::temp_dir().to_string_lossy());
+    let temp = normaliser(&temp_long().to_string_lossy());
     let Some(lecteur) = temp.get(..2) else { return };
     let Ok(sids) = std::fs::read_dir(format!("{lecteur}\\$Recycle.Bin")) else { return };
     for sid in sids.flatten() {
@@ -164,7 +171,7 @@ fn balayer_corbeille() {
 
 /// `$R…` de la corbeille du lecteur de %TEMP% dont l'origine est exactement `origine` (quand le bilan ne l'a pas donné)
 fn chercher_dans_corbeille(origine: &str) -> Option<String> {
-    let temp = normaliser(&std::env::temp_dir().to_string_lossy());
+    let temp = normaliser(&temp_long().to_string_lossy());
     let cible = normaliser(origine);
     for sid in std::fs::read_dir(format!("{}\\$Recycle.Bin", temp.get(..2)?)).ok()?.flatten() {
         for f in std::fs::read_dir(sid.path()).ok()?.flatten() {

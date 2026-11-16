@@ -248,6 +248,7 @@ pub(crate) unsafe fn activer_reglage(hwnd: HWND, f: &mut Fenetre, k: usize, sens
         Element::Sons => reglages::modifier(|r| r.sons = !r.sons),
         Element::PoidsSonore => reglages::modifier(|r| r.poids_sonore = !r.poids_sonore),
         Element::VoletDense => reglages::modifier(|r| r.volet_dense = !r.volet_dense),
+        Element::Profil => crate::commandes::executer(hwnd, f, crate::palette::Commande::BasculerProfil),
         Element::Experimental => {
             reglages::modifier(|r| r.experimental = !r.experimental);
             // Le volet montre ou cache les serveurs SFTP / WebDAV tout de suite

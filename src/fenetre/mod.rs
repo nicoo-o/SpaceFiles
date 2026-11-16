@@ -23,78 +23,168 @@ pub(crate) const WM_STOCKAGE: u32 = WM_APP + 6;
 /// Un fil court a déposé le chemin reçu par `explorer.open {reuse}` dans `OUVERTURES` : la fenêtre l'ouvre en onglet.
 /// Aucun paramètre (ni pointeur). Voir `recevoir_ouvrir_ici`.
 pub(crate) const WM_OUVRIR_ICI: u32 = WM_APP + 31;
+/// Fin de la vérification des dossiers d'une charge `ONGLETS_COPIES` (fil court de `recevoir_onglets_copies`) : sans pointeur,
+/// la fenêtre prend ses dossiers dans `ONGLETS_RECUS`
+pub(crate) const WM_ONGLETS_COPIES: u32 = WM_APP + 34;
 
-/// Boucles modales de Windows en cours (menu du Shell, glisser vers une autre application, boîte de choix) : leur boucle de
-/// messages distribue pendant que l'appelant tient un `&mut Fenetre`. Un message qui reprendrait cet état (`WM_TELECHARGEMENT`)
-/// ne doit pas agir tout de suite : il attend la fin de la modale.
+/// Boucles modales de Windows en cours (menu du Shell, glisser vers une autre application, boîte de choix, « Ouvrir avec… ») :
+/// leur boucle de messages distribue pendant que l'appelant tient parfois un `&mut Fenetre`. Un message qui ouvrirait un
+/// second `&mut Fenetre` (via `etat_de`) en même temps serait un comportement indéfini : `retenir_si_modale`, appelée en tête de
+/// la procédure, le garde donc de côté et la fin de la modale (`GardeModale`) le reposte.
 static MODALES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-/// Un `WM_TELECHARGEMENT` est arrivé pendant une modale : il est reposté une seule fois, à sa fin
-static TELECHARGEMENT_EN_ATTENTE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-/// Idem pour `WM_OUVRIR_ICI` : ouvrir un onglet remplace `f.app`, ce que la modale en dessous ne supporte pas
-static OUVRIR_ICI_EN_ATTENTE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// Parmi `MODALES`, celles qui sont des glisser-déposer internes (`GardeModale::nouvelle_glisser`)
+static GLISSES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+/// Un `WM_DPICHANGED` est arrivé pendant une modale : `WM_APPARENCE` applique la nouvelle échelle à l'état une fois la modale finie
+pub(crate) static ECHELLE_EN_ATTENTE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// Un `WM_PAINT` a été validé sans dessin pendant une modale : un nouveau est demandé à sa fin
+static REDESSIN_EN_ATTENTE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
-/// Posée autour d'un appel modal ; la détruire à sa sortie reposte le message de téléchargement s'il a été retenu.
+/// Ce que la procédure fait d'un message qui arrive pendant une modale
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SortModale {
+    /// Traité normalement (il ne prend pas l'état de la fenêtre, ou une modale ne peut pas le produire)
+    Passer,
+    /// Gardé, puis reposté à la fin de la modale (charge utile conservée)
+    Retenir,
+    /// `WM_PAINT` : zone validée sans dessin, redessin demandé à la fin
+    Valider,
+    /// Souris, clavier : la fenêtre n'est pas censée en recevoir pendant une modale (menu, propriétaire désactivé) ; s'il en
+    /// vient un quand même, il est perdu plutôt que de prendre l'état (résultat 0)
+    Ignorer,
+    /// Réponse synchrone qui ne se retient pas (zone sous le pointeur, curseur, objet d'accessibilité) : traitée par Windows
+    /// (`DefWindowProc`) sans toucher à l'état de la fenêtre
+    Systeme,
+    /// Message dont `lparam` n'est valable que pendant l'appel (pointeur de texte) : seul le signal est gardé, avec `lparam` à
+    /// 0, puis `DefWindowProc` répond
+    Signaler,
+    /// `WM_DPICHANGED` : le rectangle proposé (`lparam`) n'est valable que pendant l'appel, donc la fenêtre est replacée tout de
+    /// suite (sans toucher à l'état) et le changement d'échelle est rejoué à la fin (`ECHELLE_EN_ATTENTE`)
+    Echelle,
+}
+
+/// Table de décision, pure (testée). Tous les messages privés `WM_APP..` viennent d'un fil ou d'un `PostMessage` et prennent
+/// l'état de la fenêtre : ils attendent. Les minuteries aussi (un tick retenu est unique, voir `FileRetenue`).
+pub(crate) fn sort_en_modale(msg: u32) -> SortModale {
+    match msg {
+        WM_PAINT => SortModale::Valider,
+        // WM_CLOSE : le laisser passer détruirait la fenêtre (WM_DESTROY libère `Fenetre`) sous l'appelant de la modale
+        WM_TIMER | WM_SIZE | WM_CLOSE => SortModale::Retenir,
+        // WM_NCHITTEST, WM_SETCURSOR, WM_GETOBJECT : lisent l'état pour répondre tout de suite, donc ne peuvent pas attendre
+        WM_NCHITTEST | WM_SETCURSOR | WM_GETOBJECT => SortModale::Systeme,
+        // WM_SETTINGCHANGE : `lparam` pointe sur un texte que Windows reprend au retour
+        WM_SETTINGCHANGE => SortModale::Signaler,
+        WM_DPICHANGED => SortModale::Echelle,
+        // Clavier (0x100..=0x109), souris (0x200..=0x20E), menu contextuel (0x7B). `WM_MOUSELEAVE` (0x2A3) est retenu : le perdre
+        // laisserait le survol collé une fois la fenêtre revenue (le suivi de souris ne se réarme qu'à lui)
+        0x0100..=0x0109 | 0x0200..=0x020E | 0x007B => SortModale::Ignorer,
+        0x02A3 => SortModale::Retenir,
+        // Ne touchent pas `Fenetre` : le premier rend le focus au clavier, le second remplit une table indépendante
+        crate::hote_apercu::WM_HOTE_FOCUS | crate::arbre::WM_ARBRE => SortModale::Passer,
+        m if (WM_APP..0xC000).contains(&m) => SortModale::Retenir,
+        _ => SortModale::Passer,
+    }
+}
+
+/// Pendant un glisser-déposer interne (`SHDoDragDrop`), l'appelant ne se sert plus de son `&mut Fenetre` après l'appel (les deux
+/// sites rendent la main juste après, ou relisent l'état par `etat_de`) : le dessin et les minuteries (ouverture d'un dossier
+/// survolé, surbrillance de la cible de dépôt) continuent donc. Tout le reste suit la table ordinaire.
+pub(crate) fn sort_en_glisse(msg: u32) -> SortModale {
+    match msg {
+        WM_PAINT | WM_TIMER => SortModale::Passer,
+        _ => sort_en_modale(msg),
+    }
+}
+
+/// File des messages retenus : (message, wparam, lparam). Un message sans charge (`lparam == 0`) déjà en attente n'est pas
+/// doublé (un tick de minuterie ou un « le dossier a changé » retenu dix fois n'agirait qu'une fois) ; un message qui porte un
+/// pointeur est toujours gardé (chaque boîte doit être reçue une fois). Deux messages sont fusionnés en place : la taille (la
+/// dernière gagne) et la progression d'une opération (le dernier millième gagne), qui sinon s'empileraient par milliers pendant
+/// un menu ouvert longtemps.
+#[derive(Default)]
+pub(crate) struct FileRetenue(Vec<(u32, usize, isize)>);
+
+impl FileRetenue {
+    pub(crate) const fn vide() -> Self {
+        FileRetenue(Vec::new())
+    }
+    pub(crate) fn empiler(&mut self, msg: u32, wparam: usize, lparam: isize) {
+        if lparam == 0 && self.0.contains(&(msg, wparam, 0)) {
+            return;
+        }
+        let fusionne = |e: &&mut (u32, usize, isize)| e.0 == msg && (msg == WM_SIZE || (msg == WM_PROGRES && e.2 == lparam));
+        if let Some(e) = self.0.iter_mut().find(fusionne) {
+            *e = (msg, wparam, lparam);
+            return;
+        }
+        self.0.push((msg, wparam, lparam));
+    }
+    pub(crate) fn vider(&mut self) -> Vec<(u32, usize, isize)> {
+        std::mem::take(&mut self.0)
+    }
+}
+
+static RETENUS: std::sync::Mutex<FileRetenue> = std::sync::Mutex::new(FileRetenue::vide());
+
+/// Posée autour d'un appel modal ; la détruire à la sortie reposte ce qui a été retenu.
 /// Fil d'interface seulement (les compteurs sont atomiques, mais le repost vise la fenêtre de ce fil).
-pub(crate) struct GardeModale(HWND);
+pub(crate) struct GardeModale(HWND, bool);
 
 impl GardeModale {
     pub(crate) fn nouvelle(hwnd: HWND) -> Self {
         MODALES.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        GardeModale(hwnd)
+        GardeModale(hwnd, false)
+    }
+    /// Pour le glisser-déposer interne seulement (voir `sort_en_glisse` : l'appelant ne réutilise pas son `&mut Fenetre`)
+    pub(crate) fn nouvelle_glisser(hwnd: HWND) -> Self {
+        MODALES.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        GLISSES.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        GardeModale(hwnd, true)
     }
 }
 
 impl Drop for GardeModale {
     fn drop(&mut self) {
+        if self.1 {
+            GLISSES.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+        }
         if MODALES.fetch_sub(1, std::sync::atomic::Ordering::SeqCst) == 1 {
-            if TELECHARGEMENT_EN_ATTENTE.swap(false, std::sync::atomic::Ordering::SeqCst) {
-                // SAFETY: PostMessageW est sans effet de bord sur nos données ; `self.0` est la fenêtre qui a ouvert la modale
-                // (échec silencieux si elle n'existe plus)
+            let retenus = RETENUS.lock().unwrap_or_else(|e| e.into_inner()).vider();
+            for (msg, w, l) in retenus {
+                // SAFETY: `l` est soit 0, soit le pointeur de la boîte que l'expéditeur a donnée à ce message ; si l'envoi échoue
+                // (fenêtre détruite) personne ne la recevra et `liberer_charge` la reprend avec son vrai type
                 unsafe {
-                    let _ = PostMessageW(self.0, navigateur::WM_TELECHARGEMENT, WPARAM(0), LPARAM(0));
-                }
-            }
-            if OUVRIR_ICI_EN_ATTENTE.swap(false, std::sync::atomic::Ordering::SeqCst) {
-                // SAFETY: message sans pointeur, même fenêtre que ci-dessus
-                unsafe {
-                    let _ = PostMessageW(self.0, WM_OUVRIR_ICI, WPARAM(0), LPARAM(0));
-                }
-            }
-            // Les réponses de fond de la palette retenues pendant la modale reviennent maintenant
-            let retenus = std::mem::take(&mut *PALETTE_RETENUS.lock().unwrap_or_else(|e| e.into_inner()));
-            for (msg, p) in retenus {
-                // SAFETY: `p` est le pointeur d'une boîte que la palette a donnée au message ; si l'envoi échoue personne ne la recevra
-                // et `liberer_palette` la reprend avec son vrai type
-                unsafe {
-                    if PostMessageW(self.0, msg, WPARAM(0), LPARAM(p)).is_err() {
-                        liberer_palette(msg, p);
+                    if PostMessageW(self.0, msg, WPARAM(w), LPARAM(l)).is_err() && l != 0 {
+                        liberer_charge(msg, l);
                     }
+                }
+            }
+            if REDESSIN_EN_ATTENTE.swap(false, std::sync::atomic::Ordering::SeqCst) {
+                // SAFETY: sans effet de bord sur nos données ; échec silencieux si la fenêtre n'existe plus
+                unsafe {
+                    let _ = InvalidateRect(self.0, None, false);
                 }
             }
         }
     }
 }
 
-/// Réponses de fond de la palette (recherche, lecture d'un dossier, fin de compression) arrivées pendant une modale : (message, boîte)
-static PALETTE_RETENUS: std::sync::Mutex<Vec<(u32, isize)>> = std::sync::Mutex::new(Vec::new());
-
-/// Pendant une modale l'appelant tient `&mut Fenetre` : une réponse de la palette ne le reprend pas, elle est gardée (avec sa boîte) et
-/// reposte à la fin de la modale. Vrai = ne rien faire maintenant ; la propriété de la boîte passe à la liste.
-pub(crate) fn retenir_palette(msg: u32, lparam: LPARAM) -> bool {
-    if MODALES.load(std::sync::atomic::Ordering::SeqCst) > 0 {
-        PALETTE_RETENUS.lock().unwrap_or_else(|e| e.into_inner()).push((msg, lparam.0));
-        true
-    } else {
-        false
-    }
-}
-
-/// Rend une boîte retenue qu'on n'a pas pu reposter, selon le message qui la portait
-unsafe fn liberer_palette(msg: u32, p: isize) {
+/// Rend une boîte retenue qu'on n'a pas pu reposter, selon le message qui la portait. Un message dont `lparam` n'est pas un
+/// pointeur (`WM_PROGRES`, numéro d'opération) tombe dans `_` : rien à libérer.
+unsafe fn liberer_charge(msg: u32, p: isize) {
     match msg {
         WM_PALETTE_RECHERCHE => drop(Box::from_raw(p as *mut (String, Option<Vec<palette::Trouve>>))),
         WM_PALETTE_LECTURE => drop(Box::from_raw(p as *mut assistant::Lecture)),
-        WM_PALETTE_TACHE => drop(Box::from_raw(p as *mut Fini)),
+        WM_PALETTE_TACHE | WM_OUTIL => drop(Box::from_raw(p as *mut Fini)),
+        WM_LECTURE => drop(Box::from_raw(p as *mut Lecture)),
+        WM_GIT => drop(Box::from_raw(p as *mut (u64, Option<Git>))),
+        WM_FOND => drop(Box::from_raw(p as *mut MessageFond)),
+        etats::WM_ETATS => drop(Box::from_raw(p as *mut Vec<(String, etats::Etat)>)),
+        ocr::WM_OCR => drop(Box::from_raw(p as *mut ocr::Resultat)),
+        WM_VIGNETTE => drop(Box::from_raw(p as *mut (String, Option<Image>))),
+        WM_GALERIE => drop(Box::from_raw(p as *mut crate::apercu::PageGalerie)),
+        WM_OPERATION_FINIE => drop(Box::from_raw(p as *mut Bilan)),
+        WM_STOCKAGE => drop(Box::from_raw(p as *mut std::result::Result<String, String>)),
+        WM_APERCU => drop(Box::from_raw(p as *mut Apercu)),
         _ => {}
     }
 }
@@ -104,23 +194,157 @@ pub(crate) fn modale_en_cours() -> bool {
     MODALES.load(std::sync::atomic::Ordering::SeqCst) > 0
 }
 
-/// `WM_OUVRIR_ICI` pendant une modale : retenu et reposté à la fin ; vrai = ne rien faire maintenant.
-pub(crate) fn retenir_ouvrir_ici() -> bool {
-    if MODALES.load(std::sync::atomic::Ordering::SeqCst) > 0 {
-        OUVRIR_ICI_EN_ATTENTE.store(true, std::sync::atomic::Ordering::SeqCst);
-        true
+/// Appelée en tête de la procédure, avant tout `etat_de`. `Some(résultat)` = le message est réglé ici (retenu ou validé) ;
+/// `None` = la procédure le traite normalement. Hors modale : toujours `None`, au prix d'une lecture atomique.
+pub(crate) unsafe fn retenir_si_modale(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> Option<LRESULT> {
+    if !modale_en_cours() {
+        return None;
+    }
+    // Que des glisser-déposer en cours : table allégée ; une autre modale (menu, boîte) en même temps : table complète
+    let sort = if MODALES.load(std::sync::atomic::Ordering::SeqCst) == GLISSES.load(std::sync::atomic::Ordering::SeqCst) {
+        sort_en_glisse(msg)
     } else {
-        false
+        sort_en_modale(msg)
+    };
+    match sort {
+        SortModale::Passer => None,
+        SortModale::Retenir => {
+            // Le `lparam` d'une minuterie est un pointeur de rappel (nul ici) : forcé à 0 pour que le tick retenu soit unique
+            let l = if msg == WM_TIMER { 0 } else { lparam.0 };
+            RETENUS.lock().unwrap_or_else(|e| e.into_inner()).empiler(msg, wparam.0, l);
+            Some(LRESULT(0))
+        }
+        SortModale::Echelle => {
+            // Un message forgé par un autre processus peut porter un pointeur nul (`panic = abort` : on l'écarte)
+            if lparam.0 == 0 {
+                return Some(LRESULT(0));
+            }
+            // SAFETY: pour WM_DPICHANGED, `lparam` pointe sur un RECT valable pendant l'appel (contrat de Windows)
+            let r = &*(lparam.0 as *const RECT);
+            let _ = SetWindowPos(hwnd, None, r.left, r.top, r.right - r.left, r.bottom - r.top, SWP_NOZORDER | SWP_NOACTIVATE);
+            ECHELLE_EN_ATTENTE.store(true, std::sync::atomic::Ordering::SeqCst);
+            RETENUS.lock().unwrap_or_else(|e| e.into_inner()).empiler(WM_APPARENCE, 0, 0);
+            Some(LRESULT(0))
+        }
+        SortModale::Ignorer => Some(LRESULT(0)),
+        SortModale::Systeme => Some(DefWindowProcW(hwnd, msg, wparam, lparam)),
+        SortModale::Signaler => {
+            RETENUS.lock().unwrap_or_else(|e| e.into_inner()).empiler(msg, wparam.0, 0);
+            Some(DefWindowProcW(hwnd, msg, wparam, lparam))
+        }
+        SortModale::Valider => {
+            // Sans BeginPaint/EndPaint la zone resterait sale et Windows renverrait WM_PAINT sans fin pendant la modale
+            let mut ps = PAINTSTRUCT::default();
+            BeginPaint(hwnd, &mut ps);
+            let _ = EndPaint(hwnd, &ps);
+            REDESSIN_EN_ATTENTE.store(true, std::sync::atomic::Ordering::SeqCst);
+            Some(LRESULT(0))
+        }
     }
 }
 
-/// Une modale tourne-t-elle ? Si oui, le message est retenu (et reposté à la fin) ; vrai = ne rien faire maintenant.
-pub(crate) fn retenir_telechargement() -> bool {
-    if MODALES.load(std::sync::atomic::Ordering::SeqCst) > 0 {
-        TELECHARGEMENT_EN_ATTENTE.store(true, std::sync::atomic::Ordering::SeqCst);
-        true
-    } else {
-        false
+#[cfg(test)]
+mod tests_modale {
+    use super::*;
+
+    #[test]
+    fn les_messages_prives_sont_retenus() {
+        // Les quatorze qui n'avaient aucune retenue, plus ceux qui en avaient une éparpillée
+        for m in [
+            WM_PROGRES, WM_CHANGEMENT, WM_LECTURE, WM_VIGNETTE, WM_GALERIE, WM_OPERATION_FINIE, etats::WM_ETATS, index::WM_INDEX, WM_GIT, WM_FOND, WM_OUTIL, ocr::WM_OCR, WM_STOCKAGE,
+            WM_APERCU, WM_APPARENCE, minuteries::WM_IMAGE_ANIMATION, navigateur::WM_TELECHARGEMENT, WM_OUVRIR_ICI, WM_ONGLETS_COPIES, WM_PALETTE_RECHERCHE, WM_PALETTE_LECTURE, WM_PALETTE_TACHE,
+            accessibilite::WM_UIA_ACTION,
+        ] {
+            assert_eq!(sort_en_modale(m), SortModale::Retenir, "message {m:#x}");
+        }
+    }
+
+    #[test]
+    fn minuterie_retenue_paint_valide_le_reste_passe() {
+        assert_eq!(sort_en_modale(WM_TIMER), SortModale::Retenir);
+        assert_eq!(sort_en_modale(WM_PAINT), SortModale::Valider);
+        // Ne touchent pas `Fenetre`
+        assert_eq!(sort_en_modale(crate::hote_apercu::WM_HOTE_FOCUS), SortModale::Passer);
+        assert_eq!(sort_en_modale(crate::arbre::WM_ARBRE), SortModale::Passer);
+        // Hors plage privée : clavier, taille, WM_COPYDATA (a son propre refus), messages enregistrés (>= 0xC000)
+        for m in [WM_COPYDATA, WM_DESTROY, WM_QUERYENDSESSION, WM_ENDSESSION, WM_ACTIVATE, WM_ERASEBKGND, 0xC000, 0xC123] {
+            assert_eq!(sort_en_modale(m), SortModale::Passer, "message {m:#x}");
+        }
+    }
+
+    #[test]
+    fn fermeture_echelle_et_sortie_de_souris() {
+        // Fermer pendant une modale détruirait `Fenetre` sous l'appelant : retenu, rejoué à la fin
+        assert_eq!(sort_en_modale(WM_CLOSE), SortModale::Retenir);
+        // Le rectangle de WM_DPICHANGED ne survit pas à l'appel : traitement dédié
+        assert_eq!(sort_en_modale(WM_DPICHANGED), SortModale::Echelle);
+        // Perdre WM_MOUSELEAVE laisserait le survol collé
+        assert_eq!(sort_en_modale(0x02A3), SortModale::Retenir);
+    }
+
+    #[test]
+    fn le_glisser_garde_le_dessin_et_les_minuteries() {
+        assert_eq!(sort_en_glisse(WM_PAINT), SortModale::Passer);
+        assert_eq!(sort_en_glisse(WM_TIMER), SortModale::Passer);
+        // Le reste suit la table ordinaire
+        for m in [WM_PROGRES, WM_CLOSE, WM_SIZE, WM_DPICHANGED, WM_KEYDOWN, WM_NCHITTEST, WM_SETTINGCHANGE] {
+            assert_eq!(sort_en_glisse(m), sort_en_modale(m), "message {m:#x}");
+        }
+    }
+
+    #[test]
+    fn taille_et_progression_sont_fusionnees() {
+        let mut f = FileRetenue::vide();
+        f.empiler(WM_PROGRES, 100, 1);
+        f.empiler(WM_SIZE, 0, 0x0100_0100);
+        f.empiler(WM_PROGRES, 500, 2);
+        f.empiler(WM_PROGRES, 900, 1);
+        f.empiler(WM_SIZE, 0, 0x0200_0200);
+        // Une entrée par opération et une seule taille, à la place de la première, avec la dernière valeur
+        assert_eq!(f.vider(), vec![(WM_PROGRES, 900, 1), (WM_SIZE, 0, 0x0200_0200), (WM_PROGRES, 500, 2)]);
+    }
+
+    #[test]
+    fn entrees_reponses_synchrones_et_taille() {
+        // Clavier : jamais l'état pendant une modale
+        for m in [WM_KEYDOWN, WM_SYSKEYDOWN, WM_CHAR, WM_KEYUP] {
+            assert_eq!(sort_en_modale(m), SortModale::Ignorer, "message {m:#x}");
+        }
+        // Les bornes de la plage des entrées de pointeur (0x200..=0x20E) et les deux messages isolés
+        for m in [0x0200u32, 0x0201, 0x020A, 0x020E, 0x007B] {
+            assert_eq!(sort_en_modale(m), SortModale::Ignorer, "message {m:#x}");
+        }
+        assert_eq!(sort_en_modale(0x020F), SortModale::Passer);
+        // Réponse immédiate exigée : Windows répond, l'état n'est pas pris
+        for m in [WM_NCHITTEST, WM_SETCURSOR, WM_GETOBJECT] {
+            assert_eq!(sort_en_modale(m), SortModale::Systeme, "message {m:#x}");
+        }
+        assert_eq!(sort_en_modale(WM_SETTINGCHANGE), SortModale::Signaler);
+        // La taille est rejouée à la fin dans l'ordre d'arrivée : la dernière gagne
+        assert_eq!(sort_en_modale(WM_SIZE), SortModale::Retenir);
+    }
+
+    #[test]
+    fn la_file_garde_l_ordre_et_chaque_charge() {
+        let mut f = FileRetenue::vide();
+        f.empiler(WM_LECTURE, 0, 0x1000);
+        f.empiler(WM_LECTURE, 0, 0x2000);
+        f.empiler(WM_OUTIL, 0, 0x3000);
+        // Deux boîtes distinctes du même message : les deux sont gardées, dans l'ordre d'arrivée
+        assert_eq!(f.vider(), vec![(WM_LECTURE, 0, 0x1000), (WM_LECTURE, 0, 0x2000), (WM_OUTIL, 0, 0x3000)]);
+        assert!(f.vider().is_empty(), "la file se vide une seule fois");
+    }
+
+    #[test]
+    fn un_message_sans_charge_n_est_pas_double() {
+        let mut f = FileRetenue::vide();
+        for _ in 0..5 {
+            f.empiler(WM_TIMER, 7, 0);
+            f.empiler(WM_CHANGEMENT, 3, 0);
+        }
+        f.empiler(WM_TIMER, 8, 0);
+        // Même message avec un autre wparam : distinct
+        assert_eq!(f.vider(), vec![(WM_TIMER, 7, 0), (WM_CHANGEMENT, 3, 0), (WM_TIMER, 8, 0)]);
     }
 }
 
@@ -453,8 +677,46 @@ impl Fenetre {
         if dessinee != Some(p.cle) || !pastilles::bouton_autorise(p, bouton) {
             return;
         }
+        let (p, onglet) = (p.clone(), *onglet);
+        self.agir_bouton_pastille(hwnd, &p, onglet, bouton);
+    }
+
+    /// Un bouton de pastille activé par l'accessibilité (motif Invoke) : la pastille est retrouvée par sa clé, son libellé et son rang d'occurrence
+    /// (les fins et erreurs ont toutes la clé 0), pas par un rang, car la liste a pu changer entre la lecture du lecteur d'écran et ce message. Contrairement au clic, elle n'a pas besoin d'avoir
+    /// été dessinée (un lecteur d'écran agit sans souris et la fenêtre peut être masquée). Faux si elle n'existe plus, si une modale est
+    /// ouverte ou si le bouton n'est pas permis.
+    /// Invariant (unsafe) : fil d'interface, `hwnd` est la fenêtre principale vivante ; aucune référence n'est gardée après l'appel.
+    pub(crate) unsafe fn bouton_pastille_uia(&mut self, hwnd: HWND, cle: u64, libelle: &str, occurrence: usize, bouton: pastilles::Bouton) -> bool {
+        if self.modale() {
+            return false;
+        }
+        let Some((p, onglet)) = self.pastilles().into_iter().filter(|(p, _)| p.cle == cle && p.libelle == libelle).nth(occurrence) else { return false };
+        if !pastilles::bouton_autorise(&p, bouton) {
+            return false;
+        }
+        self.agir_bouton_pastille(hwnd, &p, onglet, bouton);
+        true
+    }
+
+    /// Ouvre le dossier de destination de la première pastille qui en a un (raccourci Ctrl+Maj+O) ; faux s'il n'y en a pas
+    /// Invariant (unsafe) : fil d'interface, `hwnd` est la fenêtre principale vivante ; aucune référence n'est gardée après l'appel.
+    pub(crate) unsafe fn ouvrir_destination(&mut self, hwnd: HWND) -> bool {
+        if self.modale() {
+            return false;
+        }
+        let Some((p, onglet)) =
+            self.pastilles().into_iter().find(|(p, _)| p.destination.is_some() && pastilles::bouton_autorise(p, pastilles::Bouton::Destination))
+        else {
+            return false;
+        };
+        self.agir_bouton_pastille(hwnd, &p, onglet, pastilles::Bouton::Destination);
+        true
+    }
+
+    /// Le corps commun d'un bouton de pastille, une fois la pastille et le bouton validés par l'appelant
+    /// Invariant (unsafe) : fil d'interface, `hwnd` est la fenêtre principale vivante ; aucune référence n'est gardée après l'appel.
+    unsafe fn agir_bouton_pastille(&mut self, hwnd: HWND, p: &pastilles::Pastille, onglet: usize, bouton: pastilles::Bouton) {
         let destination = p.destination.clone();
-        let onglet = *onglet;
         // Pastille d'un téléchargement du navigateur : ni onglet ni opération, la clé dit laquelle
         if navigateur::est_cle(p.cle) {
             match bouton {

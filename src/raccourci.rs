@@ -8,6 +8,7 @@ use std::sync::atomic::{AtomicBool, AtomicIsize, Ordering};
 
 use windows::core::{w, HSTRING};
 use windows::Win32::Foundation::*;
+use windows::Win32::System::Com::{CoInitializeEx, CoUninitialize, COINIT_APARTMENTTHREADED, COINIT_DISABLE_OLE1DDE};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Threading::CreateMutexW;
 use windows::Win32::UI::Input::KeyboardAndMouse::*;
@@ -126,15 +127,40 @@ unsafe extern "system" fn crochet(code: i32, wparam: WPARAM, lparam: LPARAM) -> 
     CallNextHookEx(None, code, wparam, lparam)
 }
 
+/// Ouvre une fenêtre SpaceFiles (nouveau processus, même exe). `ShellExecuteW` peut attendre le shell, charger des
+/// extensions et pomper des messages : dans la procédure de la fenêtre cachée, un shell lent ou bloqué figeait aussi
+/// le service de recherche, la libération de l'index et l'arrêt du résident. Il part donc sur un fil court, avec son
+/// propre COM (la doc de `ShellExecute` le demande) ; la procédure revient aussitôt.
+fn lancer_fenetre() {
+    let Ok(exe) = std::env::current_exe() else { return };
+    let lancer = |exe: &std::path::Path| unsafe {
+        // SAFETY : CoInitializeEx et CoUninitialize s'apparient sur le fil appelant (seul un succès est libéré) ; la chaîne
+        // HSTRING, terminée par un zéro, vit pendant tout l'appel. Dans le repli, ce fil est celui de l'interface : l'appel
+        // peut y pomper des messages, comme l'ancien code.
+        let com = CoInitializeEx(None, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE).is_ok();
+        let retour = ShellExecuteW(None, None, &HSTRING::from(exe.as_os_str()), None, None, SW_SHOWNORMAL);
+        // 32 ou moins : échec (exe déplacé, refus) ; sans trace, un Win+E qui ne fait rien ne laisse rien à lire
+        if retour.0 as isize <= 32 {
+            crate::journal::ecrire(crate::journal::Niveau::Avert, "raccourci", "echec du lancement de la fenetre (Win+E)");
+        }
+        if com {
+            CoUninitialize();
+        }
+    };
+    let copie = exe.clone();
+    // Fil impossible à créer (mémoire) : mieux vaut lancer sur place que perdre le Win+E
+    if std::thread::Builder::new().name("lancer-fenetre".into()).spawn(move || lancer(&copie)).is_err() {
+        lancer(&exe);
+    }
+}
+
 extern "system" fn procedure(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     unsafe {
         match msg {
             WM_OUVRIR => {
                 // Win est encore enfoncée : la touche vide empêche le menu Démarrer de s'ouvrir au relâchement
                 masquer_demarrer();
-                if let Ok(exe) = std::env::current_exe() {
-                    ShellExecuteW(None, None, &HSTRING::from(exe.as_os_str()), None, None, SW_SHOWNORMAL);
-                }
+                lancer_fenetre();
                 LRESULT(0)
             }
             WM_EFFACER_INDEX => {

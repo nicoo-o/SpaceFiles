@@ -67,6 +67,17 @@ pub const CHAMP_FOND: D2D1_COLOR_F = rgba(8, 8, 8, 0.96);
 pub const PIXEL_JOUR: D2D1_COLOR_F = rgba(0x7F, 0xE6, 0xFF, 1.0);
 /// `PIXEL_JOUR` en thème clair : `vers_clair` l'y envoie (le cyan clair sur fond clair serait invisible)
 pub const PIXEL_JOUR_CLAIR: D2D1_COLOR_F = rgba(0x0B, 0x7A, 0x99, 1.0);
+/// Couleurs de groupes pastel, pensées pour le fond noir (audit R49 : 2,40 / 2,25 / 1,63 / 2,03:1 sur le fond clair, sous les
+/// 3:1 des éléments graphiques). `vers_clair` les envoie sur leur version foncée, de même teinte, au-dessus de 3,4:1.
+pub const GROUPE_VIOLET: D2D1_COLOR_F = rgba(0xB5, 0x8C, 0xFF, 1.0);
+pub const GROUPE_BLEU: D2D1_COLOR_F = rgba(0x6A, 0xA9, 0xFF, 1.0);
+pub const GROUPE_VERT: D2D1_COLOR_F = rgba(0x7B, 0xD8, 0x8F, 1.0);
+pub const GROUPE_AMBRE: D2D1_COLOR_F = rgba(0xE8, 0xA3, 0x17, 1.0);
+/// Versions foncées en thème clair : 3,96 / 3,90 / 3,85 / 3,97:1 sur `FOND_CLAIR` (mesure de `tableau_contrastes`)
+const GROUPE_VIOLET_CLAIR: D2D1_COLOR_F = rgba(0x8B, 0x5C, 0xF6, 1.0);
+const GROUPE_BLEU_CLAIR: D2D1_COLOR_F = rgba(0x2F, 0x7B, 0xE0, 1.0);
+const GROUPE_VERT_CLAIR: D2D1_COLOR_F = rgba(0x27, 0x8F, 0x43, 1.0);
+const GROUPE_AMBRE_CLAIR: D2D1_COLOR_F = rgba(0xA8, 0x6F, 0x00, 1.0);
 /// Disque posé sous la case à cocher d'une vignette de la grille (survol, sélection multiple). Même valeur qu'un voile de
 /// fond modal : c'est pourquoi `contraste_ou` lui donne sa valeur claire par jeton au lieu de la deviner à la teinte.
 pub const DISQUE_CASE: D2D1_COLOR_F = rgba(0, 0, 0, 0.55);
@@ -211,7 +222,8 @@ fn meme_teinte(c: &D2D1_COLOR_F, k: &D2D1_COLOR_F) -> bool {
     (c.r - k.r).abs() < 0.002 && (c.g - k.g).abs() < 0.002 && (c.b - k.b).abs() < 0.002
 }
 
-/// Un jeton sombre vu en thème clair. Sans effet sur ce qui n'est pas listé (couleurs de groupes, de balises, `GROUPE_ROUGE`).
+/// Un jeton sombre vu en thème clair. Sans effet sur ce qui n'est pas listé (gris, rouge de groupe et de balise : déjà à
+/// 3,1:1 ou plus ; les quatre pastels violet, bleu, vert et ambre sont assombris).
 pub fn vers_clair(c: &D2D1_COLOR_F) -> D2D1_COLOR_F {
     let avec_alpha = |k: (u8, u8, u8), a: f32| rgba(k.0, k.1, k.2, a);
     // Texte posé sur un aplat d'accent : alpha 1 exactement (le VOILE a la même teinte mais 0,92)
@@ -229,6 +241,11 @@ pub fn vers_clair(c: &D2D1_COLOR_F) -> D2D1_COLOR_F {
     }
     if meme_teinte(c, &PIXEL_JOUR) {
         return D2D1_COLOR_F { a: c.a, ..PIXEL_JOUR_CLAIR };
+    }
+    for (sombre, clair) in [(&GROUPE_VIOLET, &GROUPE_VIOLET_CLAIR), (&GROUPE_BLEU, &GROUPE_BLEU_CLAIR), (&GROUPE_VERT, &GROUPE_VERT_CLAIR), (&GROUPE_AMBRE, &GROUPE_AMBRE_CLAIR)] {
+        if meme_teinte(c, sombre) {
+            return D2D1_COLOR_F { a: c.a, ..*clair };
+        }
     }
     if c.r > 0.99 && c.g > 0.99 && c.b > 0.99 {
         return avec_alpha(ENCRE_CLAIRE, alpha_encre(c.a));
@@ -901,10 +918,29 @@ pub(crate) mod tests {
         }
     }
 
-    /// Ce que le thème clair ne touche pas : couleurs de groupes et de balises, ombres et voiles de fond translucides
+    /// Audit R49 : en thème clair, aucune couleur de groupe ni de balise n'est sous 3:1 sur le fond (avant : violet 2,40, bleu
+    /// 2,25, vert 1,63, ambre 2,03). Teinte et alpha restent ceux du jeton sombre ; le sombre ne change pas d'un bit.
+    #[test]
+    fn groupes_lisibles_en_clair() {
+        let fond = rgba(247, 247, 248, 1.0);
+        for (c, nom) in crate::groupes::COULEURS {
+            let sombre = crate::rendu::Rendu::couleur_groupe(c);
+            let vu = transformer(&sombre, true, false, false);
+            assert!(rapport(&vu, &fond) >= 3.0, "groupe {nom} : {:.2}:1 en thème clair", rapport(&vu, &fond));
+            assert!(meme(&transformer(&sombre, false, false, false), &sombre), "groupe {nom} change en sombre");
+        }
+        // L'alpha d'un fondu est gardé
+        let fondu = D2D1_COLOR_F { a: 0.4, ..GROUPE_VERT };
+        assert_eq!(transformer(&fondu, true, false, false).a, 0.4);
+        // Une couleur proche mais autre n'est pas prise pour un groupe
+        let autre = rgba(0xB5, 0x8C, 0xF0, 1.0);
+        assert!(meme(&transformer(&autre, true, false, false), &autre));
+    }
+
+    /// Ce que le thème clair ne touche pas : gris et rouge de groupe, balises, ombres et voiles de fond translucides
     #[test]
     fn clair_laisse_groupes_et_ombres() {
-        let intactes = [GROUPE_ROUGE, rgba(140, 140, 140, 1.0), rgba(0xE8, 0xA3, 0x17, 1.0), rgba(0x46, 0xB8, 0x7C, 1.0), rgba(0x4C, 0x8D, 0xF6, 1.0), rgba(0, 0, 0, 0.35), rgba(0, 0, 0, 0.55), rgba(0, 0, 0, 0.18)];
+        let intactes = [GROUPE_ROUGE, rgba(140, 140, 140, 1.0), rgba(0x46, 0xB8, 0x7C, 1.0), rgba(0x4C, 0x8D, 0xF6, 1.0), rgba(0, 0, 0, 0.35), rgba(0, 0, 0, 0.55), rgba(0, 0, 0, 0.18)];
         for c in intactes {
             assert!(meme(&transformer(&c, true, false, false), &c), "{c:?} doit rester inchangée en clair");
         }

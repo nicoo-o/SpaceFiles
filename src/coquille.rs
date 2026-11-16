@@ -143,7 +143,10 @@ pub unsafe fn menu(hwnd: HWND, chemins: &[String], dossier: Option<&str>, x: i32
                 ptInvoke: POINT { x, y },
                 ..Default::default()
             };
+            // Une commande du menu (Propriétés, Partager, Ouvrir avec…) ouvre souvent une boîte avec cette fenêtre pour parent
+            let garde_commande = crate::fenetre::GardeModale::nouvelle(hwnd);
             let r = cm.InvokeCommand(&info as *const _ as *const CMINVOKECOMMANDINFO);
+            drop(garde_commande);
             choix = Choix::Fait;
             if let Err(e) = r {
                 // L'utilisateur qui annule une boîte de dialogue n'est pas une erreur
@@ -175,7 +178,10 @@ pub unsafe fn invoquer(hwnd: HWND, chemins: &[String], verbe_a: &str) -> Result<
         nShow: SW_SHOWNORMAL.0,
         ..Default::default()
     };
+    // La commande peut ouvrir une boîte modale (Propriétés, Partager) : voir `GardeModale`
+    let garde = crate::fenetre::GardeModale::nouvelle(hwnd);
     let r = cm.InvokeCommand(&info as *const _ as *const CMINVOKECOMMANDINFO);
+    drop(garde);
     let _ = DestroyMenu(hmenu);
     match r {
         Err(e) if e.code() != ERROR_CANCELLED.to_hresult() => Err(e),
@@ -214,6 +220,8 @@ pub unsafe fn applications(ext: &str) -> Vec<Application> {
 /// Ouvre les fichiers avec cette application
 pub unsafe fn ouvrir_avec(hwnd: HWND, chemins: &[String], a: &Application) -> Result<()> {
     let donnees: IDataObject = objet_elements(hwnd, chemins)?;
+    // Certaines applications montrent une boîte modale avant de s'ouvrir (voir `GardeModale`)
+    let _garde = crate::fenetre::GardeModale::nouvelle(hwnd);
     a.gestionnaire.Invoke(&donnees)
 }
 
@@ -221,6 +229,8 @@ pub unsafe fn ouvrir_avec(hwnd: HWND, chemins: &[String], a: &Application) -> Re
 pub unsafe fn choisir_application(hwnd: HWND, chemin: &str) -> Result<()> {
     let w = wide(chemin);
     let info = OPENASINFO { pcszFile: PCWSTR(w.as_ptr()), pcszClass: PCWSTR::null(), oaifInFlags: OAIF_ALLOW_REGISTRATION | OAIF_REGISTER_EXT | OAIF_EXEC };
+    // Boîte modale : voir `GardeModale`
+    let _garde = crate::fenetre::GardeModale::nouvelle(hwnd);
     match SHOpenWithDialog(hwnd, &info) {
         Err(e) if e.code() != ERROR_CANCELLED.to_hresult() => Err(e),
         _ => Ok(()),
@@ -244,7 +254,9 @@ unsafe fn verbe(cm: &IContextMenu, decalage: u32) -> String {
 pub unsafe fn glisser(hwnd: HWND, chemins: &[String]) -> Result<DROPEFFECT> {
     let donnees: IDataObject = objet_elements(hwnd, chemins)?;
     // Boucle modale jusqu'au dépôt (voir `GardeModale`)
-    let _garde = crate::fenetre::GardeModale::nouvelle(hwnd);
+    // Les deux appelants (procedure.rs, WM_MOUSEMOVE et WM_LBUTTONDOWN) ne se servent plus de leur `&mut Fenetre` après cet appel :
+    // le dessin et les minuteries continuent pendant le glisser (voir `sort_en_glisse`)
+    let _garde = crate::fenetre::GardeModale::nouvelle_glisser(hwnd);
     SHDoDragDrop(hwnd, &donnees, None, DROPEFFECT_COPY | DROPEFFECT_MOVE | DROPEFFECT_LINK)
 }
 
