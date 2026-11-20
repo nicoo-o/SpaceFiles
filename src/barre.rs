@@ -37,17 +37,43 @@ pub fn bouton() -> f32 {
 pub const DENSITE_LARGEUR: f32 = 128.0;
 const DENSITE_ECART: f32 = 16.0;
 const DENSITE_BOUTON: f32 = 61.0;
+/// Marge entre le cadre d'un groupe de la barre et le fond de son élément actif (lot 4 de l'audit UX)
+pub const GROUPE_MARGE: f32 = 3.0;
 const ICONE: f32 = 30.0;
 const CHEVRON: f32 = 16.0;
 const ESPACE: f32 = 2.0;
 const SEPARATION: f32 = 14.0;
 
 impl Outil {
-    /// Rayon de coin du fond de l'outil : une pilule (`bouton() / 2`) pour « + NOUVEAU » (maquette `.btn`), 10 pour les autres.
-    /// Le fond, le contour et le reflet du curseur le partagent : le reflet avait un coin de 8 et dessinait, autour de la pilule,
-    /// une seconde forme carrée aux coins arrondis.
+    /// Outil du groupe des vues : posé dans un cadre en pilule, son fond (actif, survol, reflet) est inscrit dans ce cadre
+    pub fn est_vue(self) -> bool {
+        matches!(self, Outil::VueListe | Outil::VueGrille | Outil::VueColonnes | Outil::VueTailles | Outil::Double)
+    }
+
+    /// Forme du fond de l'outil, dans sa zone de clic (qui ne change pas) : `(rectangle, rayon)`. Lot 4 de l'audit UX : les groupes
+    /// de la barre (NOUVEAU, CONFORT / COMPACT, vues) ont **un seul cadre** en pilule de la hauteur d'un bouton, et l'élément actif
+    /// est un fond plein, sans contour, concentrique au cadre (`GROUPE_MARGE` de chaque côté, rayon = moitié de la hauteur restante).
+    /// Les outils isolés gardent le coin moyen sur toute la zone. Le fond, le fond glissant et le reflet lisent cette seule fonction.
+    pub fn forme(self, zone: D2D_RECT_F) -> (D2D_RECT_F, f32) {
+        if self.est_vue() {
+            let interieur = rect(zone.left, zone.top + GROUPE_MARGE, zone.right - zone.left, zone.bottom - zone.top - 2.0 * GROUPE_MARGE);
+            (interieur, (interieur.bottom - interieur.top) / 2.0)
+        } else {
+            (zone, self.rayon_coin())
+        }
+    }
+
+    /// Rayon de coin du fond de l'outil : une pilule (`bouton() / 2`) pour « + NOUVEAU » (maquette `.btn`), la pilule intérieure du
+    /// cadre pour les vues, `RAYON_MOYEN` pour les autres. Le fond, le contour et le reflet du curseur le partagent : le reflet avait
+    /// un coin de 8 et dessinait, autour de la pilule, une seconde forme carrée aux coins arrondis.
     pub fn rayon_coin(self) -> f32 {
-        if self == Outil::Nouveau { bouton() / 2.0 } else { 10.0 }
+        if self == Outil::Nouveau {
+            bouton() / 2.0
+        } else if self.est_vue() {
+            bouton() / 2.0 - GROUPE_MARGE
+        } else {
+            crate::theme::RAYON_MOYEN
+        }
     }
 
     /// Texte court (boutons à libellé) ; vide : icône seule
@@ -246,9 +272,18 @@ mod tests {
     fn une_seule_forme_pour_le_bouton_nouveau() {
         // Fond, contour et reflet lisent le même rayon : la pilule (moitié de la hauteur), jamais le coin de 8 du reflet d'avant
         assert_eq!(Outil::Nouveau.rayon_coin(), bouton() / 2.0);
-        for o in [Outil::Copier, Outil::Supprimer, Outil::Trier, Outil::VueListe, Outil::Plus] {
-            assert_eq!(o.rayon_coin(), 10.0);
+        for o in [Outil::Copier, Outil::Supprimer, Outil::Trier, Outil::Plus] {
+            assert_eq!(o.rayon_coin(), crate::theme::RAYON_MOYEN);
         }
+        // Lot 4 : le fond d'une vue est la pilule intérieure du cadre du groupe (marge `GROUPE_MARGE`), concentrique à lui
+        let zone = rect(100.0, 10.0, ICONE, bouton());
+        let (fond, rayon) = Outil::VueListe.forme(zone);
+        assert_eq!(rayon, bouton() / 2.0 - GROUPE_MARGE);
+        assert_eq!(fond.bottom - fond.top, bouton() - 2.0 * GROUPE_MARGE);
+        assert_eq!((fond.left, fond.right), (zone.left, zone.right));
+        // Hors des vues, le fond est la zone entière
+        let (fond, _) = Outil::Copier.forme(zone);
+        assert_eq!((fond.top, fond.bottom), (zone.top, zone.bottom));
         // Le rayon d'une pilule ne dépasse jamais la moitié de la hauteur du bouton
         assert!(Outil::Nouveau.rayon_coin() * 2.0 <= bouton());
     }

@@ -223,8 +223,6 @@ pub enum Cible {
     Onglet(usize),
     FermerOnglet(usize),
     NouvelOnglet,
-    /// Loupe de la barre haute
-    RechercheHaut,
     /// Mode Essentiel de la barre haute
     EssentielHaut,
     /// Section CLOUD du volet
@@ -235,6 +233,8 @@ pub enum Cible {
     Groupe(usize),
     /// Entrée « CE PC » en tête du volet
     CePc,
+    /// Entrée « ESPACE DISQUE » sous Ce PC en tête du volet : ouvre la page ESPACE
+    EspaceVolet,
     /// Titre d'une section du volet (clic : replier / déplier) : rang dans rendu::SECTIONS_VOLET
     TitreVolet(u8),
     /// Ligne de l'arbre de dossiers du volet (rang dans `App::lignes_arbre`)
@@ -249,12 +249,34 @@ pub enum Cible {
     StockageCePc(usize),
     /// « + AJOUTER UN STOCKAGE » en bas de la vue Ce PC (clic : formulaire des réglages)
     AjouterStockage,
+    /// Ligne « ESPACE » en bas de la vue Ce PC : ouvre la page ESPACE (E1)
+    OuvrirEspace,
+    /// Carte « RÉCUPÉRABLE » de la vue Ce PC (E9, seulement s'il y a une analyse) : ouvre la page NETTOYAGE
+    OuvrirNettoyage,
     /// Bouton « réglages » en haut à droite
     Reglages,
     /// Croix du panneau Réglages
     ReglagesFermer,
     /// Catégorie du rail des Réglages (rang dans page::CATEGORIES)
     ReglagesNav(usize),
+    /// Croix de la page ESPACE : retour à l'emplacement précédent
+    EspaceFermer,
+    /// Page du rail de la page ESPACE (rang dans espace::PAGES)
+    EspaceNav(usize),
+    /// Ligne de l'arbre de la page ESPACE
+    EspaceLigne(usize),
+    /// Segment du contrôle de vue de la page ESPACE : carte, arbre, types, gros fichiers, âge (rang dans espace::VUES)
+    EspaceVue(usize),
+    /// Rectangle de la carte de la page ESPACE
+    EspaceCellule(usize),
+    /// Pastille du fil d'Ariane de la carte (profondeur de pile à rejoindre : 0 = les disques)
+    EspaceChemin(usize),
+    /// Ligne de la liste de la page NETTOYAGE (rang de la catégorie)
+    NettoyageLigne(usize),
+    /// Case à cocher d'une ligne de la page NETTOYAGE (rang de la catégorie)
+    NettoyageCase(usize),
+    /// Bouton du bas de la page NETTOYAGE (`rendu::NET_SUPPRIMER`, `NET_CONFIRMER`, `NET_ANNULER`)
+    NettoyageBouton(usize),
     /// Ligne de la page des réglages
     Reglage(usize),
     /// Élément du formulaire « ajouter un stockage »
@@ -271,6 +293,14 @@ pub enum Cible {
     TerminalFermer,
     /// « Ouvrir dans Windows Terminal » dans le panneau terminal
     TerminalExterne,
+    /// Onglet de rang `i` du panneau terminal (T4a ; clic : l'afficher)
+    TerminalOnglet(usize),
+    /// Croix de l'onglet de rang `i` du panneau terminal (clic : le fermer ; le dernier ferme le panneau)
+    TerminalOngletFermer(usize),
+    /// Bouton « + » du panneau terminal (un onglet de plus)
+    TerminalNouveau,
+    /// Onglet « JOURNAL » du panneau terminal (T4c ; clic : afficher le journal des opérations à la place du shell)
+    TerminalJournal,
     /// Corps du panneau terminal : un clic ne doit pas atteindre la liste dessous
     TerminalPanneau,
     /// L'autre panneau (double panneau, F6) : un clic lui donne le focus
@@ -300,9 +330,9 @@ impl Cible {
                 | Cible::Parent
                 | Cible::Onglet(_)
                 | Cible::NouvelOnglet
-                | Cible::RechercheHaut
                 | Cible::EssentielHaut
                 | Cible::CePc
+                | Cible::EspaceVolet
                 | Cible::Favori(_)
                 | Cible::Epingle(_)
                 | Cible::Disque(_)
@@ -314,6 +344,10 @@ impl Cible {
                 | Cible::Terminal
                 | Cible::TerminalFermer
                 | Cible::TerminalExterne
+                | Cible::TerminalOnglet(_)
+                | Cible::TerminalOngletFermer(_)
+                | Cible::TerminalNouveau
+                | Cible::TerminalJournal
                 | Cible::Outil(_)
         )
     }
@@ -615,6 +649,15 @@ pub struct App {
     pub arbre_focus: bool,
     pub arbre_curseur: Option<String>,
     pub volet_defilement: f32,
+    /// Bas utilisable du volet en DIP (hauteur de la fenêtre moins le retrait des réglages), posé au dessin ; infini tant qu'aucun
+    /// dessin n'a eu lieu. La disposition du volet s'en sert pour replier seules les sections qui feraient sortir DISQUES.
+    pub volet_bas: f32,
+    /// Sections que l'auteur a rouvertes à la main alors que la fenêtre les avait repliées seules (bits comme `volet_replie`) :
+    /// le repli automatique les laisse, le milieu du volet défile à la place. Non enregistré : oublié à la fermeture.
+    pub volet_force: u32,
+    /// Ouverture affichée de chaque section du volet (0 repliée, 1 ouverte), posée au dessin pendant qu'elle glisse ;
+    /// NaN tant qu'aucun dessin n'a eu lieu (la disposition prend alors l'état visé)
+    pub volet_ouv: [f32; 7],
     /// Dernier dossier vers lequel l'arbre a défilé : il ne défile qu'au changement de dossier
     pub arbre_vu: String,
     /// Dossier affiché avant la navigation en cours, pour retenir où l'on en était (V17)
@@ -716,6 +759,9 @@ impl App {
             arbre_focus: false,
             arbre_curseur: None,
             volet_defilement: 0.0,
+            volet_bas: f32::INFINITY,
+            volet_force: 0,
+            volet_ouv: [f32::NAN; 7],
             arbre_vu: String::new(),
             vu: None,
             edition: None,
@@ -785,7 +831,7 @@ impl App {
 
     /// Ce PC, la liste des partages d'un serveur, les réglages : rien à copier, renommer ou supprimer
     pub fn sans_fichiers(&self) -> bool {
-        matches!(self.emplacement, Emplacement::CePC | Emplacement::Serveur(_) | Emplacement::Reglages | Emplacement::Archive { .. } | Emplacement::Sftp { .. })
+        matches!(self.emplacement, Emplacement::CePC | Emplacement::Serveur(_) | Emplacement::Reglages | Emplacement::Espace | Emplacement::Archive { .. } | Emplacement::Sftp { .. })
     }
 
     /// Chemin du dossier ouvert (aucun pour Ce PC)
@@ -884,6 +930,13 @@ impl App {
         }
         self.jeton_surveillance = numero();
         self.surveillant = self.dossier().and_then(|c| surveillance::surveiller(hwnd, c, self.jeton_surveillance));
+        // T4b : le terminal ouvert reprend le dossier de la liste (le message ne fait rien s'il n'y a pas de terminal)
+        if !hwnd.is_invalid() {
+            // SAFETY : `PostMessageW` accepte n'importe quelle fenêtre ; un échec (fenêtre détruite) est sans conséquence
+            unsafe {
+                let _ = PostMessageW(hwnd, crate::fenetre::WM_TERMINAL, WPARAM(0), LPARAM(0));
+            }
+        }
     }
 
     /// Relit le même dossier sans perdre la position (le dossier a changé)
@@ -1275,7 +1328,7 @@ impl App {
             Emplacement::Serveur(h) => format!("\\\\{h}"),
             Emplacement::Archive { fichier, .. } => fichier.clone(),
             Emplacement::Sftp { hote, chemin } => crate::sftp::adresse(hote, chemin),
-            Emplacement::Reglages => return,
+            Emplacement::Reglages | Emplacement::Espace => return,
             _ => String::new(),
         };
         let mut ed = Edition::champ(&t);
@@ -2340,7 +2393,10 @@ impl App {
         let choix = !self.sans_fichiers() && self.marques.iter().find_map(|&i| self.entrees.get(i)).is_some_and(|e| self.chemin_de(e).is_some());
         let dossier = self.dossier().is_some();
         match o {
-            Outil::Nouveau => dossier,
+            // Toujours actif : « Nouvel onglet » marche partout (Ce PC, Corbeille, recherche) ; seuls « Nouveau dossier » et
+            // « Nouveau fichier » se grisent hors d'un dossier (`commande_possible`). Avant, le bouton entier restait mort
+            // (ni survol, ni reflet, ni clic) sur Ce PC.
+            Outil::Nouveau => true,
             Outil::Couper | Outil::Copier | Outil::Supprimer | Outil::Partager => choix,
             Outil::Renommer => choix && dossier,
             Outil::Coller => dossier && operations::fichiers_a_coller(),
@@ -2518,7 +2574,7 @@ impl App {
     pub fn avec_chronologie(&self) -> bool {
         crate::reglages::CHRONOLOGIE.load(Ordering::Relaxed)
             && self.affichage != Affichage::Colonnes
-            && !matches!(self.emplacement, Emplacement::CePC | Emplacement::Reglages | Emplacement::Serveur(_) | Emplacement::Doublons(_))
+            && !matches!(self.emplacement, Emplacement::CePC | Emplacement::Reglages | Emplacement::Espace | Emplacement::Serveur(_) | Emplacement::Doublons(_))
     }
 
     /// Le filtre a changé : la liste se réduit tout de suite, la première entrée est choisie
@@ -2590,6 +2646,9 @@ impl App {
     /// Ctrl+F : sans filtre, ouvre le champ (puces `ext:` `taille>` `modif:`, comme `openSearch` de la maquette) ; avec un filtre,
     /// le cherche dans tous les sous-dossiers
     pub fn rechercher(&mut self, hwnd: HWND) {
+        if self.emplacement == Emplacement::Espace {
+            return;
+        }
         if self.filtre.trim().is_empty() && self.emplacement != Emplacement::Reglages {
             self.filtre_ouvert = true;
             self.annoncer("TAPEZ CE QUE VOUS CHERCHEZ · EXT:PDF TAILLE>10MO MODIF:2026 · CTRL+F DE NOUVEAU POUR CHERCHER DANS LES SOUS-DOSSIERS", false);
@@ -3410,7 +3469,7 @@ mod tests {
     fn seuls_les_controles_du_chrome_se_soulevent() {
         assert!(Cible::Onglet(0).est_chrome());
         assert!(Cible::NouvelOnglet.est_chrome());
-        assert!(Cible::RechercheHaut.est_chrome());
+        assert!(Cible::EssentielHaut.est_chrome());
         assert!(Cible::CePc.est_chrome());
         assert!(Cible::Outil(crate::barre::Outil::Nouveau).est_chrome());
         assert!(Cible::Terminal.est_chrome());
@@ -3418,6 +3477,19 @@ mod tests {
         assert!(!Cible::Ligne(0).est_chrome());
         assert!(!Cible::Reglage(0).est_chrome());
         assert!(!Cible::FermerOnglet(0).est_chrome());
+    }
+
+    /// Retour de l'auteur (16/11) : « le bouton ne marche plus ». Sur Ce PC, NOUVEAU était inactif en entier (ni survol, ni reflet,
+    /// ni clic) alors que « Nouvel onglet » y marche : le bouton reste actif, seules les deux commandes de dossier se grisent.
+    #[test]
+    fn nouveau_reste_actif_sur_ce_pc_et_grise_seulement_les_commandes_de_dossier() {
+        use crate::barre::Outil;
+        use crate::commandes::commande_possible;
+        use crate::palette::Commande;
+        let app = App::nouveau(Emplacement::CePC);
+        assert!(app.dossier().is_none(), "Ce PC n'est pas un dossier");
+        assert!(app.outil_possible(Outil::Nouveau));
+        assert!(!commande_possible(&app, Commande::NouveauDossier) && !commande_possible(&app, Commande::NouveauFichier));
     }
 
     #[test]

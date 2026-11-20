@@ -88,9 +88,6 @@ pub(crate) unsafe fn cible_sous(hwnd: HWND, f: &Fenetre, px: i32, py: i32) -> Ci
                 _ => Cible::Reduire,
             };
         }
-        if dedans(&zone_recherche_haut(lt), x, y) {
-            return Cible::RechercheHaut;
-        }
         if dedans(&zone_essentiel_haut(lt), x, y) {
             return Cible::EssentielHaut;
         }
@@ -114,6 +111,10 @@ pub(crate) unsafe fn cible_sous(hwnd: HWND, f: &Fenetre, px: i32, py: i32) -> Ci
     if app.emplacement == Emplacement::Reglages {
         return cible_page(f, lt, h, x, y);
     }
+    // Page ESPACE (E1) : couvre aussi le volet ; elle a sa croix, son rail et ses lignes, rien dessous ne doit réagir
+    if app.emplacement == Emplacement::Espace {
+        return cible_espace(f, lt, h, x, y);
+    }
     // Pastilles d'opération (coordonnées de la fenêtre) : par-dessus la liste, jamais sur le volet
     if !f.modale() {
         let d = f.rendu.zones_pastilles.borrow();
@@ -135,7 +136,7 @@ pub(crate) unsafe fn cible_sous(hwnd: HWND, f: &Fenetre, px: i32, py: i32) -> Ci
         return Cible::Rien;
     }
     // Panneau terminal : il est au-dessus de la liste, mais jamais du pied
-    if f.terminal_visible && app.emplacement != Emplacement::Reglages {
+    if f.terminal_affiche() {
         let panneau = crate::rendu::zone_terminal_panneau(ll, h);
         if dedans(&panneau, x, y) {
             if dedans(&crate::rendu::zone_terminal_fermer(ll, h), x, y) {
@@ -143,6 +144,27 @@ pub(crate) unsafe fn cible_sous(hwnd: HWND, f: &Fenetre, px: i32, py: i32) -> Ci
             }
             if dedans(&crate::rendu::zone_terminal_action(ll, h), x, y) {
                 return Cible::TerminalExterne;
+            }
+            // T4a : onglets, puis « + » (seulement tant qu'un onglet de plus tient : sans lui, le bouton n'est pas dessiné).
+            // Même seuil que `dessiner_terminal` : un panneau trop petit n'est pas dessiné, ses boutons ne se cliquent pas
+            if panneau.bottom - panneau.top < 40.0 || panneau.right - panneau.left < 80.0 {
+                return Cible::TerminalPanneau;
+            }
+            if crate::rendu::terminal_journal_largeur(ll, h) > 0.0 && dedans(&crate::rendu::zone_terminal_journal(ll, h), x, y) {
+                return Cible::TerminalJournal;
+            }
+            let n = f.terminaux.len();
+            for i in 0..n {
+                // La croix est dans l'onglet : elle passe avant lui
+                if dedans(&crate::rendu::zone_terminal_onglet_croix(ll, h, i, n), x, y) {
+                    return Cible::TerminalOngletFermer(i);
+                }
+                if dedans(&crate::rendu::zone_terminal_onglet(ll, h, i, n), x, y) {
+                    return Cible::TerminalOnglet(i);
+                }
+            }
+            if crate::rendu::terminal_peut_ajouter(ll, h, n) && dedans(&crate::rendu::zone_terminal_plus(ll, h, n), x, y) {
+                return Cible::TerminalNouveau;
             }
             return Cible::TerminalPanneau;
         }
@@ -287,6 +309,65 @@ pub(crate) fn cible_page(f: &Fenetre, l: f32, h: f32, x: f32, y: f32) -> Cible {
         .position(|&(a, b)| b > 0.0 && yy >= a + REGLAGE_CARTE_ECART && yy < a + b)
         .filter(|&k| lignes[k].element.choisissable())
         .map_or(Cible::Rien, Cible::Reglage)
+}
+
+/// Élément de la page ESPACE sous ce point (DIP) : croix, page du rail ou ligne de l'arbre
+pub(crate) fn cible_espace(f: &Fenetre, l: f32, h: f32, x: f32, y: f32) -> Cible {
+    if dedans(&page::zone_fermer(l), x, y) {
+        return Cible::EspaceFermer;
+    }
+    if let Some(k) = (0..espace::PAGES.len()).find(|&k| dedans(&rendu::rect(page::NAV_X, page::NAV_Y + k as f32 * page::NAV_H, page::NAV_W, page::NAV_H - 2.0), x, y)) {
+        return Cible::EspaceNav(k);
+    }
+    let e = &f.espace;
+    if e.page == espace::PAGE_ANALYSE && e.arbre.is_some() {
+        if let Some(k) = (0..espace::VUES.len()).find(|&k| dedans(&rendu::espace_segment_vue(l, k), x, y)) {
+            return Cible::EspaceVue(k);
+        }
+    }
+    if e.page == espace::PAGE_NETTOYAGE {
+        return cible_nettoyage(e, l, h, x, y);
+    }
+    if e.page != espace::PAGE_ANALYSE || x < page::gauche() - 8.0 || x > page::droite(l) + 8.0 || y >= h - statut_h() {
+        return Cible::Rien;
+    }
+    if e.vue == espace::Vue::Carte {
+        // Fil d'Ariane : toutes les pastilles sauf la dernière (l'endroit où l'on est)
+        let miettes = rendu::espace_miettes(e, l);
+        if let Some((_, m)) = miettes.iter().take(miettes.len().saturating_sub(1)).find(|(r, _)| dedans(r, x, y)) {
+            return Cible::EspaceChemin(m.niveau);
+        }
+        return e.cellule_sous(rendu::espace_zone_carte(l, h), x, y).map_or(Cible::Rien, Cible::EspaceCellule);
+    }
+    e.ligne_sous(y - rendu::ESPACE_LISTE_Y, pas_espace()).map_or(Cible::Rien, Cible::EspaceLigne)
+}
+
+/// Élément de la page NETTOYAGE sous ce point (DIP) : bouton du bas, case ou ligne de la liste. Les lignes sont celles que le
+/// dessin montre (`rendu::net_plage`) et la zone de la liste s'arrête au-dessus du bas de page, comme le dessin.
+pub(crate) fn cible_nettoyage(e: &espace::Etat, l: f32, h: f32, x: f32, y: f32) -> Cible {
+    let boutons: &[usize] = match &e.net_etape {
+        espace::EtapeNet::Liste if e.nettoyage.as_ref().is_some_and(|c| !c.is_empty()) => &[espace::NET_SUPPRIMER],
+        espace::EtapeNet::Confirmation(_) => &[espace::NET_CONFIRMER, espace::NET_ANNULER],
+        _ => &[],
+    };
+    if let Some(&k) = boutons.iter().find(|&&k| dedans(&rendu::net_bouton(l, h, k), x, y)) {
+        return Cible::NettoyageBouton(k);
+    }
+    // Seule la liste elle-même se vise : pas la confirmation (aucune ligne à choisir), pas la mesure en cours
+    let (espace::EtapeNet::Liste, Some(cats)) = (&e.net_etape, e.nettoyage.as_ref()) else { return Cible::Rien };
+    let (debut, fin) = rendu::net_plage(cats.len(), e.net_focus, e.net_debut, h);
+    (debut..fin)
+        .find_map(|k| {
+            let rang = k - debut;
+            if dedans(&rendu::net_zone_case(rang), x, y) {
+                Some(Cible::NettoyageCase(k))
+            } else if dedans(&rendu::net_rect_ligne(l, rang), x, y) {
+                Some(Cible::NettoyageLigne(k))
+            } else {
+                None
+            }
+        })
+        .unwrap_or(Cible::Rien)
 }
 
 /// Segment visé dans la carte `k` (point en DIP de la fenêtre), pour un réglage à contrôle segmenté
@@ -446,6 +527,72 @@ mod tests {
         assert!(zone_fichiers(l, h, l - 0.5, h - statut_h() - 0.5));
         assert!(!zone_fichiers(l, h, 500.0, liste_y() - 0.5));
         assert!(!zone_fichiers(l, h, 500.0, h - statut_h()));
+    }
+
+    /// Une page NETTOYAGE mesurée avec `n` catégories
+    fn page_nettoyage(n: usize) -> espace::Etat {
+        const IDS: [&str; 8] = ["a", "b", "c", "d", "e", "f", "g", "h"];
+        let mut e = espace::Etat::nouveau();
+        e.page = espace::PAGE_NETTOYAGE;
+        assert!(e.nettoyage_a_lancer());
+        let cats = (0..n)
+            .map(|k| espace::nettoyage::Categorie {
+                id: IDS[k],
+                libelle: "Essai",
+                risque: "",
+                mode: espace::nettoyage::Mode::Direct,
+                octets: 10 - k as u64,
+                fichiers: 1,
+                elements: 1,
+                illisibles: 0,
+                anormal: false,
+                chemins: Vec::new(),
+            })
+            .collect();
+        e.recevoir_nettoyage(cats);
+        e
+    }
+
+    #[test]
+    fn la_souris_vise_la_case_la_ligne_et_le_bouton_de_nettoyage_la_ou_le_dessin_les_pose() {
+        let (l, h) = (1000.0f32, 700.0f32);
+        let e = page_nettoyage(3);
+        // Milieu de la case, puis du texte, de chaque ligne : ce que `dessiner_espace_nettoyage` trace aux mêmes rectangles
+        for rang in 0..3 {
+            let (case, ligne) = (rendu::net_zone_case(rang), rendu::net_rect_ligne(l, rang));
+            assert_eq!(cible_nettoyage(&e, l, h, (case.left + case.right) / 2.0, (case.top + case.bottom) / 2.0), Cible::NettoyageCase(rang));
+            assert_eq!(cible_nettoyage(&e, l, h, (ligne.left + ligne.right) / 2.0, (ligne.top + ligne.bottom) / 2.0), Cible::NettoyageLigne(rang));
+        }
+        // Entre deux lignes (les 4 DIP d'écart) et sous la dernière : rien
+        let ligne = rendu::net_rect_ligne(l, 0);
+        assert_eq!(cible_nettoyage(&e, l, h, (ligne.left + ligne.right) / 2.0, ligne.bottom + 2.0), Cible::Rien);
+        let dernier = rendu::net_rect_ligne(l, 2);
+        assert_eq!(cible_nettoyage(&e, l, h, (dernier.left + dernier.right) / 2.0, dernier.bottom + 30.0), Cible::Rien);
+        // Le bouton SUPPRIMER est dans le bas de page ; CONFIRMER et ANNULER n'existent pas sur la liste
+        let b = rendu::net_bouton(l, h, espace::NET_SUPPRIMER);
+        assert_eq!(cible_nettoyage(&e, l, h, (b.left + b.right) / 2.0, (b.top + b.bottom) / 2.0), Cible::NettoyageBouton(espace::NET_SUPPRIMER));
+        // (ANNULER se recouvre avec SUPPRIMER sur la liste : le test vise CONFIRMER, qui est à côté)
+        let c = rendu::net_bouton(l, h, espace::NET_CONFIRMER);
+        assert_eq!(cible_nettoyage(&e, l, h, (c.left + c.right) / 2.0, (c.top + c.bottom) / 2.0), Cible::Rien);
+    }
+
+    #[test]
+    fn la_souris_de_nettoyage_suit_le_defilement_de_la_molette() {
+        let (l, h) = (1000.0f32, 300.0f32);
+        let mut e = page_nettoyage(8);
+        let visibles = rendu::net_visibles(h);
+        assert!(visibles < 8, "la fenêtre de l'essai doit être trop basse pour huit lignes");
+        // Au début, la première ligne est la rangée 0 ; après la molette, c'est la catégorie `debut` qui y est
+        let r = rendu::net_rect_ligne(l, 0);
+        let (x, y) = ((r.left + r.right) / 2.0, (r.top + r.bottom) / 2.0);
+        assert_eq!(cible_nettoyage(&e, l, h, x, y), Cible::NettoyageLigne(0));
+        e.molette_nettoyage(-1.0, 0, visibles);
+        assert_eq!(cible_nettoyage(&e, l, h, x, y), Cible::NettoyageLigne(2));
+        // Pendant la confirmation, aucune ligne n'est visable : seuls les deux boutons répondent
+        e.net_etape = espace::EtapeNet::Confirmation(Vec::new());
+        assert_eq!(cible_nettoyage(&e, l, h, x, y), Cible::Rien);
+        let b = rendu::net_bouton(l, h, espace::NET_CONFIRMER);
+        assert_eq!(cible_nettoyage(&e, l, h, (b.left + b.right) / 2.0, (b.top + b.bottom) / 2.0), Cible::NettoyageBouton(espace::NET_CONFIRMER));
     }
 
     #[test]

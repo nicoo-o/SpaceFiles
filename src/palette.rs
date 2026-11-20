@@ -15,6 +15,8 @@ pub enum Commande {
     FermerOnglet,
     RouvrirOnglet,
     Reglages,
+    /// Page ESPACE : où est passée la place (E1)
+    Espace,
     Terminal,
     VsCode,
     CheminWsl,
@@ -335,6 +337,7 @@ pub const COMMANDES: &[(Commande, &str, &str, &str)] = &[
     (Commande::BasculerProfil, "PASSER EN MODE SIMPLE / EXPERT", "CTRL+MAJ+E", "profil simple expert mode facile avance debutant complet"),
     (Commande::OuvrirDestination, "OUVRIR LE DOSSIER DE DESTINATION", "CTRL+MAJ+O", "destination dossier copie deplacement operation pastille"),
     (Commande::Reglages, "RÉGLAGES", "CTRL+,", "reglages options parametres"),
+    (Commande::Espace, "ESPACE DISQUE : OÙ EST PASSÉE LA PLACE", "", "espace place disque stockage taille gros dossiers fichiers analyse"),
 ];
 
 /// Commandes que l'étape « Commande » reprend pour un élément choisi : elles ne sont plus dans « Partout », où elles agiraient sur la
@@ -376,7 +379,7 @@ fn icone_commande(c: Commande) -> Icone {
         Commande::SeptZip | Commande::Extraire => Icone::Archive,
         Commande::ImageJpg | Commande::ImagePng | Commande::ImageReduire | Commande::ImageSansMeta => Icone::Image,
         Commande::Terminal | Commande::VsCode => Icone::Code,
-        Commande::RechercheGlobale | Commande::ReconstruireIndex => Icone::Disque,
+        Commande::RechercheGlobale | Commande::ReconstruireIndex | Commande::Espace => Icone::Disque,
         Commande::TrierNom | Commande::TrierDate | Commande::TrierType | Commande::TrierTaille | Commande::TrierCroissant | Commande::TrierDecroissant => Icone::Bureau,
         Commande::Reglages | Commande::BasculerProfil | Commande::Sons | Commande::PoidsSonore | Commande::Palette | Commande::PaletteSecondaire | Commande::Administrateur | Commande::ModeCapture => Icone::Reglages,
         _ => Icone::Fichier,
@@ -748,6 +751,7 @@ pub fn apercu_de(it: &Item) -> ApercuPalette {
                 Commande::Supprimer => "Envoie à la corbeille, avec Annuler".to_string(),
                 Commande::RechercheGlobale => "Cherche dans tout le PC par l'index".to_string(),
                 Commande::Reglages => "Apparence, stockages, raccourcis".to_string(),
+                Commande::Espace => "Les dossiers classés par taille, d'après l'index enregistré".to_string(),
                 _ => mots_de(*c, it.raccourci),
             };
             (description, art)

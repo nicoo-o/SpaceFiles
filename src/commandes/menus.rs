@@ -599,9 +599,8 @@ pub(crate) fn choix_barre(f: &Fenetre, o: barre::Outil) -> Vec<Choix> {
     use dossier::Colonne;
     use Choix::{Commande as C, Separation as S};
     let a = &f.app;
-    let possible = |o: Outil| a.outil_possible(o);
     match o {
-        Outil::Nouveau => vec![C(Commande::NouveauDossier, possible(Outil::Nouveau)), C(Commande::NouveauFichier, possible(Outil::Nouveau)), S, C(Commande::NouvelOnglet, false)],
+        Outil::Nouveau => vec![C(Commande::NouveauDossier, false), C(Commande::NouveauFichier, false), S, C(Commande::NouvelOnglet, false)],
         Outil::Trier => vec![
             C(Commande::TrierNom, a.tri.0 == Colonne::Nom),
             C(Commande::TrierDate, a.tri.0 == Colonne::Date),
@@ -624,6 +623,7 @@ pub(crate) fn choix_barre(f: &Fenetre, o: barre::Outil) -> Vec<Choix> {
             C(Commande::Caches, a.caches),
             S,
             C(Commande::Galerie, false),
+            C(Commande::Espace, f.app.emplacement == Emplacement::Espace),
         ],
         Outil::Outils => vec![
             C(Commande::Palette, false),
@@ -669,6 +669,7 @@ pub(crate) fn choix_barre(f: &Fenetre, o: barre::Outil) -> Vec<Choix> {
                 C(Commande::Apercu, f.apercu_visible),
                 C(Commande::Caches, a.caches),
                 C(Commande::Galerie, false),
+                C(Commande::Espace, f.app.emplacement == Emplacement::Espace),
             ]),
             Choix::Sous("OUTILS", vec![
                 C(Commande::Palette, false),

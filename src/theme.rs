@@ -214,7 +214,8 @@ pub const BLANC_PUR: D2D1_COLOR_F = rgba(255, 255, 255, 1.0);
 /// Alpha de l'encre claire pour un blanc sombre d'alpha `a`. Les paliers de la maquette sont exacts ; toute autre valeur
 /// (fondus, apparition, opacités calculées) garde son alpha d'entrée, borné à [0 ; 1] : règle simple, le fondu reste un fondu.
 fn alpha_encre(a: f32) -> f32 {
-    const PALIERS: [(f32, f32); 11] = [(1.0, 0.95), (0.75, 0.68), (0.65, 0.68), (0.55, 0.40), (0.52, 0.60), (0.45, 0.55), (0.14, 0.16), (0.10, 0.09), (0.09, 0.06), (0.07, 0.08), (0.06, 0.05)];
+    // 0,30 -> 0,18 : arête haute du reflet (`reflet::ALPHA_LUEUR`), l'encre claire plus douce que le blanc sombre
+    const PALIERS: [(f32, f32); 12] = [(1.0, 0.95), (0.75, 0.68), (0.65, 0.68), (0.55, 0.40), (0.52, 0.60), (0.45, 0.55), (0.30, 0.18), (0.14, 0.16), (0.10, 0.09), (0.09, 0.06), (0.07, 0.08), (0.06, 0.05)];
     PALIERS.iter().find(|(entree, _)| (a - entree).abs() < 0.005).map_or(a.clamp(0.0, 1.0), |&(_, sortie)| sortie)
 }
 
@@ -436,10 +437,17 @@ pub fn volet_ligne() -> f32 {
 pub const VOLET_ESPACE: f32 = 12.0;
 /// Marge intérieure du volet (maquette v6 : padding 12)
 pub const VOLET_PAD: f32 = 12.0;
-/// Carte d'un disque dans le volet (nom, jauge, place libre)
+/// Pas d'une ligne de disque dans le volet (nom, jauge, place libre) : 68, soit 64 visibles (multiple de 4), sans carte (lot 5)
 pub fn volet_disque() -> f32 {
-    78.0 * elasticite()
+    68.0 * elasticite()
 }
+
+/// Échelle des rayons de coin (décision D-4 de l'audit UI du 16/11/2026, choisie par l'auteur : 8 / 12 / 16).
+/// Petit : boutons, champs, lignes ; moyen : lignes du volet, onglets, cartes de réglage ; grand : cartes et panneaux.
+/// Une pilule n'a pas de jeton : son rayon est la moitié de sa hauteur (`rendu::rayon_pilule`).
+pub const RAYON_PETIT: f32 = 8.0;
+pub const RAYON_MOYEN: f32 = 12.0;
+pub const RAYON_GRAND: f32 = 16.0;
 
 /// Panneau Réglages : rail de navigation de 236 DIP et marge du contenu
 pub const REGLAGES_NAV: f32 = 236.0;
@@ -451,16 +459,16 @@ pub const REGLAGES_PAD_Y: f32 = 24.0;
 /// marge haute 10, rayon 16, tuile d'icône de 36 au rayon 12
 pub const REGLAGE_CARTE_H: f32 = 70.0;
 pub const REGLAGE_CARTE_ECART: f32 = 10.0;
-pub const REGLAGE_CARTE_RAYON: f32 = 16.0;
+pub const REGLAGE_CARTE_RAYON: f32 = RAYON_GRAND;
 pub const REGLAGE_TUILE: f32 = 36.0;
-pub const REGLAGE_TUILE_RAYON: f32 = 12.0;
+pub const REGLAGE_TUILE_RAYON: f32 = RAYON_MOYEN;
 /// Interrupteur 40 x 24 (rayon 12), bille de 16 décalée de 16 quand il est actif
 pub const REGLAGE_INTER_L: f32 = 40.0;
 pub const REGLAGE_INTER_H: f32 = 24.0;
 pub const REGLAGE_BILLE: f32 = 16.0;
 /// Contrôle segmenté : hauteur, rayon du cadre
 pub const REGLAGE_SEG_H: f32 = 28.0;
-pub const REGLAGE_SEG_RAYON: f32 = 12.0;
+pub const REGLAGE_SEG_RAYON: f32 = RAYON_MOYEN;
 
 // Barre de navigation : précédent, suivant, parent, puis le fil d'Ariane
 // Bloc de 58 DIP : 14 en haut, 38 de contenu, 6 en bas. Le chemin commence donc à 52.
@@ -614,8 +622,11 @@ pub const ONGLET_MAX: f32 = 190.0;
 pub const ONGLET_ECART: f32 = 6.0;
 /// Trois icônes de 32 DIP avant les contrôles système, à droite de la barre haute
 pub const BOUTON_HAUT: f32 = 32.0;
-pub const ECART_HAUT: f32 = 6.0;
-pub const MARGE_HAUT: f32 = 12.0;
+/// Lot 6 de l'audit UX (D-6) : les trois icônes et les trois contrôles système sont au même pas, 40 DIP de centre à centre
+/// (32 + 8 d'écart ; contrôles de `BOUTON_LARGEUR`). Avant : 38 entre les icônes, 48 entre la dernière et « réduire ».
+pub const ECART_HAUT: f32 = 8.0;
+/// Jour entre la dernière icône et les contrôles système : 4 + 16 (demi-icône) + 20 (demi-contrôle) = 40, le même pas
+pub const MARGE_HAUT: f32 = 4.0;
 /// Volet d'aperçu à droite (Alt+P)
 pub const LARGEUR_APERCU: f32 = 288.0;
 
@@ -1129,5 +1140,34 @@ pub(crate) mod tests {
         // `contraste_avec` prend le drapeau en paramètre : aucun état global n'est touché
         assert_eq!(contraste_avec(&ACCENT, true).a, 1.0);
         assert_eq!(contraste_avec(&ERREUR, true).a, 1.0);
+    }
+
+    #[test]
+    fn echelle_des_rayons() {
+        // Les rayons sont des multiples de 4, rangés du plus petit au plus grand
+        assert!(RAYON_PETIT < RAYON_MOYEN && RAYON_MOYEN < RAYON_GRAND);
+        for r in [RAYON_PETIT, RAYON_MOYEN, RAYON_GRAND] {
+            assert_eq!(r % 4.0, 0.0, "rayon hors échelle : {r}");
+        }
+    }
+
+    #[test]
+    fn le_dessin_n_ecrit_aucun_rayon_hors_echelle() {
+        // Tout `radiusX:` suivi d'un nombre doit être un trait fin (≤ 2) ; les coins passent par les jetons ou `rayon_pilule`
+        let source = include_str!("rendu.rs");
+        let mut fautes = Vec::new();
+        for (n, ligne) in source.lines().enumerate() {
+            let mut reste = ligne;
+            while let Some(i) = reste.find("radiusX: ") {
+                reste = &reste[i + "radiusX: ".len()..];
+                let nombre: String = reste.chars().take_while(|c| c.is_ascii_digit() || *c == '.').collect();
+                if let Ok(v) = nombre.parse::<f32>() {
+                    if v > 2.0 {
+                        fautes.push(format!("rendu.rs:{} radiusX: {nombre}", n + 1));
+                    }
+                }
+            }
+        }
+        assert!(fautes.is_empty(), "rayons écrits en dur hors échelle : {fautes:?}");
     }
 }

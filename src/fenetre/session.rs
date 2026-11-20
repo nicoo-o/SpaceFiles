@@ -9,7 +9,7 @@ pub(crate) fn vers_session(e: &Emplacement) -> Option<String> {
         Emplacement::Serveur(h) => Some(format!("\\\\{h}")),
         Emplacement::Archive { fichier, .. } => Some(dossier::dossier_de(fichier).to_string()),
         Emplacement::Sftp { hote, chemin } => Some(sftp::adresse(hote, chemin)),
-        Emplacement::Reglages | Emplacement::Globale { .. } | Emplacement::Groupe(_) | Emplacement::Recents | Emplacement::Corbeille | Emplacement::Panneau | Emplacement::Doublons(_) => None,
+        Emplacement::Reglages | Emplacement::Espace | Emplacement::Globale { .. } | Emplacement::Groupe(_) | Emplacement::Recents | Emplacement::Corbeille | Emplacement::Panneau | Emplacement::Doublons(_) => None,
     }
 }
 
@@ -106,9 +106,15 @@ pub(crate) fn sorte_d_arguments(args: &[String]) -> &'static str {
         "--groupe" => "--groupe",
         "--chercher" => "--chercher",
         "--resident" => "--resident",
+        "--terminal" => "--terminal",
         "--rapide" => "ancien argument",
         _ => "dossier ou autre",
     }
+}
+
+/// `--terminal` : la fenêtre s'ouvre avec le panneau terminal déjà ouvert (captures et essais, sans souris)
+pub(crate) fn terminal_demande() -> bool {
+    std::env::args().nth(1).is_some_and(|a| a.trim().trim_matches('"') == "--terminal")
 }
 
 /// Arguments d'anciennes versions, acceptés et ignorés
@@ -144,7 +150,7 @@ pub(crate) fn depart() -> Option<Option<Emplacement>> {
     }
     // Ancien argument de la recherche rapide Alt+Espace (retirée) : un vieux raccourci peut encore le passer.
     // Ignoré, sinon il filerait vers l'Explorateur de Windows ; la fenêtre s'ouvre comme sans argument.
-    if est_ancien_argument(a) {
+    if est_ancien_argument(a) || a == "--terminal" {
         return Some(None);
     }
     if a.starts_with("sftp://") {

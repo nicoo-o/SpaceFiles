@@ -1,0 +1,8 @@
+␛[?9001h␛[?1004h␛[?25l␛[2J␛[m␛[H␛]0;AdministrateurÂ : C:\WINDOWS\System32\WindowsPowerShell\v1.0\powershell.exe␇␛[?25hPS C:\Users\utilisateur\Desktop\projet perso code\nothing-explorer> ␛[?25l␛[93mf␛[?25h␛[m␛[92m\x08function ␛[37mprompt { ␛[36m"␛[37m$([char]␛[97m27␛[37m)␛[36m]133;A␛[37m$([char]␛[97m27␛[37m)␛[36m\␛[37m$([char]␛[97m27␛[37m)␛[36m]9;9;␛[37m$(␛[92m$PWD␛[37m.␛[97mPath␛[37m)$([char]␛[97m27␛[37m)␛[36m\PS ␛[37m$(␛[92m$PWD␛[37m.␛[97mPath␛[37m)␛[36m> " ␛[37m}\r\n
+␛[m␛]133;A␛\␛]9;9;C:\Users\utilisateur\Desktop\projet perso code\nothing-explorer␛\PS C:\Users\utilisateur\Desktop\projet perso code\nothing-explorer> ␛[93mcd ␛[37m\\r\n
+>> \r\n
+␛[m␛]133;A␛\␛]9;9;C:\␛\PS C:\> ␛[93mWrite-Host ␛[36m'bonjour' ␛[90m-ForegroundColor ␛[37mGreen\r\n
+>> \r\n
+␛[m␛[38;5;10mbonjour␛[m\r\n
+␛]133;A␛\␛]9;9;C:\␛\␛[?25lPS C:\> ␛[37m\r\n
+>> ␛[8;9H␛[?25h␛[?9001l␛[?1004l␛[m

@@ -101,6 +101,7 @@ const SIMPLES: &[Commande] = &[
     Commande::SaisirCheminSecondaire,
     Commande::Aide,
     Commande::Reglages,
+    Commande::Espace,
     Commande::ChercherReglage,
     Commande::BasculerProfil,
     Commande::OuvrirDestination,

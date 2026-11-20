@@ -11,7 +11,7 @@ use crate::icones::Icone;
 use windows::Win32::UI::WindowsAndMessaging::{SW_HIDE, SW_SHOWNORMAL};
 
 /// Chemin réel d'un dossier connu de Windows (suit les redirections, vers OneDrive par exemple)
-fn dossier_connu(id: &windows::core::GUID) -> Option<String> {
+pub(crate) fn dossier_connu(id: &windows::core::GUID) -> Option<String> {
     unsafe {
         let p = SHGetKnownFolderPath(id, KNOWN_FOLDER_FLAG(0), None).ok()?;
         let s = p.to_string().ok();

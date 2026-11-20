@@ -1604,7 +1604,12 @@ pub struct Mouvements {
     pub palette: AnimPalette,
     /// Lot 15B : tiroir de l'Historique (0 : rentré, 1 : sorti ; le ressort dépasse un peu)
     tiroir: Glisse,
+    /// Ouverture de chaque section du volet (0 repliée, 1 ouverte) : elle glisse quand la fenêtre ou l'auteur la replie
+    volet_sections: [Glisse; 7],
 }
+
+/// Durée du repli ou de la réouverture d'une section du volet : assez lente pour qu'on suive des yeux, assez vive pour ne pas gêner
+pub const VOLET_SECTION_MS: u64 = 220;
 
 #[derive(Clone, Copy, Debug)]
 struct EntreeInterrupteur {
@@ -1646,7 +1651,19 @@ impl Mouvements {
             pilule_fondu: [Glisse::avec(Courbe::Ease); 2],
             palette: AnimPalette::nouveau(),
             tiroir: Glisse::nouveau(),
+            volet_sections: [Glisse::avec(Courbe::Ease); 7],
         }
+    }
+
+    /// Ouverture affichée des sections du volet vers `cibles` (0 ou 1) : la première image ou le mouvement réduit posent l'état
+    /// sans glisser ; courbe `ease` (pas de ressort : une hauteur qui dépasse 1 sortirait de la section).
+    pub fn sections_volet(&mut self, cibles: [f32; 7], t: u64, animer: bool) -> [f32; 7] {
+        let mut sortie = [1.0; 7];
+        for (k, g) in self.volet_sections.iter_mut().enumerate() {
+            g.viser(cibles[k], t, VOLET_SECTION_MS, !animer);
+            sortie[k] = g.valeur(t).clamp(0.0, 1.0);
+        }
+        sortie
     }
 
     /// Tiroir de l'Historique (`.hist`, `translateX(105%)` vers `none`) : avancement de 0 (rentré) à 1 (sorti), au ressort en 500 ms.
@@ -1783,6 +1800,7 @@ impl Mouvements {
             || self.palette_ferme.is_some_and(|d| t.saturating_sub(d) < PALETTE_FERMETURE_MS)
             || self.palette.en_cours(t)
             || self.tiroir.en_cours(t)
+            || self.volet_sections.iter().any(|g| g.en_cours(t))
     }
 
     /// Avancement (0 à 1, le ressort dépasse un peu) de l'apparition de `quoi` tant qu'elle n'a pas fini ; `None` : absent, en place,
@@ -2379,6 +2397,25 @@ mod tests {
         let v = r.maj(None, 1000 + REFLET_MS, true);
         assert!(v.is_empty() && r.nombre() == 0, "retiré à la fin");
         assert!(!r.en_cours(1000 + REFLET_MS));
+    }
+
+    /// Le soulèvement du fond change à chaque image du ressort : le reflet reste le même (zone au repos), il ne repart pas de zéro
+    #[test]
+    fn reflet_qui_se_souleve_reste_un_seul_reflet() {
+        use crate::reflet::planifier;
+        use crate::rendu::rect;
+        let plan = |dy: f32| Plan { decalage: dy, ..planifier(rect(100.0, 100.0, 120.0, 36.0), 8.0, false, Some((150.0, 110.0)), true).unwrap() };
+        let mut r = Reflets::nouveau();
+        r.maj(Some((plan(0.0), None)), 0, true);
+        let mut avant = 0.0;
+        for (i, dy) in [-0.5_f32, -1.4, -2.2, -2.3, -2.0].into_iter().enumerate() {
+            let v = r.maj(Some((plan(dy), None)), 10 + 20 * i as u64, true);
+            assert_eq!(v.len(), 1, "un seul reflet à l'image {i}, pas une pile de fantômes");
+            assert!(v[0].2 >= avant, "l'opacité monte sans repartir de zéro : {} puis {}", avant, v[0].2);
+            assert_eq!(v[0].0.decalage, dy, "le décalage est mis à jour avec le reste");
+            avant = v[0].2;
+        }
+        assert_eq!(r.nombre(), 1);
     }
 
     #[test]

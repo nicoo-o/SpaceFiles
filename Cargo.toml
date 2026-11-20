@@ -12,6 +12,9 @@ regex = { version = "1", default-features = false, features = ["std", "unicode"]
 # Coup d'oeil HTML : WebView2 (scripts et reseau coupes), cree a la demande et detruit a la fermeture. 0.34 est la derniere version qui
 # repose sur `windows` 0.58 (0.35 passe a 0.59) ; justification et mesures dans docs/ui/webview2-dependance.md
 webview2-com = "0.34"
+# Terminal intégré (PLAN-TERMINAL, lot T1) : machine d'états des séquences VT (analyseur seul, sans grille ni E/S), 2 dépendances
+# (memchr déjà présent via regex, arrayvec). Mesure T0 : +10 752 octets sur l'exe ; mesure finale du lot T1 dans docs/terminal/PLAN-TERMINAL.md
+vte = "0.15"
 
 [dependencies.windows]
 version = "0.58"
@@ -28,6 +31,7 @@ features = [
     "Win32_System_Memory",
     "Win32_System_Ole",
     "Win32_System_Threading",
+    "Win32_System_JobObjects",
     "Win32_System_Diagnostics_ToolHelp",
     "Win32_System_RestartManager",
     "Win32_System_SystemServices",
@@ -63,6 +67,7 @@ features = [
     "Win32_System_Time",
     "Win32_UI_Shell",
     "Win32_System_Com",
+    "Win32_System_Console",
     "Win32_System_LibraryLoader",
     "Win32_UI_Accessibility",
     "Win32_System_Variant",

@@ -2,11 +2,13 @@
 
 use crate::*;
 
+mod espace_page;
 mod etapes;
 mod fichiers;
 mod menus;
 mod reglages_page;
 
+pub(crate) use espace_page::*;
 pub(crate) use etapes::*;
 pub(crate) use fichiers::*;
 pub(crate) use menus::*;
@@ -124,18 +126,31 @@ pub(crate) unsafe fn executer_palette(hwnd: HWND, f: &mut Fenetre) {
 /// Le plateau (Z10) est un groupe ordinaire de ce nom : zone de passage où l'on pose des éléments de plusieurs dossiers
 pub(crate) const PLATEAU: &str = "PLATEAU";
 
-/// Ouvre ou ferme le panneau terminal. Son contenu vient du journal des opérations : aucune commande
-/// n'est simulée. L'ouverture dans Windows Terminal reste une action séparée du panneau.
-pub(crate) fn basculer_terminal(f: &mut Fenetre) {
-    if f.terminal_visible {
-        f.terminal_visible = false;
+/// Ouvre ou ferme le panneau terminal. Ouvrir lance un vrai shell (PowerShell, ConPTY) dans le dossier courant ;
+/// fermer le détruit, donc tue la session : aucun shell ne tourne tant que le panneau est fermé.
+/// L'ouverture dans Windows Terminal reste une action séparée du panneau.
+pub(crate) unsafe fn basculer_terminal(hwnd: HWND, f: &mut Fenetre) {
+    if !f.terminaux.is_empty() {
+        f.fermer_terminal();
         return;
     }
-    if f.app.dossier_ici().is_some() {
-        f.terminal_lignes = journal::dernieres_operations(5);
-        f.terminal_visible = true;
-    } else {
-        f.app.annoncer("PAS DE DOSSIER ICI", true);
+    nouvel_onglet_terminal(hwnd, f);
+}
+
+/// T4a : ouvre un onglet de terminal de plus (un autre shell PowerShell dans le dossier courant) et l'affiche. Le premier
+/// onglet ouvre le panneau. Refusé, avec un message, quand l'en-tête n'a plus de place ou que le maximum est atteint.
+pub(crate) unsafe fn nouvel_onglet_terminal(hwnd: HWND, f: &mut Fenetre) {
+    if !f.terminaux.is_empty() && !f.terminal_peut_ajouter(hwnd) {
+        f.app.annoncer("TROP D'ONGLETS", true);
+        return;
+    }
+    match f.app.dossier_ici() {
+        Some(dossier) => {
+            let (colonnes, lignes) = f.dimensions_terminal(hwnd);
+            let p = crate::terminal::panneau::Panneau::ouvrir(crate::terminal::session::Shell::PowerShell, &dossier, colonnes, lignes, notifier_terminal(hwnd));
+            f.ajouter_onglet_terminal(p);
+        }
+        None => f.app.annoncer("PAS DE DOSSIER ICI", true),
     }
 }
 
@@ -173,7 +188,8 @@ pub(crate) unsafe fn executer(hwnd: HWND, f: &mut Fenetre, c: Commande) {
         }
         Commande::RouvrirOnglet => f.rouvrir_onglet(hwnd),
         Commande::Reglages => ouvrir_reglages(hwnd, f),
-        Commande::Terminal => basculer_terminal(f),
+        Commande::Espace => ouvrir_espace(hwnd, f),
+        Commande::Terminal => basculer_terminal(hwnd, f),
         Commande::VsCode => {
             // Le fichier choisi s'il y en a un, sinon le dossier
             let cible = f.app.selection.and_then(|i| f.app.entrees.get(i)).filter(|e| !e.est_conteneur() && f.app.marques.len() == 1).and_then(|e| f.app.chemin_de(e));
@@ -612,7 +628,7 @@ pub(crate) fn libelle_commande(c: Commande) -> String {
 pub(crate) fn commande_possible(a: &App, c: Commande) -> bool {
     use barre::Outil;
     match c {
-        Commande::NouveauDossier | Commande::NouveauFichier => a.outil_possible(Outil::Nouveau),
+        Commande::NouveauDossier | Commande::NouveauFichier => a.dossier().is_some(),
         Commande::Couper => a.outil_possible(Outil::Couper),
         Commande::Renommer => a.outil_possible(Outil::Renommer),
         Commande::Partager => a.outil_possible(Outil::Partager),

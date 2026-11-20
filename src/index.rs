@@ -20,7 +20,7 @@ use crate::dossier::{entree_fichier, Entree};
 pub const MAX_RESULTATS: usize = 5000;
 /// L'index sur disque est relu tel quel s'il a moins de 6 h ; plus vieux, il est reconstruit
 const AGE_MAX_S: u64 = 6 * 3600;
-const DOSSIER_RACINE: u32 = u32::MAX;
+pub(crate) const DOSSIER_RACINE: u32 = u32::MAX;
 /// Au-delà, les changements vus depuis la construction sont trop nombreux : on reconstruit
 const MAX_CHANGEMENTS: usize = 50_000;
 
@@ -70,7 +70,66 @@ impl Index {
         self.noeuds.len()
     }
 
-    fn ajouter(&mut self, nom: &str, parent: u32, dossier: bool, taille: u64, modif: u64) -> u32 {
+    /// Taille cumulée de chaque élément (un dossier = somme de tout ce qu'il contient, tailles logiques). Les nœuds sont en
+    /// largeur (un parent précède toujours ses enfants) : un seul passage à rebours suffit, sans récursion ni pile (E0 d'ESPACE).
+    pub fn tailles_cumulees(&self) -> Vec<u64> {
+        let mut cumul: Vec<u64> = self.noeuds.iter().map(|n| if n.dossier { 0 } else { n.taille }).collect();
+        for i in (0..self.noeuds.len()).rev() {
+            let p = self.noeuds[i].parent;
+            if p != DOSSIER_RACINE {
+                cumul[p as usize] = cumul[p as usize].saturating_add(cumul[i]);
+            }
+        }
+        cumul
+    }
+
+    /// Numéro du nœud d'un chemin (insensible à la casse), None s'il n'est pas dans l'index
+    #[cfg(test)]
+    pub fn trouver(&self, chemin: &str) -> Option<u32> {
+        let mut courant = DOSSIER_RACINE;
+        for morceau in chemin.split('\\').filter(|m| !m.is_empty()) {
+            let minuscule = morceau.to_lowercase();
+            courant = self.noeuds.iter().position(|n| n.parent == courant && self.nom(n).to_lowercase() == minuscule)? as u32;
+        }
+        (courant != DOSSIER_RACINE).then_some(courant)
+    }
+
+    /// Éléments sans parent : les disques (page ESPACE)
+    pub fn racines(&self) -> Vec<u32> {
+        (0..self.noeuds.len() as u32).filter(|&i| self.noeuds[i as usize].parent == DOSSIER_RACINE).collect()
+    }
+
+    /// Enfants directs d'un élément. Un enfant est rangé après son parent : le balayage part de lui, pas du début (E1).
+    pub fn enfants(&self, parent: u32) -> Vec<u32> {
+        let debut = parent as usize + 1;
+        (debut..self.noeuds.len()).filter(|&i| self.noeuds[i].parent == parent).map(|i| i as u32).collect()
+    }
+
+    /// Tous les fichiers (pas les dossiers) : numéro, nom, taille logique, date de modification (FILETIME : 100 ns depuis
+    /// 1601, 0 si inconnue). Un seul passage, sans allocation : c'est la base des bilans par type, taille et âge (E3).
+    pub fn fichiers(&self) -> impl Iterator<Item = (u32, &str, u64, u64)> + '_ {
+        self.noeuds.iter().enumerate().filter(|(_, n)| !n.dossier).map(|(i, n)| (i as u32, self.nom(n), n.taille, n.modif))
+    }
+
+    /// Dossier qui contient l'élément `i` (`None` pour un disque ou un numéro inconnu)
+    pub fn parent_de(&self, i: u32) -> Option<u32> {
+        self.noeuds.get(i as usize).map(|n| n.parent).filter(|&p| p != DOSSIER_RACINE)
+    }
+
+    pub fn nom_de(&self, i: u32) -> &str {
+        self.noeuds.get(i as usize).map_or("", |n| self.nom(n))
+    }
+
+    pub fn est_dossier(&self, i: u32) -> bool {
+        self.noeuds.get(i as usize).is_some_and(|n| n.dossier)
+    }
+
+    /// Chemin complet d'un élément (`C:\` pour un disque)
+    pub fn chemin_de(&self, i: u32) -> String {
+        self.chemin(i)
+    }
+
+    pub(crate) fn ajouter(&mut self, nom: &str, parent: u32, dossier: bool, taille: u64, modif: u64) -> u32 {
         let debut = self.noms.len() as u32;
         let octets = &nom.as_bytes()[..nom.len().min(u16::MAX as usize)];
         self.noms.extend_from_slice(octets);
@@ -384,6 +443,45 @@ fn prevenir() {
             let _ = PostMessageW(HWND(h as *mut _), WM_INDEX, WPARAM(0), LPARAM(0));
         }
     }
+}
+
+/// Lecture de l'index enregistré par `charger_enregistre` en cours
+static CHARGEMENT_SEUL: AtomicBool = AtomicBool::new(false);
+
+/// Page ESPACE : relit l'index enregistré **sans jamais le reconstruire** (un parcours de 132 s devant l'utilisateur
+/// serait une surprise ; la page montre la date de l'index). Ne lance pas la surveillance des disques : la première
+/// recherche globale s'en charge. La fenêtre reçoit WM_INDEX quand l'index est installé. Sans fichier d'index
+/// (ou « Supprimer l'index » demandé), rien n'est lu : la page dit qu'il n'y a pas d'analyse.
+pub fn charger_enregistre(hwnd: HWND) {
+    abonner(hwnd);
+    if actuel().is_some() || EFFACE.load(Ordering::SeqCst) || DEMARRE.load(Ordering::SeqCst) {
+        return;
+    }
+    if CHARGEMENT_SEUL.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    let efface = EFFACEMENTS.load(Ordering::SeqCst);
+    let h = hwnd.0 as isize;
+    std::thread::spawn(move || {
+        if let Some(i) = charger() {
+            let _etat = ETAT.lock().unwrap_or_else(|e| e.into_inner());
+            // Une fenêtre a démarré l'index entre-temps, ou il a été supprimé : on n'écrase rien
+            if actuel().is_none() && EFFACEMENTS.load(Ordering::SeqCst) == efface && !DEMARRE.load(Ordering::SeqCst) {
+                installer(i);
+            }
+        }
+        CHARGEMENT_SEUL.store(false, Ordering::SeqCst);
+        prevenir();
+        // Fichier absent ou abîmé : `prevenir` ne dit rien sans index, la page doit quand même cesser d'attendre
+        unsafe {
+            let _ = PostMessageW(HWND(h as *mut _), WM_INDEX, WPARAM(0), LPARAM(0));
+        }
+    });
+}
+
+/// Un index enregistré existe-t-il sur le disque (la page ESPACE sait alors s'il y a quelque chose à attendre) ?
+pub fn enregistre_existe() -> bool {
+    fichier_index().is_some_and(|f| f.exists())
 }
 
 /// Au premier besoin (palette, recherche globale) : relit l'index enregistré, le reconstruit s'il est trop vieux, puis surveille les disques
@@ -994,6 +1092,82 @@ mod tests {
     }
 
     use super::*;
+
+    /// Mesure E0 d'ESPACE (lancer avec `--release --ignored --nocapture`) : parcours complet des disques fixes sans droits
+    /// d'administrateur, puis cumul des tailles par dossier. Variable `ESPACE_VERIF` = un dossier dont on imprime le cumul,
+    /// pour le comparer à une somme faite par un autre outil.
+    #[test]
+    #[ignore]
+    fn mesure_espace_e0() {
+        let t = std::time::Instant::now();
+        let index = construire();
+        let parcours = t.elapsed();
+        let t = std::time::Instant::now();
+        let cumul = index.tailles_cumulees();
+        let agregation = t.elapsed();
+
+        let dossiers = index.noeuds.iter().filter(|n| n.dossier).count();
+        let octets_noeuds = index.noeuds.capacity() * std::mem::size_of::<Noeud>();
+        println!("MESURE E0 parcours : {} ms, {} éléments ({} dossiers, {} fichiers)", parcours.as_millis(), index.len(), dossiers, index.len() - dossiers);
+        println!("MESURE E0 cumul    : {} ms ({} µs par 1000 éléments)", agregation.as_millis(), agregation.as_micros() * 1000 / index.len().max(1) as u128);
+        println!(
+            "MESURE E0 mémoire  : nœuds {:.1} Mo + noms {:.1} Mo + cumuls {:.1} Mo = {:.1} Mo (estimation par capacité, hors tas du système)",
+            octets_noeuds as f64 / 1_048_576.0,
+            index.noms.capacity() as f64 / 1_048_576.0,
+            (cumul.len() * 8) as f64 / 1_048_576.0,
+            (octets_noeuds + index.noms.capacity() + cumul.len() * 8) as f64 / 1_048_576.0
+        );
+
+        // Somme vue par l'index et espace occupé annoncé par le disque : l'écart est l'« espace non expliqué » (E12)
+        for (k, n) in index.noeuds.iter().enumerate().filter(|(_, n)| n.parent == DOSSIER_RACINE) {
+            let racine = format!("{}\\", index.nom(n));
+            let (mut libre, mut total) = (0u64, 0u64);
+            let w = wide(&racine);
+            unsafe {
+                let _ = GetDiskFreeSpaceExW(PCWSTR(w.as_ptr()), None, Some(&mut total), Some(&mut libre));
+            }
+            let occupe = total.saturating_sub(libre);
+            println!(
+                "MESURE E0 disque {racine} : index {:.1} Go, occupé selon Windows {:.1} Go, non expliqué {:.1} Go ({:.0} %)",
+                cumul[k] as f64 / 1e9,
+                occupe as f64 / 1e9,
+                occupe.saturating_sub(cumul[k]) as f64 / 1e9,
+                occupe.saturating_sub(cumul[k]) as f64 * 100.0 / occupe.max(1) as f64
+            );
+            // Les dix plus gros dossiers directement sous la racine
+            let mut enfants: Vec<(u64, String)> = index.noeuds.iter().enumerate().filter(|(_, e)| e.parent == k as u32 && e.dossier).map(|(i, e)| (cumul[i], index.nom(e).to_string())).collect();
+            enfants.sort_by(|a, b| b.0.cmp(&a.0));
+            for (taille, nom) in enfants.iter().take(10) {
+                println!("MESURE E0   {:>8.2} Go  {racine}{nom}", *taille as f64 / 1e9);
+            }
+        }
+        if let Ok(v) = std::env::var("ESPACE_VERIF") {
+            match index.trouver(&v) {
+                Some(i) => println!("MESURE E0 vérif {v} : {} octets", cumul[i as usize]),
+                None => println!("MESURE E0 vérif {v} : absent de l'index"),
+            }
+        }
+    }
+
+    #[test]
+    fn cumul_des_tailles() {
+        let mut i = Index::default();
+        let c = i.ajouter("C:", DOSSIER_RACINE, true, 0, 0);
+        let a = i.ajouter("A", c, true, 0, 0);
+        let b = i.ajouter("B", c, true, 0, 0);
+        i.ajouter("un.txt", a, false, 10, 0);
+        let sous = i.ajouter("S", a, true, 0, 0);
+        i.ajouter("deux.txt", sous, false, 5, 0);
+        i.ajouter("trois.txt", b, false, 7, 0);
+        let cumul = i.tailles_cumulees();
+        assert_eq!(cumul[a as usize], 15);
+        assert_eq!(cumul[sous as usize], 5);
+        assert_eq!(cumul[b as usize], 7);
+        assert_eq!(cumul[c as usize], 22);
+        assert_eq!(i.trouver(r"c:\a\s"), Some(sous));
+        assert_eq!(i.trouver(r"C:\inconnu"), None);
+        assert_eq!(i.trouver(""), None);
+    }
 
     #[test]
     fn debordement_reconstruit_au_plus_une_fois_par_pause() {

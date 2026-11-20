@@ -9,16 +9,22 @@ mod logique;
 mod procedure;
 mod session;
 pub(crate) mod souris;
+mod terminal_clavier;
 
 pub(crate) use arbre::*;
 pub(crate) use clavier::*;
 pub(crate) use procedure::*;
 pub(crate) use session::*;
 pub(crate) use souris::*;
+pub(crate) use terminal_clavier::*;
 pub(crate) const WM_MOUSELEAVE: u32 = 0x02A3;
 
 /// Vérification d'un stockage ajouté terminée (LPARAM = Box<Result<String, String>>)
 pub(crate) const WM_STOCKAGE: u32 = WM_APP + 6;
+
+/// Le shell du panneau terminal a produit de la sortie ou s'est terminé : la fenêtre vide la session dans l'émulateur
+/// (`Panneau::pomper`) et redessine. Posté par un fil de la session ; sans paramètre (le panneau est dans `Fenetre`).
+pub(crate) const WM_TERMINAL: u32 = WM_APP + 60;
 
 /// Un fil court a déposé le chemin reçu par `explorer.open {reuse}` dans `OUVERTURES` : la fenêtre l'ouvre en onglet.
 /// Aucun paramètre (ni pointeur). Voir `recevoir_ouvrir_ici`.
@@ -251,7 +257,7 @@ mod tests_modale {
     fn les_messages_prives_sont_retenus() {
         // Les quatorze qui n'avaient aucune retenue, plus ceux qui en avaient une éparpillée
         for m in [
-            WM_PROGRES, WM_CHANGEMENT, WM_LECTURE, WM_VIGNETTE, WM_GALERIE, WM_OPERATION_FINIE, etats::WM_ETATS, index::WM_INDEX, WM_GIT, WM_FOND, WM_OUTIL, ocr::WM_OCR, WM_STOCKAGE,
+            WM_PROGRES, WM_CHANGEMENT, WM_LECTURE, WM_VIGNETTE, WM_GALERIE, WM_OPERATION_FINIE, etats::WM_ETATS, index::WM_INDEX, WM_GIT, WM_FOND, WM_OUTIL, ocr::WM_OCR, WM_STOCKAGE, WM_TERMINAL,
             WM_APERCU, WM_APPARENCE, minuteries::WM_IMAGE_ANIMATION, navigateur::WM_TELECHARGEMENT, WM_OUVRIR_ICI, WM_ONGLETS_COPIES, WM_PALETTE_RECHERCHE, WM_PALETTE_LECTURE, WM_PALETTE_TACHE,
             accessibilite::WM_UIA_ACTION,
         ] {
@@ -365,13 +371,40 @@ pub(crate) struct Fenetre {
     pub(crate) apercu_demande: Option<String>,
     pub(crate) apercu_numero: u64,
     pub(crate) apercu_attente: Option<(String, Option<Entree>)>,
-    /// Panneau terminal intégré ouvert (bouton `>_` du chemin ou Ctrl+Alt+T)
-    pub(crate) terminal_visible: bool,
-    /// Dernières opérations chargées à l'ouverture du panneau (contenu réel du journal)
-    pub(crate) terminal_lignes: Vec<crate::journal::Operation>,
+    /// Panneau terminal intégré (bouton `>_` du chemin ou Ctrl+Alt+T) : un panneau par onglet (T4a), chacun avec son shell ;
+    /// vide = panneau fermé. Fermer un onglet détruit son panneau (et tue sa session), aucun shell ne tourne tant que le
+    /// panneau est fermé
+    pub(crate) terminaux: Vec<Box<crate::terminal::panneau::Panneau>>,
+    /// Rang de l'onglet affiché dans `terminaux` (toujours valide quand la liste n'est pas vide)
+    pub(crate) terminal_actif: usize,
+    /// T4b : dernier dossier de la liste que le terminal connaît (déjà tapé au shell, ou venu de lui). Sert à ne réagir
+    /// qu'à un changement : la liste ne renvoie pas au shell un dossier que le shell vient de lui donner
+    pub(crate) terminal_dossier_liste: Option<String>,
+    /// T4c : l'onglet JOURNAL du panneau est affiché à la place du shell actif (qui continue de tourner, caché). Le journal est
+    /// en lecture seule : ni clavier, ni sélection, ni molette ne vont au shell tant qu'il est là
+    pub(crate) terminal_journal: bool,
+    /// T4c : dernières opérations lues dans `operations.csv`, et le compteur d'écritures (`journal::ecritures`) au moment de la
+    /// lecture : `usize::MAX` = à relire (ouverture de l'onglet), sinon on relit seulement quand une opération a été écrite
+    pub(crate) terminal_operations: Vec<crate::journal::Operation>,
+    pub(crate) terminal_operations_version: usize,
+    /// T5 : commandes tapées dans le terminal (suggestion grise, rappel par ↑), partagées par tous les onglets. Lu dans
+    /// `%APPDATA%\SpaceFiles\historique-terminal.txt` à la première frappe, pas au démarrage (`historique_terminal_charge`)
+    pub(crate) historique_terminal: crate::terminal::historique::Historique,
+    pub(crate) historique_terminal_charge: bool,
+    /// Le clavier va au shell (clic dans la grille) plutôt qu'à l'explorateur
+    pub(crate) terminal_focus: bool,
+    /// Un glissement de la souris sélectionne du texte dans la grille du terminal (la souris est capturée)
+    pub(crate) terminal_glisse: bool,
+    /// T3 : le bouton gauche est tenu dans la grille et c'est le programme du terminal (vim, htop…) qui reçoit le
+    /// glissement, pas la sélection de texte (la souris est capturée)
+    pub(crate) terminal_glisse_appli: bool,
+    /// T3 : fraction de cran de molette pas encore envoyée au programme (pavé tactile de précision)
+    pub(crate) terminal_molette_reste: f32,
     pub(crate) par_defaut: bool,
     /// Page des réglages (commune à tous les onglets)
     pub(crate) page: Page,
+    /// Page ESPACE (analyse de l'espace disque) : l'état n'existe que tant que la page est affichée
+    pub(crate) espace: espace::Etat,
     /// Cloud détecté (OneDrive, Google Drive…), relu avec les disques
     pub(crate) detectes: Vec<Lieu>,
     /// États mesurés des lieux du volet (lot 14b), la mesure en cours et l'heure de la dernière
@@ -468,6 +501,272 @@ impl Fenetre {
     /// Convertit des pixels physiques en DIP
     pub(crate) fn dip(&self, px: i32) -> f32 {
         px as f32 * 96.0 / self.dpi
+    }
+
+    /// Un onglet de terminal de plus tient-il dans l'en-tête du panneau (place et nombre maximal) ?
+    ///
+    /// # Safety
+    /// Fil d'interface ; `hwnd` est la fenêtre de cette `Fenetre`.
+    pub(crate) unsafe fn terminal_peut_ajouter(&self, hwnd: HWND) -> bool {
+        let (lp, hp) = taille_client(hwnd);
+        let (lt, h) = (self.dip(lp as i32), self.dip(hp as i32));
+        crate::rendu::terminal_peut_ajouter(largeur_liste(lt, self.apercu_visible), h, self.terminaux.len())
+    }
+
+    /// Colonnes × lignes que la grille du panneau terminal peut afficher dans la fenêtre actuelle
+    pub(crate) unsafe fn dimensions_terminal(&self, hwnd: HWND) -> (usize, usize) {
+        let (lp, hp) = taille_client(hwnd);
+        let (lt, h) = (self.dip(lp as i32), self.dip(hp as i32));
+        let ll = largeur_liste(lt, self.apercu_visible);
+        let z = zone_terminal_grille(ll, h);
+        let (cw, ch) = self.rendu.cellule_terminal();
+        crate::terminal::panneau::dimensions_grille(z.right - z.left, z.bottom - z.top, cw, ch)
+    }
+
+    /// Case (rangée visible, colonne) de la grille du terminal sous le point (x, y) en DIP. Hors de la grille : `None`, ou,
+    /// avec `borner`, la case la plus proche (un glissement qui sort de la grille continue de sélectionner jusqu'au bord).
+    pub(crate) unsafe fn case_terminal_sous(&self, hwnd: HWND, x: f32, y: f32, borner: bool) -> Option<(usize, usize)> {
+        // Le journal masque la grille : aucune case, donc ni sélection ni souris vers le programme
+        if self.terminal_journal {
+            return None;
+        }
+        let p = self.terminal_ref()?;
+        let (lp, hp) = taille_client(hwnd);
+        let (lt, h) = (self.dip(lp as i32), self.dip(hp as i32));
+        let z = zone_terminal_grille(largeur_liste(lt, self.apercu_visible), h);
+        if !borner && !(x >= z.left && x < z.right && y >= z.top && y < z.bottom) {
+            return None;
+        }
+        let (cw, ch) = self.rendu.cellule_terminal();
+        let (colonnes, lignes) = (p.terminal().colonnes().max(1), p.terminal().lignes().max(1));
+        let col = (((x - z.left) / cw).floor().max(0.0) as usize).min(colonnes - 1);
+        let rangee = (((y - z.top) / ch).floor().max(0.0) as usize).min(lignes - 1);
+        Some((rangee, col))
+    }
+
+    /// T3 : appui du bouton gauche sur la grille quand le programme a demandé la souris (Maj garde la sélection de texte).
+    /// Lui envoie l'appui, prend la capture et rend `true` ; `x` et `y` en DIP. Sans cela rien n'est fait.
+    pub(crate) unsafe fn appui_vers_programme(&mut self, hwnd: HWND, x: f32, y: f32, maj: bool, ctrl: bool, alt: bool) -> bool {
+        if maj || !self.terminal_ref().is_some_and(|p| p.souris_capturee()) {
+            return false;
+        }
+        let Some((rangee, col)) = self.case_terminal_sous(hwnd, x, y, false) else { return false };
+        if let Some(p) = self.terminal_mut() {
+            // Une sélection de texte restée affichée n'a plus de sens une fois le clic parti vers le programme
+            p.effacer_selection();
+            p.oublier_case_souris();
+            p.envoyer_souris(crate::terminal::souris::Evenement::Appui(crate::terminal::souris::Bouton::Gauche), col, rangee, ctrl, alt);
+        }
+        self.terminal_glisse_appli = true;
+        windows::Win32::UI::Input::KeyboardAndMouse::SetCapture(hwnd);
+        true
+    }
+
+    /// T3 : fin d'un glissement transmis au programme : il reçoit le relâchement (case bornée à la grille, même si le
+    /// pointeur en est sorti). `liberer` rend la capture ; à `false` quand c'est la perte de la capture qui l'a causée.
+    /// Sans glissement en cours, ne fait rien.
+    pub(crate) unsafe fn finir_glisse_appli(&mut self, hwnd: HWND, x: f32, y: f32, ctrl: bool, alt: bool, liberer: bool) {
+        // Drapeau baissé avant `ReleaseCapture`, qui envoie `WM_CAPTURECHANGED` tout de suite : le gestionnaire ne refait rien
+        if !std::mem::take(&mut self.terminal_glisse_appli) {
+            return;
+        }
+        if let Some((rangee, col)) = self.case_terminal_sous(hwnd, x, y, true) {
+            if let Some(p) = self.terminal_mut() {
+                p.envoyer_souris(crate::terminal::souris::Evenement::Relache(crate::terminal::souris::Bouton::Gauche), col, rangee, ctrl, alt);
+            }
+        }
+        if let Some(p) = self.terminal_mut() {
+            p.oublier_case_souris();
+        }
+        if liberer {
+            let _ = windows::Win32::UI::Input::KeyboardAndMouse::ReleaseCapture();
+        }
+    }
+
+    /// Le panneau terminal est dessiné et prend la souris et le clavier (jamais sur une page : Réglages, ESPACE)
+    pub(crate) fn terminal_affiche(&self) -> bool {
+        !self.terminaux.is_empty() && !self.app.emplacement.est_page()
+    }
+
+    /// Panneau de l'onglet affiché
+    pub(crate) fn terminal_ref(&self) -> Option<&crate::terminal::panneau::Panneau> {
+        self.terminaux.get(self.terminal_actif).map(|b| &**b)
+    }
+
+    /// Panneau de l'onglet affiché, modifiable
+    pub(crate) fn terminal_mut(&mut self) -> Option<&mut crate::terminal::panneau::Panneau> {
+        self.terminaux.get_mut(self.terminal_actif).map(|b| &mut **b)
+    }
+
+    /// T4b : garde la liste et le terminal sur le même dossier, dans les deux sens, en ne réagissant qu'aux changements.
+    /// Shell → liste : un `cd` tapé dans l'onglet affiché ouvre ce dossier dans la liste (les autres onglets notent leur
+    /// dossier sans toucher à la liste : changer d'onglet ne déplace rien). Liste → shell : un nouveau dossier de la liste
+    /// est tapé au shell (`cd`) dès qu'il est à une invite vide ; sinon on réessaie à la prochaine invite.
+    pub(crate) fn synchroniser_terminal(&mut self, hwnd: HWND) {
+        if self.terminaux.is_empty() {
+            return;
+        }
+        let actif = self.terminal_actif;
+        let mut du_shell = None;
+        for (i, p) in self.terminaux.iter_mut().enumerate() {
+            let d = p.dossier_change_par_le_shell();
+            if i == actif {
+                du_shell = d;
+            }
+        }
+        if let Some(d) = du_shell {
+            let deja = self.app.dossier().is_some_and(|c| crate::terminal::panneau::meme_dossier(c, &d));
+            if self.terminal_affiche() && !deja && std::path::Path::new(&d).is_dir() {
+                self.terminal_dossier_liste = Some(d.clone());
+                self.app.naviguer(hwnd, crate::dossier::Emplacement::Dossier(d));
+            }
+        }
+        let Some(d) = self.app.dossier().map(str::to_owned) else { return };
+        if self.terminal_dossier_liste.as_deref() == Some(d.as_str()) {
+            return;
+        }
+        let Some(p) = self.terminal_mut() else { return };
+        if crate::terminal::panneau::meme_dossier(&d, p.dossier_connu()) || p.aller_dans(&d) {
+            self.terminal_dossier_liste = Some(d);
+        }
+    }
+
+    /// Ajoute un onglet (déjà ouvert) et l'affiche ; le clavier lui va. Rend `false` sans rien faire s'il y en a trop
+    pub(crate) fn ajouter_onglet_terminal(&mut self, p: crate::terminal::panneau::Panneau) -> bool {
+        if self.terminaux.len() >= crate::terminal::onglets::ONGLETS_MAX {
+            return false;
+        }
+        self.abandonner_glisse_terminal();
+        self.terminaux.push(Box::new(p));
+        self.terminal_actif = self.terminaux.len() - 1;
+        self.terminal_journal = false;
+        self.terminal_focus = true;
+        self.terminal_molette_reste = 0.0;
+        true
+    }
+
+    /// Un glissement commencé dans l'onglet affiché (sélection de texte ou souris transmise au programme) ne peut pas
+    /// continuer quand l'onglet change ou se ferme : le programme reçoit son relâchement (sinon il croirait le bouton tenu
+    /// jusqu'au prochain clic), la capture est rendue, et si le bouton est encore enfoncé son relâchement ne sera pas pris
+    /// pour un clic sur ce qui se trouve dessous. À appeler AVANT de changer `terminal_actif` ou de retirer l'onglet.
+    /// Sans glissement en cours, ne fait rien.
+    fn abandonner_glisse_terminal(&mut self) {
+        if !(self.terminal_glisse || self.terminal_glisse_appli) {
+            return;
+        }
+        use windows::Win32::Foundation::POINT;
+        use windows::Win32::Graphics::Gdi::ScreenToClient;
+        use windows::Win32::UI::Input::KeyboardAndMouse::{GetCapture, GetKeyState, ReleaseCapture, VK_LBUTTON};
+        use windows::Win32::UI::WindowsAndMessaging::GetCursorPos;
+        // SAFETY : fil d'interface ; `GetCapture` rend la fenêtre qui détient la capture posée au début du glissement.
+        // `ReleaseCapture` envoie `WM_CAPTURECHANGED` tout de suite et son gestionnaire reprend un `&mut Fenetre` : les deux
+        // drapeaux sont donc baissés avant, pour qu'il ne refasse rien (même motif que `finir_glisse_appli`).
+        unsafe {
+            let hwnd = GetCapture();
+            if self.terminal_glisse_appli && !hwnd.is_invalid() {
+                let mut p = POINT::default();
+                let (x, y) = if GetCursorPos(&mut p).is_ok() && ScreenToClient(hwnd, &mut p).as_bool() {
+                    (self.dip(p.x), self.dip(p.y))
+                } else {
+                    (0.0, 0.0)
+                };
+                self.finir_glisse_appli(hwnd, x, y, false, false, false);
+            }
+            self.terminal_glisse = false;
+            self.terminal_glisse_appli = false;
+            if GetKeyState(VK_LBUTTON.0 as i32) < 0 {
+                self.avaler_clic = true;
+            }
+            let _ = ReleaseCapture();
+        }
+    }
+
+    /// Affiche l'onglet de rang `i` (sans effet s'il n'existe pas) ; un glissement en cours est abandonné proprement
+    pub(crate) fn choisir_onglet_terminal(&mut self, i: usize) {
+        if i >= self.terminaux.len() {
+            return;
+        }
+        // Le journal affiché : un clic sur un onglet shell, même l'actif, rend la place au shell
+        let etait_journal = std::mem::take(&mut self.terminal_journal);
+        if i == self.terminal_actif {
+            self.terminal_focus = self.terminal_focus || etait_journal;
+            return;
+        }
+        self.abandonner_glisse_terminal();
+        self.terminal_actif = i;
+        self.terminal_focus = true;
+        // États de souris propres à l'onglet quitté : la fraction de cran de molette et la dernière case envoyée
+        self.terminal_molette_reste = 0.0;
+        if let Some(p) = self.terminal_mut() {
+            p.oublier_case_souris();
+        }
+    }
+
+    /// T4c : affiche l'onglet JOURNAL (un glissement de sélection en cours est abandonné ; le clavier revient à l'explorateur,
+    /// le journal n'a rien à saisir) ; un second clic sur l'onglet le quitte
+    pub(crate) fn basculer_journal_terminal(&mut self) {
+        if self.terminal_journal {
+            self.terminal_journal = false;
+            self.terminal_focus = true;
+            return;
+        }
+        self.abandonner_glisse_terminal();
+        self.terminal_journal = true;
+        self.terminal_focus = false;
+        self.terminal_operations_version = usize::MAX;
+    }
+
+    /// Relit `operations.csv` quand le journal est affiché et qu'il a changé depuis la dernière lecture ; rend `true` si la liste a
+    /// été remplacée
+    pub(crate) fn actualiser_operations_terminal(&mut self) -> bool {
+        if !self.terminal_journal || !self.terminal_affiche() {
+            return false;
+        }
+        let v = crate::journal::ecritures();
+        if self.terminal_operations_version == v {
+            return false;
+        }
+        self.terminal_operations_version = v;
+        self.terminal_operations = crate::journal::dernieres_operations(crate::journal::OPERATIONS_AFFICHEES);
+        true
+    }
+
+    /// Ferme l'onglet de rang `i` (son shell est tué par le `Drop`) ; le dernier fermé ferme tout le panneau
+    pub(crate) fn fermer_onglet_terminal(&mut self, i: usize) {
+        if i >= self.terminaux.len() {
+            return;
+        }
+        if self.terminaux.len() == 1 {
+            self.fermer_terminal();
+            return;
+        }
+        let etait_actif = i == self.terminal_actif;
+        if etait_actif {
+            // Avant le retrait : le relâchement doit encore atteindre le programme de cet onglet
+            self.abandonner_glisse_terminal();
+        }
+        self.terminaux.remove(i);
+        self.terminal_actif = crate::terminal::onglets::apres_fermeture(self.terminal_actif, i, self.terminaux.len());
+        if etait_actif {
+            self.terminal_molette_reste = 0.0;
+            if let Some(p) = self.terminal_mut() {
+                p.oublier_case_souris();
+            }
+        }
+    }
+
+    /// Ferme le panneau terminal entier : toutes les sessions (et leurs descendants) sont tuées par le `Drop` des panneaux
+    pub(crate) fn fermer_terminal(&mut self) {
+        self.terminaux.clear();
+        self.terminal_actif = 0;
+        self.terminal_journal = false;
+        self.terminal_focus = false;
+        // Un glissement de sélection en cours n'a plus de cible : sans cela la capture resterait prise et le survol figé
+        // `|` et non `||` : les deux drapeaux doivent être remis à zéro
+        if std::mem::take(&mut self.terminal_glisse) | std::mem::take(&mut self.terminal_glisse_appli) {
+            // SAFETY : appelé sur le fil d'interface, qui détient la capture de la souris posée au début du glissement
+            let _ = unsafe { windows::Win32::UI::Input::KeyboardAndMouse::ReleaseCapture() };
+        }
     }
 
     /// Un mouvement du lot 12A n'a pas fini : ouverture, fermeture ou glissement (pastille, vue, onglet). La minuterie

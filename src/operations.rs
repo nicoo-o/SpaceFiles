@@ -314,7 +314,7 @@ fn chemin_reel(item: Option<&IShellItem>) -> Option<String> {
 
 /// Chemin développé par `GetLongPathNameW` (`SPACEF~1` -> `spacefiles-matrice-…`), sans préfixe long ; inchangé s'il échoue.
 /// L'élément doit exister : un élément supprimé n'a plus de nom court à développer.
-fn developper(chemin: &str) -> String {
+pub(crate) fn developper(chemin: &str) -> String {
     let entree = wide(&avec_prefixe_long(chemin));
     // SAFETY: `entree` est terminé par 0 et vit pendant les deux appels ; le tampon a la taille annoncée par le premier
     unsafe {

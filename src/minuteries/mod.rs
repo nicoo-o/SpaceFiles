@@ -122,6 +122,7 @@ pub(crate) unsafe fn animer(hwnd: HWND, f: &mut Fenetre) {
         for a in f.tous() {
             a.animer();
         }
+        f.espace.animer();
         let _ = InvalidateRect(hwnd, None, false);
         return;
     }
@@ -214,7 +215,7 @@ pub(crate) unsafe fn image_animation(hwnd: HWND) -> LRESULT {
         // Seuls les yeux de Pixel bougent (clignement toutes les 9 s, regard) : 30 images par seconde, pas la cadence de l'écran
         // (mesuré : un clignement à 237 Hz coûtait ~340 ms de processeur, soit 3 % d'un cœur)
         let t = mouvement::maintenant_ms();
-        let seuls = f.apps().all(|a| !a.en_mouvement()) && !pixel_en_vol(f) && !f.mouvement_hors_yeux(t);
+        let seuls = f.apps().all(|a| !a.en_mouvement()) && !f.espace.en_mouvement() && !pixel_en_vol(f) && !f.mouvement_hors_yeux(t);
         if !mouvement::peindre_cette_image(seuls, &mut f.image_yeux, t) {
             return LRESULT(0);
         }
@@ -245,7 +246,9 @@ pub(crate) unsafe fn timer_defilement(hwnd: HWND) -> LRESULT {
             let _ = DestroyWindow(hwnd);
             return LRESULT(0);
         }
-        if !f.app.animer() && !pixel_en_vol && !f.mouvement_en_cours(maintenant) {
+        // Les deux défilements avancent à chaque image : pas de court-circuit
+        let espace_en_vol = f.espace.animer();
+        if !f.app.animer() && !espace_en_vol && !pixel_en_vol && !f.mouvement_en_cours(maintenant) {
             arreter_animation(hwnd, f);
             if let Some(bilan) = f.cadence.vider() {
                 mouvement::journaliser_cadence(&bilan);

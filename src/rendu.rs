@@ -15,6 +15,7 @@ use windows::Foundation::Numerics::Matrix3x2;
 use crate::apercu::{Apercu, Galerie, Image, Teinte};
 use crate::app::{Affichage, App, Cible, GRILLE_ECART, GRILLE_NOM};
 use crate::dossier::Entree;
+use crate::espace;
 use crate::lot::Lot;
 use crate::conflit::{Choix, Conflits};
 use crate::menu::{self, Menu};
@@ -37,11 +38,12 @@ pub struct Vue<'a> {
     pub actif: usize,
     pub apercu_visible: bool,
     pub apercu: Option<&'a Apercu>,
-    /// Panneau terminal intégré et ses dernières opérations (journal réel)
-    pub terminal_visible: bool,
-    pub terminal_lignes: &'a [crate::journal::Operation],
+    /// Panneau terminal intégré : `None` tant qu'il est fermé (aucune session n'existe alors)
+    pub terminal: Option<VueTerminal<'a>>,
     /// Page des réglages (quand l'onglet affiché est sur Réglages)
     pub page: Option<VuePage<'a>>,
+    /// Page ESPACE (quand l'onglet affiché est sur ESPACE)
+    pub espace: Option<VueEspace<'a>>,
     /// Double panneau (F6) : le panneau qui a le focus est-il celui de droite ?
     pub double: bool,
     pub focus_droite: bool,
@@ -87,11 +89,61 @@ mod historique;
 pub use historique::*;
 mod zones;
 pub use zones::*;
+mod grille_terminal;
+pub use grille_terminal::VueTerminal;
 use historique::{hist_bas_liste, HIST_BOUTON_H, HIST_BOUTON_L, HIST_ENTETE, HIST_PAD, HIST_TEMPS_L};
 
 /// Mélange de deux couleurs (déjà passées par le thème) : `k` = 0 donne `a`, 1 donne `b`
 fn melange_couleurs(a: &D2D1_COLOR_F, b: &D2D1_COLOR_F, k: f32) -> D2D1_COLOR_F {
     D2D1_COLOR_F { r: mouvement::melanger(a.r, b.r, k), g: mouvement::melanger(a.g, b.g, k), b: mouvement::melanger(a.b, b.b, k), a: mouvement::melanger(a.a, b.a, k) }
+}
+
+/// Rayon d'une pilule : la moitié de la hauteur du rectangle (le dessin et le reflet partagent ainsi la même forme)
+pub fn rayon_pilule(r: &D2D_RECT_F) -> f32 {
+    (r.bottom - r.top) / 2.0
+}
+
+/// Hauteur (DIP) réservée au bouton des réglages sous le volet : le dessin du volet et le rognage de son reflet s'y arrêtent
+/// tous deux (le reflet s'arrêtait 6 DIP plus haut, ce qui laissait sans reflet une ligne à demi visible)
+const RETRAIT_BAS_VOLET: f32 = 46.0;
+
+/// Rayon du fond d'un élément, **table unique** lue par le dessin de cet élément et par son reflet (`cible_du_reflet`) :
+/// un reflet qui n'a pas le rayon du fond qu'il éclaire déborde aux coins (lot 2 de l'audit UX, 16/11/2026 : onglets 8 contre 12,
+/// carte de disque 12 contre 16, stockages de Ce PC 10 contre 12). `None` : élément dont la forme n'est pas fixe (outils de la
+/// barre : `Outil::rayon_coin` ; pastilles et boutons de formulaire : pilules, rayon lu sur le rectangle).
+pub fn rayon_cible(c: Cible) -> Option<f32> {
+    Some(match c {
+        Cible::Onglet(_) | Cible::FermerOnglet(_) | Cible::NouvelOnglet => RAYON_MOYEN,
+        // Toutes les lignes du volet, disque compris, et les lignes de l'arbre : un seul rayon, 8 (lot 5 de l'audit UX, D-5)
+        Cible::CePc | Cible::EspaceVolet | Cible::Favori(_) | Cible::Epingle(_) | Cible::Nuage(_) | Cible::Serveur(_) | Cible::Groupe(_) | Cible::Disque(_) => RAYON_PETIT,
+        Cible::Arbre(_) => RAYON_PETIT,
+        Cible::Reglages | Cible::ReglagesFermer | Cible::EssentielHaut | Cible::EspaceFermer | Cible::EspaceLigne(_) => RAYON_PETIT,
+        Cible::Terminal | Cible::TerminalFermer | Cible::TerminalExterne | Cible::TerminalOnglet(_) | Cible::TerminalOngletFermer(_) | Cible::TerminalNouveau | Cible::TerminalJournal => RAYON_PETIT,
+        Cible::Precedent | Cible::Suivant | Cible::Parent => RAYON_PETIT,
+        Cible::ReglagesNav(_) | Cible::EspaceNav(_) | Cible::EspaceVue(_) => REGLAGE_SEG_RAYON,
+        Cible::EspaceCellule(_) | Cible::EspaceChemin(_) => RAYON_PETIT,
+        Cible::NettoyageLigne(_) | Cible::NettoyageCase(_) | Cible::NettoyageBouton(_) => RAYON_PETIT,
+        Cible::Reglage(_) => REGLAGE_CARTE_RAYON,
+        Cible::Note | Cible::Corbeille | Cible::StockageCePc(_) | Cible::AjouterStockage | Cible::OuvrirEspace | Cible::OuvrirNettoyage => RAYON_MOYEN,
+        Cible::Puce(_) => RAYON_PETIT,
+        _ => return None,
+    })
+}
+
+/// Un reflet de l'image : plan, rognage, opacité du fondu, et « déjà peint » (le reflet est peint une seule fois par image)
+type ReflexAttente = (reflet::Plan, Option<D2D_RECT_F>, f32, bool);
+
+/// Prend les reflets pas encore peints : ceux de l'élément `cible`, ou tous (`None`, la passe finale), et les marque peints.
+/// Séparée du dessin pour être testée : c'est elle qui garantit qu'un reflet n'est jamais peint deux fois ni perdu.
+fn reclamer_reflets(attente: &mut [ReflexAttente], cible: Option<Cible>) -> Vec<(reflet::Plan, Option<D2D_RECT_F>, f32)> {
+    attente
+        .iter_mut()
+        .filter(|e| !e.3 && cible.is_none_or(|q| e.0.cible == Some(q)))
+        .map(|e| {
+            e.3 = true;
+            (e.0, e.1, e.2)
+        })
+        .collect()
 }
 
 /// Traduit un rectangle vers le haut pour le survol du chrome, sans toucher à sa zone de clic.
@@ -184,10 +236,212 @@ pub struct VuePage<'a> {
     pub focus_clavier: bool,
 }
 
+/// Page ESPACE : l'état (arbre, ligne choisie, défilement) et ce que le dessin doit savoir de plus
+pub struct VueEspace<'a> {
+    pub etat: &'a espace::Etat,
+    pub focus_clavier: bool,
+    /// Pas d'une ligne de l'arbre (DIP)
+    pub pas: f32,
+    /// Heure (secondes depuis 1970), pour l'âge de l'index
+    pub maintenant: u64,
+    /// Un index enregistré existe sur le disque (sinon la page dit qu'il n'y a rien à lire)
+    pub index_enregistre: bool,
+}
+
+/// Haut de la liste de l'arbre (DIP) : sous le titre et le sous-titre de la page
+pub const ESPACE_LISTE_Y: f32 = page::PAGE_Y + 84.0;
+/// Largeur de la barre de proportion
+const ESPACE_BARRE_L: f32 = 160.0;
+/// Largeur de chaque segment du contrôle de vue (DIP), dans l'ordre de `espace::VUES` : largeur mesurée du libellé
+/// (≈ 34, 34, 34, 74 et 24 DIP) + 28 de marge ; le texte y est centré, donc l'écart entre deux libellés est le même partout
+const ESPACE_VUE_LARGEURS: [f32; 5] = [62.0, 62.0, 62.0, 102.0, 52.0];
+/// Fond du segment de la vue montrée : plus net que `SELECTION` (7 %), qui se confondait avec le fond de la page
+const ESPACE_SEGMENT_ACTIF: D2D1_COLOR_F = rgba(255, 255, 255, 0.20);
+const ESPACE_SEGMENT_ACTIF_CLAIR: D2D1_COLOR_F = rgba(16, 16, 20, 0.14);
+/// Largeur de tout le contrôle de vue
+fn espace_vues_largeur() -> f32 {
+    ESPACE_VUE_LARGEURS.iter().sum()
+}
+
+/// Segment `k` du contrôle de vue (carte, arbre, types, gros fichiers, âge), en haut à droite de la page, sur la ligne du sous-titre (DIP)
+pub fn espace_segment_vue(l: f32, k: usize) -> D2D_RECT_F {
+    let avant: f32 = ESPACE_VUE_LARGEURS.iter().take(k).sum();
+    rect(page::droite(l) - espace_vues_largeur() + avant, page::PAGE_Y + 48.0, ESPACE_VUE_LARGEURS.get(k).copied().unwrap_or(0.0), 28.0)
+}
+
+/// Hauteur réservée sous la carte : la légende des couleurs, puis la ligne d'aide (DIP)
+const ESPACE_AIDE_H: f32 = 44.0;
+/// Hauteur d'une pastille du fil d'Ariane
+const ESPACE_MIETTE_H: f32 = 26.0;
+
+/// Place de la carte sous son fil d'Ariane, jusqu'à la légende et la ligne d'aide qui la suivent (DIP)
+pub fn espace_zone_carte(l: f32, h: f32) -> espace::carte::Rect {
+    let y = ESPACE_LISTE_Y + ESPACE_MIETTE_H + 8.0;
+    espace::carte::Rect { x: page::gauche(), y, l: (page::droite(l) - page::gauche()).max(0.0), h: (h - statut_h() - 8.0 - ESPACE_AIDE_H - y).max(0.0) }
+}
+
+/// Page NETTOYAGE : pas d'une ligne de catégorie (DIP)
+const NET_PAS: f32 = 56.0;
+/// Page NETTOYAGE : hauteur réservée en bas de la liste (texte de risque, ou total et boutons)
+const NET_BAS_H: f32 = 48.0;
+/// Page NETTOYAGE : haut de la liste, sous le titre et le sous-titre (DIP)
+fn net_liste_y() -> f32 {
+    page::PAGE_Y + 84.0
+}
+
+/// Page NETTOYAGE : nombre de lignes entières que la fenêtre montre (au moins une)
+pub fn net_visibles(h: f32) -> usize {
+    let place = h - statut_h() - NET_BAS_H - net_liste_y();
+    ((place / NET_PAS).floor() as usize).max(1)
+}
+
+/// Page NETTOYAGE : plage des catégories dessinées (début, fin exclue). Une seule règle pour le dessin et la souris : sans
+/// position voulue (`debut` à `None`, après une touche), la liste suit la ligne choisie ; la molette fixe un début.
+pub fn net_plage(n: usize, focus: usize, debut: Option<usize>, h: f32) -> (usize, usize) {
+    let visibles = net_visibles(h);
+    let place = h - statut_h() - NET_BAS_H - net_liste_y();
+    let debut = match debut {
+        Some(d) => d.min(n.saturating_sub(visibles)),
+        None => (focus + 1).saturating_sub(visibles),
+    }
+    .min(n);
+    // Une ligne de plus que `visibles` est tolérée quand il ne lui manque que 4 DIP (comme avant l'ajout de la souris)
+    let capacite = (((place + 4.0) / NET_PAS).floor() as usize).max(visibles);
+    (debut, n.min(debut + capacite))
+}
+
+/// Page NETTOYAGE : rectangle de la ligne dessinée au rang `rang` de la plage (DIP)
+pub fn net_rect_ligne(l: f32, rang: usize) -> D2D_RECT_F {
+    rect(page::gauche() - 8.0, net_liste_y() + rang as f32 * NET_PAS, page::droite(l) - page::gauche() + 16.0, NET_PAS - 4.0)
+}
+
+/// Page NETTOYAGE : case à cocher de la ligne dessinée au rang `rang` de la plage (DIP)
+fn net_rect_case(rang: usize) -> D2D_RECT_F {
+    rect(page::gauche() + 2.0, net_liste_y() + rang as f32 * NET_PAS + 8.0, 18.0, 18.0)
+}
+
+/// Page NETTOYAGE : zone qui coche au clic (la case et sa marge : plus facile à viser que 18 DIP)
+pub fn net_zone_case(rang: usize) -> D2D_RECT_F {
+    let c = net_rect_case(rang);
+    rect(c.left - 10.0, c.top - 8.0, 18.0 + 10.0 + 12.0, NET_PAS - 4.0)
+}
+
+/// Page NETTOYAGE : un bouton du bas de page (`espace::NET_SUPPRIMER` sur la liste ; `NET_CONFIRMER` et `NET_ANNULER` sur la confirmation)
+pub fn net_bouton(l: f32, h: f32, k: usize) -> D2D_RECT_F {
+    let (droite, y) = (page::droite(l), h - statut_h() - 38.0);
+    match k {
+        espace::NET_ANNULER => rect(droite - 110.0, y, 110.0, 30.0),
+        espace::NET_CONFIRMER => rect(droite - 110.0 - 12.0 - 150.0, y, 150.0, 30.0),
+        _ => rect(droite - 190.0, y, 190.0, 30.0),
+    }
+}
+
+/// Pastilles du fil d'Ariane de la carte et leur place (DIP) : la même disposition pour le dessin et pour la souris, sans
+/// mesurer de texte (`espace::largeur_miette`). Elles tiennent dans les deux tiers de la largeur ; le reste montre le choix.
+pub fn espace_miettes(e: &espace::Etat, l: f32) -> Vec<(D2D_RECT_F, espace::Miette)> {
+    let place = (page::droite(l) - page::gauche()) * 0.66 - 90.0;
+    let mut x = page::gauche();
+    e.miettes(place)
+        .into_iter()
+        .map(|m| {
+            let w = espace::largeur_miette(&m.libelle);
+            let r = rect(x, ESPACE_LISTE_Y, w, ESPACE_MIETTE_H);
+            x += w + espace::MIETTE_ECART;
+            (r, m)
+        })
+        .collect()
+}
+
+/// Couleur d'un genre d'élément sur la carte, avec l'opacité `a` : des teintes sourdes, qui laissent le blanc du texte lisible
+fn couleur_genre(g: espace::analyse::Genre, a: f32) -> D2D1_COLOR_F {
+    use espace::analyse::Genre;
+    let (r, v, b) = match g {
+        Genre::Dossier => (150, 165, 195),
+        Genre::Image => (80, 200, 170),
+        Genre::Video => (175, 125, 235),
+        Genre::Audio => (235, 120, 175),
+        Genre::Document => (100, 160, 240),
+        Genre::Archive => (230, 190, 90),
+        Genre::Code => (120, 210, 110),
+        Genre::Programme => (235, 125, 95),
+        Genre::Autre => (165, 165, 165),
+    };
+    rgba(r, v, b, a)
+}
+
 
 /// Carte du disque (O6) et Corbeille (O7) : blocs posés sous les disques de Ce PC
 const CARTE_BLOC_L: f32 = 360.0;
 const CARTE_BLOC_H: f32 = 176.0;
+
+/// Matrice de 10 × 10 points de la Corbeille (et des cartes de disque) : origine du premier centre dans le bloc, pas et rayon
+/// du plus gros point. La carte de la Corbeille se calcule à partir d'eux (lot 3 de l'audit UX), jamais l'inverse.
+const MATRICE_DX: f32 = 6.0;
+const MATRICE_DY: f32 = 32.0;
+const MATRICE_PAS: f32 = 12.0;
+const MATRICE_RAYON_POINT: f32 = 4.2;
+/// Marge égale des quatre côtés entre le contenu de la carte Corbeille et son bord (multiple de 4 : lot 1)
+const CORBEILLE_MARGE: f32 = 8.0;
+/// Écart entre la matrice et la colonne de texte de la Corbeille
+const CORBEILLE_ECART_TEXTE: f32 = 24.0;
+/// Hauteur d'une ligne de texte de la Corbeille et du titre
+const CORBEILLE_LIGNE_H: f32 = 18.0;
+/// Le haut visible des lettres du titre est sous le haut de son rectangle de 18 (mesuré sur capture : ~4 DIP) ; la marge du haut se
+/// prend sur les lettres, pas sur le rectangle, sinon elle paraît plus grande que les trois autres
+const CORBEILLE_TITRE_DECALAGE: f32 = 4.0;
+const CORBEILLE_PAS_LIGNES: f32 = 16.0;
+
+/// Où la Corbeille dessine son contenu dans le bloc `(bx, by)`, et la carte (zone de survol, de clic et de reflet) qui l'entoure
+#[derive(Clone, Copy, Debug)]
+struct GeometrieCorbeille {
+    /// Carte : le contenu plus `CORBEILLE_MARGE` des quatre côtés
+    carte: D2D_RECT_F,
+    /// Colonne de texte : bord gauche et largeur (celle du plus long texte, jamais plus que la place du bloc)
+    texte_x: f32,
+    texte_l: f32,
+}
+
+/// `largeur_texte` : largeur du plus long des textes de la colonne (DIP). Fonction pure : le test de contenu l'appelle sans fenêtre.
+fn geometrie_corbeille(bx: f32, by: f32, largeur_texte: f32) -> GeometrieCorbeille {
+    let (gx, gy) = (bx + MATRICE_DX, by + MATRICE_DY);
+    let matrice_g = gx - MATRICE_RAYON_POINT;
+    let matrice_d = gx + 9.0 * MATRICE_PAS + MATRICE_RAYON_POINT;
+    let bas = gy + 9.0 * MATRICE_PAS + MATRICE_RAYON_POINT;
+    let texte_x = matrice_d + CORBEILLE_ECART_TEXTE;
+    // La carte reste dans son bloc : à droite, la marge ne passe pas dans le bloc voisin
+    let place = (bx + CARTE_BLOC_L - CORBEILLE_MARGE - texte_x).max(0.0);
+    let texte_l = largeur_texte.ceil().clamp(0.0, place);
+    let gauche = bx.min(matrice_g);
+    let droite = matrice_d.max(texte_x + texte_l);
+    GeometrieCorbeille {
+        carte: D2D_RECT_F { left: gauche - CORBEILLE_MARGE, top: by + CORBEILLE_TITRE_DECALAGE - CORBEILLE_MARGE, right: droite + CORBEILLE_MARGE, bottom: bas + CORBEILLE_MARGE },
+        texte_x,
+        texte_l,
+    }
+}
+
+/// Bord droit de la légende d'une carte de disque, mesuré depuis le coin du bloc. La carte de la Corbeille (bloc suivant) déborde de
+/// `CORBEILLE_MARGE` vers la gauche : sans cet écart, les tailles (« 5,3 GO ») touchaient son bord (2 DIP, vu sur capture le 16/11).
+/// 336 = bloc − 3 marges : il reste 16 DIP entre la dernière lettre et la carte voisine.
+const LEGENDE_BORD_DROIT: f32 = CARTE_BLOC_L - 3.0 * CORBEILLE_MARGE;
+
+/// Largeur du rectangle de texte d'une ligne de légende, dont le texte part de `lx_rel + 16` (décalage de la pastille)
+fn place_legende(lx_rel: f32) -> f32 {
+    (LEGENDE_BORD_DROIT - lx_rel - 16.0).max(0.0)
+}
+
+/// Textes de la colonne de droite de la Corbeille (le vide est omis)
+fn lignes_corbeille(e: &crate::corbeille::Etat) -> Vec<String> {
+    [
+        if e.elements == 0 { "VIDE".to_string() } else { format!("{} · {} ELEMENT{}", systeme::taille(e.octets), e.elements, if e.elements > 1 { "S" } else { "" }) },
+        if e.capacite > 0 { format!("RESERVE {}", systeme::taille(e.capacite)) } else { String::new() },
+        "CLIC : OUVRIR".to_string(),
+        "PALETTE : VIDER".to_string(),
+    ]
+    .into_iter()
+    .filter(|t| !t.is_empty())
+    .collect()
+}
 
 /// Coin haut gauche du bloc `k` (disques, puis la Corbeille), `y0` : sous la dernière ligne
 fn bloc_carte(l: f32, y0: f32, k: usize) -> (f32, f32) {
@@ -245,6 +499,13 @@ fn stockages_ce_pc(app: &App, l: f32, y0: f32) -> StockagesCePc {
         y += 10.0;
     }
     lignes.push((rect(x, y, w, STOCK_LIGNE_H - 2.0), Cible::AjouterStockage));
+    y += STOCK_LIGNE_H;
+    lignes.push((rect(x, y, w, STOCK_LIGNE_H - 2.0), Cible::OuvrirEspace));
+    // Carte « récupérable » (E9) : seulement quand une analyse existe, sinon elle ne dirait rien
+    if crate::espace::instantane::resume().is_some() {
+        y += STOCK_LIGNE_H;
+        lignes.push((rect(x, y, w, STOCK_LIGNE_H - 2.0), Cible::OuvrirNettoyage));
+    }
     StockagesCePc { titres, lignes, bas: y + STOCK_LIGNE_H }
 }
 
@@ -402,6 +663,8 @@ enum Pose {
 
 struct Formats {
     code: IDWriteTextFormat,
+    /// Grille du terminal (T2b) : JetBrains Mono 13, sans retour à la ligne ni points de suspension
+    terminal: IDWriteTextFormat,
     titre: IDWriteTextFormat,
     /// Marque « SPACEFILES » de la barre de titre : garde 18 DIP quelle que soit « Taille du texte » (la barre fait 52 DIP et les onglets commencent à 190)
     marque: IDWriteTextFormat,
@@ -417,8 +680,11 @@ struct Formats {
     liste_droite: IDWriteTextFormat,
     /// Texte courant du volet et des pastilles : Segoe 13,5
     volet: IDWriteTextFormat,
-    /// Noms des lieux, groupes, disques et épingles du volet (`.it .d` de la maquette) : Doto 14 gras, espacement 1 px (voir `texte_espace`)
+    /// Repères de structure (lot 7, D-3) : titres des sections du volet, en-têtes de colonnes, libellés de l'aperçu, « CE PC ». Doto 14 gras,
+    /// capitales, espacement 1 px (voir `texte_espace`) ; 14 est le plancher de lisibilité de Doto. Le contenu (noms) reste en Segoe.
     volet_nom: IDWriteTextFormat,
+    /// Même repère aligné à droite (en-tête de la colonne TAILLE)
+    repere_droite: IDWriteTextFormat,
     /// Valeurs et étiquettes du volet (Doto, comme `petit` mais plus grand)
     valeur: IDWriteTextFormat,
     /// Texte courant à petite taille : détails, chemins, noms d'onglets (mono)
@@ -516,51 +782,170 @@ unsafe fn creer_icone(rt: &ID2D1HwndRenderTarget, icone: Icone, blanche: bool) -
 /// Sections du volet, dans l'ordre (les bits des réglages volet_replie / volet_masque suivent ce rang)
 pub const SECTIONS_VOLET: [&str; 6] = ["FAVORIS", "ÉPINGLES", "GROUPES", "CLOUD", "SERVEURS", "DISQUES"];
 
-/// Volet : titres (texte, y, repliée ?, nombre d'éléments) et zones cliquables
-pub fn disposition_volet(app: &App) -> (Vec<(&'static str, f32, bool, usize)>, Vec<(Cible, D2D_RECT_F)>) {
-    let (mut titres, mut v) = (Vec::new(), Vec::new());
+/// Un titre de section du volet : texte, y, repliée ?, nombre d'éléments, et bande verticale où il est visible
+pub type TitreVolet = (&'static str, f32, bool, usize, (f32, f32));
+
+/// Disposition du volet : trois zones. En haut, fixes : Ce PC et Espace disque. En bas, fixe : la section DISQUES entière (titre et
+/// toutes les cartes), collée au bas du volet dès que le reste ne tient plus au-dessus. Au milieu, FAVORIS, ÉPINGLES, GROUPES,
+/// CLOUD, SERVEURS (et l'arbre) : elles se replient seules, les moins utiles d'abord, jusqu'à tenir ; si cela ne suffit pas, le
+/// milieu défile (molette) sous le haut et au-dessus des disques.
+pub struct DispoVolet {
+    pub titres: Vec<TitreVolet>,
+    pub zones: Vec<(Cible, D2D_RECT_F)>,
+    /// Bande verticale visible de chaque zone (même rang que `zones`) : le milieu est rogné par le haut et par les disques,
+    /// une section qui glisse l'est par le bas de son contenu
+    pub limites: Vec<(f32, f32)>,
+    /// Trait fin entre le milieu et les disques, seulement quand le milieu défile
+    pub separateur: Option<f32>,
+    /// Bande de la partie défilante du volet
+    pub region: (f32, f32),
+    /// Plus grand défilement du milieu, en DIP (0 : tout tient)
+    pub defilement_max: f32,
+    /// Ouverture visée de chaque section (0 repliée, 1 ouverte), dans l'ordre de `SECTIONS_VOLET` puis l'arbre
+    pub ouverture_cible: [f32; 7],
+}
+
+/// Ordre dans lequel la fenêtre replie les sections quand elles ne tiennent pas : SERVEURS et CLOUD d'abord, puis GROUPES, ÉPINGLES
+/// et FAVORIS en dernier (rangs de `SECTIONS_VOLET`)
+const ORDRE_REPLI_AUTO: [usize; 5] = [4, 3, 2, 1, 0];
+
+/// Calcule la disposition du volet (voir `DispoVolet`). Les réglages de l'auteur (`volet_replie`, `volet_masque`) ne sont jamais
+/// modifiés : le repli automatique n'est qu'un état de la fenêtre ; agrandie, tout revient comme il l'avait laissé.
+pub fn dispo_volet(app: &App) -> DispoVolet {
+    use std::sync::atomic::Ordering::Relaxed;
+    let mut d = DispoVolet { titres: Vec::new(), zones: Vec::new(), limites: Vec::new(), separateur: None, region: (0.0, 0.0), defilement_max: 0.0, ouverture_cible: [1.0; 7] };
     // Mode Essentiel : le volet est replié, il n'a ni titre ni zone
     if largeur_volet() == 0.0 {
-        return (titres, v);
+        return d;
     }
-    // Le défilement du volet n'existe que pour l'arbre : sans lui, le volet reste en place
-    let mut y = VOLET_Y - if crate::reglages::ARBRE.load(std::sync::atomic::Ordering::Relaxed) { app.volet_defilement } else { 0.0 };
-    let replie = crate::reglages::VOLET_REPLIE.load(std::sync::atomic::Ordering::Relaxed);
-    let masque = crate::reglages::VOLET_MASQUE.load(std::sync::atomic::Ordering::Relaxed);
-    let arbre_n = if crate::reglages::ARBRE.load(std::sync::atomic::Ordering::Relaxed) { app.lignes_arbre().len() } else { 0 };
+    let arbre = crate::reglages::ARBRE.load(Relaxed);
+    let replie_auteur = crate::reglages::VOLET_REPLIE.load(Relaxed);
+    let masque = crate::reglages::VOLET_MASQUE.load(Relaxed);
+    let essentiel = crate::app::ESSENTIEL.load(Relaxed);
+    let arbre_n = if arbre { app.lignes_arbre().len() } else { 0 };
     let (x, w) = (VOLET_PAD, largeur_volet() - 2.0 * VOLET_PAD);
-    // Entrée fixe de la maquette : Ce PC, avant les sections
-    v.push((Cible::CePc, rect(x, y, w, volet_ligne() - 2.0)));
-    y += volet_ligne() + 8.0;
+    let haut_fenetre = HAUTEUR_TITRE + 1.0;
+    let bas_volet = app.volet_bas;
+    let ligne = volet_ligne();
+    // Rang, titre, nombre d'éléments, fabrique de cible, pas : l'ordre est celui de `SECTIONS_VOLET`, puis l'arbre (rang 6)
     let sections: [(&'static str, usize, fn(usize) -> Cible, f32); 7] = [
-        ("FAVORIS", app.favoris.len(), Cible::Favori, volet_ligne()),
-        ("ÉPINGLES", app.epingles.len(), Cible::Epingle, volet_ligne()),
-        ("GROUPES", app.groupes.len(), Cible::Groupe, volet_ligne()),
-        ("CLOUD", app.nuages.len(), Cible::Nuage, volet_ligne()),
-        ("SERVEURS", app.serveurs.len(), Cible::Serveur, volet_ligne()),
+        ("FAVORIS", app.favoris.len(), Cible::Favori, ligne),
+        ("ÉPINGLES", app.epingles.len(), Cible::Epingle, ligne),
+        ("GROUPES", app.groupes.len(), Cible::Groupe, ligne),
+        ("CLOUD", app.nuages.len(), Cible::Nuage, ligne),
+        ("SERVEURS", app.serveurs.len(), Cible::Serveur, ligne),
         ("DISQUES", app.disques.len(), Cible::Disque, volet_disque()),
-        ("ARBORESCENCE", arbre_n, Cible::Arbre, volet_ligne()),
+        ("ARBORESCENCE", arbre_n, Cible::Arbre, ligne),
     ];
-    let essentiel = crate::app::ESSENTIEL.load(std::sync::atomic::Ordering::Relaxed);
-    for (k, (titre, n, cible, pas)) in sections.into_iter().enumerate() {
-        if (n == 0 && titre != "FAVORIS" && titre != "DISQUES") || masque & (1 << k) != 0 || (essentiel && titre != "ÉPINGLES") {
-            continue;
+    let visible = |k: usize| {
+        let (titre, n, _, _) = sections[k];
+        !((n == 0 && titre != "FAVORIS" && titre != "DISQUES") || masque & (1 << k) != 0 || (essentiel && titre != "ÉPINGLES"))
+    };
+    const RANG_DISQUES: usize = 5;
+    // Haut fixe : Ce PC, puis l'entrée qui ouvre la page ESPACE (pour qu'un nouvel utilisateur la trouve)
+    let plein = (haut_fenetre, bas_volet);
+    let mut y = VOLET_Y;
+    d.zones.push((Cible::CePc, rect(x, y, w, ligne - 2.0)));
+    d.limites.push(plein);
+    y += ligne;
+    d.zones.push((Cible::EspaceVolet, rect(x, y, w, ligne - 2.0)));
+    d.limites.push(plein);
+    y += ligne + 8.0;
+    let haut_milieu = y;
+
+    // Rang des sections du milieu, dans l'ordre d'affichage (l'arbre est le dernier)
+    let milieu: Vec<usize> = [0usize, 1, 2, 3, 4, 6].into_iter().filter(|&k| visible(k)).collect();
+    let disques_visibles = visible(RANG_DISQUES);
+    let hauteur_disques_pleine = if disques_visibles {
+        VOLET_ENTETE + if replie_auteur & (1 << RANG_DISQUES) != 0 { 0.0 } else { sections[RANG_DISQUES].1 as f32 * sections[RANG_DISQUES].3 }
+    } else {
+        0.0
+    };
+    let hauteur_section = |k: usize, ouverture: f32| VOLET_ENTETE + ouverture * sections[k].1 as f32 * sections[k].3 + VOLET_ESPACE;
+
+    // Repli automatique, sur l'état visé (jamais sur l'état qui glisse : pas d'aller-retour). Seulement hors arbre : l'arbre est
+    // fait pour défiler. Une section que l'auteur a repliée, vide, ou rouverte à la main (`volet_force`) est laissée.
+    let mut replie = replie_auteur;
+    if !arbre && bas_volet.is_finite() {
+        let place = bas_volet - hauteur_disques_pleine - haut_milieu;
+        let besoin = |rep: u32| -> f32 { milieu.iter().map(|&k| hauteur_section(k, if rep & (1 << k) != 0 { 0.0 } else { 1.0 })).sum() };
+        for k in ORDRE_REPLI_AUTO {
+            if besoin(replie) <= place {
+                break;
+            }
+            if visible(k) && sections[k].1 > 0 && replie & (1 << k) == 0 && app.volet_force & (1 << k) == 0 {
+                replie |= 1 << k;
+            }
         }
-        let repliee = replie & (1 << k) != 0;
-        titres.push((titre, y, repliee, n));
-        v.push((Cible::TitreVolet(k as u8), rect(x, y, w, VOLET_ENTETE)));
-        y += VOLET_ENTETE;
-        if repliee {
-            y += VOLET_ESPACE;
-            continue;
-        }
-        for i in 0..n {
-            let marge = if pas == volet_disque() { 4.0 } else { 2.0 };
-            v.push((cible(i), rect(x, y + i as f32 * pas, w, pas - marge)));
-        }
-        y += n as f32 * pas + VOLET_ESPACE;
     }
-    (titres, v)
+    for k in 0..7 {
+        d.ouverture_cible[k] = if replie & (1 << k) != 0 { 0.0 } else { 1.0 };
+    }
+    // Ouverture affichée : celle qui glisse, ou l'état visé avant le premier dessin
+    let visee = d.ouverture_cible;
+    let ouverture = |k: usize| {
+        let v = app.volet_ouv[k];
+        if v.is_nan() { visee[k] } else { v.clamp(0.0, 1.0) }
+    };
+
+    // Placement : le milieu coule depuis le haut ; les disques le suivent, sans jamais passer sous le bas du volet
+    let hauteur_milieu: f32 = milieu.iter().map(|&k| hauteur_section(k, ouverture(k))).sum();
+    let hauteur_disques = if disques_visibles { VOLET_ENTETE + ouverture(RANG_DISQUES) * sections[RANG_DISQUES].1 as f32 * sections[RANG_DISQUES].3 } else { 0.0 };
+    let y_disques = (haut_milieu + hauteur_milieu).min(bas_volet - hauteur_disques);
+    let bas_milieu = (if disques_visibles { y_disques } else { bas_volet.min(haut_milieu + hauteur_milieu) }).max(haut_milieu);
+    d.region = (haut_milieu, bas_milieu);
+    d.defilement_max = (hauteur_milieu - (bas_milieu - haut_milieu)).max(0.0);
+    if d.defilement_max > 0.5 && disques_visibles {
+        d.separateur = Some(bas_milieu - VOLET_ESPACE / 2.0);
+    }
+    let defilement = app.volet_defilement.clamp(0.0, d.defilement_max);
+
+    // Pose une section : titre, zone du titre, puis ses lignes rognées à son contenu visible et à la bande `bande`
+    let poser = |d: &mut DispoVolet, k: usize, y: f32, bande: (f32, f32)| -> f32 {
+        let (titre, n, cible, pas) = sections[k];
+        d.titres.push((titre, y, replie & (1 << k) != 0, n, bande));
+        d.zones.push((Cible::TitreVolet(k as u8), rect(x, y, w, VOLET_ENTETE)));
+        d.limites.push(bande);
+        let haut_contenu = y + VOLET_ENTETE;
+        let hauteur_contenu = ouverture(k) * n as f32 * pas;
+        if hauteur_contenu > 0.5 {
+            let vue = (haut_contenu.max(bande.0), (haut_contenu + hauteur_contenu).min(bande.1));
+            let marge = if pas == volet_disque() { 4.0 } else { 2.0 };
+            for i in 0..n {
+                d.zones.push((cible(i), rect(x, haut_contenu + i as f32 * pas, w, pas - marge)));
+                d.limites.push(vue);
+            }
+        }
+        haut_contenu + hauteur_contenu + VOLET_ESPACE
+    };
+    let region = d.region;
+    let mut y = haut_milieu - defilement;
+    for &k in &milieu {
+        y = poser(&mut d, k, y, region);
+    }
+    if disques_visibles {
+        poser(&mut d, RANG_DISQUES, y_disques, (y_disques.max(haut_fenetre), bas_volet));
+    }
+    d
+}
+
+/// Zones du volet pour le clic et le survol : chacune rognée à sa bande visible (une ligne sortie sous le haut ou sous les disques
+/// ne se clique pas)
+pub fn zones_volet(app: &App) -> Vec<(Cible, D2D_RECT_F)> {
+    let d = dispo_volet(app);
+    d.zones
+        .into_iter()
+        .zip(d.limites)
+        .filter_map(|((q, r), (haut, bas))| {
+            let r = D2D_RECT_F { top: r.top.max(haut), bottom: r.bottom.min(bas), ..r };
+            (r.bottom - r.top > 1.0).then_some((q, r))
+        })
+        .collect()
+}
+
+/// Le milieu du volet déborde-t-il (la molette y défile) ?
+pub fn volet_defilable(app: &App) -> bool {
+    dispo_volet(app).defilement_max > 0.5
 }
 
 /// Nom affiché d'un élément : sans l'extension quand le réglage les cache (dossiers, archives
@@ -611,15 +996,13 @@ fn placer_jours(app: &App, l: f32, h: f32) -> Vec<(D2D_RECT_F, u32, usize)> {
         .collect()
 }
 
-pub fn zones_volet(app: &App) -> Vec<(Cible, D2D_RECT_F)> {
-    disposition_volet(app).1
-}
-
 pub struct Rendu {
     d2d: ID2D1Factory,
     dwrite: IDWriteFactory,
     f: Formats,
     cible: Option<Cible2D>,
+    /// Largeur et hauteur d'une cellule du terminal en DIP, mesurées une fois avec la police réelle
+    cellule_terminal: (f32, f32),
     /// Vignettes reçues, pas encore converties (None : le fichier n'en a pas)
     images: RefCell<HashMap<String, Option<Image>>>,
     /// Vignettes demandées (pour ne pas les redemander)
@@ -637,6 +1020,9 @@ pub struct Rendu {
     pub zones_etiquettes: RefCell<Vec<(D2D_RECT_F, u8)>>,
     /// Élément éclairable au dernier dessin, pointeur dedans ou non : invalidé aussi par la souris (voir `dessiner_reflet`)
     pub zone_candidate: Cell<Option<D2D_RECT_F>>,
+    /// Reflets de l'image (plan, rognage, opacité, déjà peint) : calculés au début de l'image, peints par l'élément éclairé entre son
+    /// fond et son texte (`reflet_sous`), le reste en dernière passe par-dessus (`dessiner_reflet`)
+    reflets_attente: RefCell<Vec<ReflexAttente>>,
     /// Style de trait à bouts ronds
     trait_rond: ID2D1StrokeStyle,
     /// Glissements en cours (pastille de sélection, indicateur de vue, liseré d'onglet), lus et mis à jour au dessin
@@ -835,8 +1221,11 @@ impl Rendu {
                 &HSTRING::from("fr-fr"),
             )?;
             code.SetWordWrapping(DWRITE_WORD_WRAPPING_NO_WRAP)?;
+            let terminal = grille_terminal::format_terminal(&dw)?;
+            let cellule_terminal = grille_terminal::mesurer_cellule(&dw, &terminal);
             let f = Formats {
                 code,
+                terminal,
                 titre: format_texte(&dw, 18.0, DWRITE_FONT_WEIGHT_BOLD, g)?,
                 marque: format_texte(&dw, 18.0 / crate::reglages::echelle_texte(), DWRITE_FONT_WEIGHT_BOLD, g)?,
                 apercu_nom: format_sans(&dw, 18.0, DWRITE_FONT_WEIGHT_MEDIUM, g)?,
@@ -851,6 +1240,7 @@ impl Rendu {
                 liste_droite: format_sans(&dw, 13.0, DWRITE_FONT_WEIGHT_NORMAL, d)?,
                 volet: format_sans(&dw, 13.5, DWRITE_FONT_WEIGHT_NORMAL, g)?,
                 volet_nom: format_texte(&dw, 14.0, DWRITE_FONT_WEIGHT_BOLD, g)?,
+                repere_droite: format_texte(&dw, 14.0, DWRITE_FONT_WEIGHT_BOLD, d)?,
                 valeur: format_sans(&dw, 13.0, DWRITE_FONT_WEIGHT_NORMAL, g)?,
                 petit_mono: format_mono(&dw, 12.0, g)?,
                 volet_droite: format_sans(&dw, 12.0, DWRITE_FONT_WEIGHT_NORMAL, d)?,
@@ -882,6 +1272,7 @@ impl Rendu {
                 dwrite: dw,
                 f,
                 cible: None,
+                cellule_terminal,
                 images: RefCell::new(HashMap::new()),
                 demandees: RefCell::new(HashSet::new()),
                 a_demander: RefCell::new(Vec::new()),
@@ -890,6 +1281,7 @@ impl Rendu {
                 zone_reflet: Cell::new(None),
                 zones_etiquettes: RefCell::new(Vec::new()),
                 zone_candidate: Cell::new(None),
+                reflets_attente: RefCell::new(Vec::new()),
                 trait_rond,
                 mouvements: RefCell::new(Mouvements::nouveau()),
                 t_image: Cell::new(0),
@@ -1103,6 +1495,26 @@ impl Rendu {
         }
     }
 
+    /// `texte` tel quel s'il tient dans `largeur`, sinon sa fin précédée de « … » (recherche par dichotomie : peu de mesures par image)
+    fn raccourcir_a_gauche(&self, texte: &str, format: &IDWriteTextFormat, largeur: f32) -> String {
+        if self.mesurer(texte, format) <= largeur {
+            return texte.to_string();
+        }
+        let car: Vec<char> = texte.chars().collect();
+        // Plus petit nombre de caractères coupés au début pour que « … » + le reste tienne
+        let (mut bas, mut haut) = (1usize, car.len());
+        while bas < haut {
+            let milieu = (bas + haut) / 2;
+            let essai: String = std::iter::once('…').chain(car[milieu..].iter().copied()).collect();
+            if self.mesurer(&essai, format) <= largeur {
+                haut = milieu;
+            } else {
+                bas = milieu + 1;
+            }
+        }
+        std::iter::once('…').chain(car[bas.min(car.len())..].iter().copied()).collect()
+    }
+
     fn mesurer(&self, texte: &str, format: &IDWriteTextFormat) -> f32 {
         let w: Vec<u16> = texte.encode_utf16().collect();
         unsafe {
@@ -1142,6 +1554,14 @@ impl Rendu {
         let lp = largeur_panneau(ll, autre.is_some());
         for (rang, a) in std::iter::once(&mut *app).chain(autre.as_deref_mut()).enumerate() {
             a.hauteur_liste = (h - liste_y() - statut_h() - if a.avec_chronologie() { CHRONO_H } else { 0.0 }).max(0.0);
+            a.volet_bas = h - RETRAIT_BAS_VOLET;
+            // Volet : l'ouverture de chaque section glisse vers l'état visé (le repli automatique est calculé sur la cible, jamais
+            // sur l'état qui glisse) ; le défilement du milieu reste dans ce qui déborde encore
+            let dv = dispo_volet(a);
+            if rang == 0 {
+                a.volet_ouv = self.mouvements.borrow_mut().sections_volet(dv.ouverture_cible, mouvement::maintenant_ms(), crate::reglages::animations_actives());
+            }
+            a.volet_defilement = a.volet_defilement.clamp(0.0, dv.defilement_max);
             a.zones.jours = if a.avec_chronologie() { placer_jours(a, lp, h) } else { Vec::new() };
             // Lot 14 : le champ de filtre s'ouvre (largeur 450 ms au ressort, opacité 200 ms) ; sa part est posée avant la mesure du chemin
             let pilule = self.mouvements.borrow_mut().pilule(rang, a.champ_filtre_visible(), mouvement::maintenant_ms(), crate::reglages::animations_actives());
@@ -1167,7 +1587,7 @@ impl Rendu {
             if a.emplacement == Emplacement::CePC {
                 crate::index::preparer_carte(hwnd);
                 let (bx, by) = bloc_carte(lp, haut_carte(a), disques_carte(a).count());
-                a.zones.corbeille = crate::corbeille::etat().map(|_| rect(bx - 6.0, by - 4.0, CARTE_BLOC_L - 20.0, CARTE_BLOC_H - 30.0));
+                a.zones.corbeille = crate::corbeille::etat().map(|e| self.geometrie_corbeille(bx, by, &e).carte);
                 let (y0, st) = (haut_carte(a), stockages_ce_pc(a, lp, haut_carte(a)));
                 // 26 : l'écart entre la dernière ligne et le haut des cartes (`haut_carte`)
                 a.pied_ce_pc = 26.0 + st.bas - y0;
@@ -1534,14 +1954,23 @@ impl Rendu {
         c.rt.PopAxisAlignedClip();
     }
 
-    /// Dessine un motif de points centré en (cx, cy), avec un pas donné
-    /// Ligne de l'arbre du volet : chevron en points, icône, nom ; le curseur du clavier est cerclé de rouge
-    unsafe fn ligne_arbre(&self, c: &Cible2D, app: &App, l: &crate::arbre::Ligne, r: D2D_RECT_F, survole: bool, fondu: f32, depose: bool) {
+    /// Barre orange de la ligne active du volet (lot 5, D-2) : la même que le rail des Réglages (3 × 16, coins de 1,5), calée à gauche
+    /// et centrée sur la ligne ; elle remplace le contour orange, qui faisait de chaque ligne active une carte.
+    /// Invariant `unsafe` : appelée sur le fil d'interface, entre `BeginDraw` et `EndDraw`, avec une cible `c` valide.
+    unsafe fn barre_active_volet(&self, c: &Cible2D, r: D2D_RECT_F) {
+        self.couleur(c, &ACCENT);
+        let centre = (r.top + r.bottom) / 2.0;
+        c.rt.FillRoundedRectangle(&D2D1_ROUNDED_RECT { rect: rect(r.left + 6.0, centre - 8.0, 3.0, 16.0), radiusX: 1.5, radiusY: 1.5 }, &c.pinceau);
+    }
+
+    /// Ligne de l'arbre du volet : chevron en points, icône, nom ; le curseur du clavier est cerclé de rouge.
+    /// Invariant `unsafe` : appelée sur le fil d'interface, entre `BeginDraw` et `EndDraw`, avec une cible `c` valide.
+    unsafe fn ligne_arbre(&self, c: &Cible2D, app: &App, l: &crate::arbre::Ligne, r: D2D_RECT_F, quoi: Cible, survole: bool, fondu: f32, depose: bool) {
         let courant = app.dossier().map(crate::arbre::cle).unwrap_or_default();
         let cl = crate::arbre::cle(&l.chemin);
         let actif = cl == courant;
         let curseur = app.arbre_focus && app.arbre_curseur.as_deref().unwrap_or(&courant) == cl;
-        let forme = D2D1_ROUNDED_RECT { rect: r, radiusX: 7.0, radiusY: 7.0 };
+        let forme = D2D1_ROUNDED_RECT { rect: r, radiusX: RAYON_PETIT, radiusY: RAYON_PETIT };
         if actif || fondu > 0.0 {
             if actif { self.couleur(c, &SURVOL_FORT) } else { self.couleur_k(c, &SURVOL, fondu) }
             c.rt.FillRoundedRectangle(&forme, &c.pinceau);
@@ -1553,6 +1982,7 @@ impl Rendu {
             self.couleur(c, &ACCENT);
             c.rt.DrawRoundedRectangle(&forme, &c.pinceau, 1.5, None);
         }
+        self.reflet_sous(c, quoi);
         let x = r.left + l.profondeur as f32 * crate::arbre::RETRAIT;
         let y = (r.top + r.bottom) / 2.0;
         if l.enfants != Some(false) {
@@ -1629,7 +2059,7 @@ impl Rendu {
     unsafe fn champ(&self, c: &Cible2D, ed: &crate::edition::Edition, zone: D2D_RECT_F) {
         let rt = &c.rt;
         let cadre = D2D_RECT_F { left: zone.left - 6.0, top: zone.top + 3.0, right: zone.right, bottom: zone.bottom - 3.0 };
-        let arrondi = D2D1_ROUNDED_RECT { rect: cadre, radiusX: 5.0, radiusY: 5.0 };
+        let arrondi = D2D1_ROUNDED_RECT { rect: cadre, radiusX: RAYON_PETIT, radiusY: RAYON_PETIT };
         self.couleur(c, &CHAMP_FOND);
         rt.FillRoundedRectangle(&arrondi, &c.pinceau);
         self.couleur(c, &BLANC);
@@ -1875,7 +2305,8 @@ impl Rendu {
                 let z = decaler(*z, decalage_chrome(app, vue, Cible::Onglet(vue.actif)));
                 let r = D2D_RECT_F { left: gauche, right: droite, ..z };
                 self.couleur_ou(c, &SELECTION, &SELECTION_CLAIR);
-                rt.FillRoundedRectangle(&D2D1_ROUNDED_RECT { rect: r, radiusX: 12.0, radiusY: 12.0 }, &c.pinceau);
+                let rayon = rayon_cible(Cible::Onglet(vue.actif)).unwrap_or(RAYON_MOYEN);
+                rt.FillRoundedRectangle(&D2D1_ROUNDED_RECT { rect: r, radiusX: rayon, radiusY: rayon }, &c.pinceau);
                 // Liseré supérieur de base, pas de contour complet autour de l'onglet actif
                 self.couleur(c, &BLANC_TRES_FAIBLE);
                 rt.FillRectangle(&rect(r.left + 8.0, r.top, r.right - r.left - 16.0, 1.0), &c.pinceau);
@@ -1884,7 +2315,8 @@ impl Rendu {
         for (quoi, r) in zones {
             let r = decaler(r, decalage_chrome(app, vue, quoi));
             let survole = app.survol == quoi;
-            let arrondi = D2D1_ROUNDED_RECT { rect: r, radiusX: 12.0, radiusY: 12.0 };
+            let rayon = rayon_cible(quoi).unwrap_or(RAYON_MOYEN);
+            let arrondi = D2D1_ROUNDED_RECT { rect: r, radiusX: rayon, radiusY: rayon };
             match quoi {
                 Cible::Onglet(k) => {
                     let actif = k == vue.actif;
@@ -1895,6 +2327,7 @@ impl Rendu {
                         self.couleur_k(c, &SURVOL, fondu);
                         rt.FillRoundedRectangle(&arrondi, &c.pinceau);
                     }
+                    self.reflet_sous(c, quoi);
                     self.couleur(c, if actif { &ACCENT } else { &BLANC_TRES_FAIBLE });
                     rt.FillEllipse(&ellipse(r.left + 12.0, (r.top + r.bottom) / 2.0, 2.5), &c.pinceau);
                     let avec_croix = n > 1 && (actif || survole || fermer_survole);
@@ -1916,6 +2349,7 @@ impl Rendu {
                         self.couleur_k(c, &SURVOL, fondu);
                         rt.FillRoundedRectangle(&arrondi, &c.pinceau);
                     }
+                    self.reflet_sous(c, quoi);
                     self.couleur(c, if survole { &BLANC } else { &BLANC_DOUX });
                     self.points(c, (r.left + r.right) / 2.0, (r.top + r.bottom) / 2.0, 3.0, 1.2, &[(0, 0), (-1, 0), (1, 0), (0, -1), (0, 1)]);
                 }
@@ -1935,7 +2369,8 @@ impl Rendu {
         let (gauche, largeur) = (x0 + 22.0, l - x0 - 44.0);
         let haut = HAUTEUR_TITRE + 1.0 + 20.0;
         self.couleur(c, &BLANC_FAIBLE);
-        self.texte(c, &f.petit, "APERÇU", rect(gauche, haut, largeur, 18.0 * crate::theme::elasticite()));
+        // Lot 7 (D-3) : les repères de l'aperçu (titre, libellés TYPE / TAILLE…) sont en Doto ; le nom et les valeurs en Segoe
+        self.texte_espace(c, &f.volet_nom, "APERÇU", rect(gauche, haut, largeur, 20.0 * crate::theme::elasticite()));
         let Some(a) = apercu else {
             self.couleur(c, &BLANC_FAIBLE);
             self.texte(c, &f.petit, "…", rect(gauche, haut + 40.0, largeur, 30.0));
@@ -1971,17 +2406,13 @@ impl Rendu {
             }
         }
         if !dessinee {
-            // Carte de l'aperçu (maquette `.glyph`) : un carré sombre bordé, l'icône en points au centre
-            let carte = D2D1_ROUNDED_RECT { rect: rect(gauche, y, largeur, 150.0), radiusX: 20.0, radiusY: 20.0 };
-            self.couleur_ou(c, &CARTE, &CARTE_CLAIR);
-            rt.FillRoundedRectangle(&carte, &c.pinceau);
-            self.couleur(c, &LIGNE);
-            rt.DrawRoundedRectangle(&carte, &c.pinceau, 1.0, None);
+            // Lot 5 (D-5) : l'icône repose directement sur le panneau, sans carte ni cadre autour (une carte dans un panneau
+            // faisait deux cartes imbriquées). Zone de 112 de haut, l'icône en points centrée ; nom et type remontent d'autant.
             // Icône agrandie : chaque point de la matrice 7×7 devient un gros point
             let motif = a.icone.motif();
             let pas = 13.0;
             let cote = 7.0 * pas;
-            let (ox, oy) = (gauche + (largeur - cote) / 2.0 + pas / 2.0, y + 75.0 - cote / 2.0 + pas / 2.0);
+            let (ox, oy) = (gauche + (largeur - cote) / 2.0 + pas / 2.0, y + 56.0 - cote / 2.0 + pas / 2.0);
             for (j, ligne) in motif.iter().enumerate() {
                 for (i, ch) in ligne.bytes().enumerate() {
                     let col = match ch {
@@ -1994,7 +2425,7 @@ impl Rendu {
                     rt.FillEllipse(&ellipse(ox + i as f32 * pas, oy + j as f32 * pas, r), &c.pinceau);
                 }
             }
-            y += 170.0;
+            y += 132.0;
         }
 
         // Nom (Segoe 18) puis les informations : libellé 12, valeur 14, comme la maquette
@@ -2008,7 +2439,7 @@ impl Rendu {
                 break;
             }
             self.couleur(c, &BLANC_FAIBLE);
-            self.texte(c, &f.petit, libelle, rect(gauche, y, largeur, 18.0 * e));
+            self.texte_espace(c, &f.volet_nom, &libelle.to_uppercase(), rect(gauche, y, largeur, 20.0 * e));
             self.couleur(c, &BLANC);
             // Une valeur trop longue pour une ligne (statut de signature ou de disponibilité, emplacement) passe à la ligne, sur
             // deux lignes au plus, au lieu d'être coupée par « … » : on ne lisait plus le statut
@@ -2030,7 +2461,7 @@ impl Rendu {
             let zone = rect(gauche - 6.0, y + 4.0, largeur + 12.0, (h - y - 24.0).max(0.0));
             if zone.bottom - zone.top > 40.0 {
                 self.couleur(c, &CHAMP_FOND);
-                rt.FillRoundedRectangle(&D2D1_ROUNDED_RECT { rect: zone, radiusX: 6.0, radiusY: 6.0 }, &c.pinceau);
+                rt.FillRoundedRectangle(&D2D1_ROUNDED_RECT { rect: zone, radiusX: RAYON_PETIT, radiusY: RAYON_PETIT }, &c.pinceau);
                 self.couleur(c, &BLANC_DOUX);
                 let interieur = rect(zone.left + 10.0, zone.top + 8.0, zone.right - zone.left - 20.0, zone.bottom - zone.top - 16.0);
                 rt.PushAxisAlignedClip(&interieur, D2D1_ANTIALIAS_MODE_ALIASED);
@@ -2040,26 +2471,127 @@ impl Rendu {
         }
     }
 
-    /// Panneau terminal intégré (196 px) : journal réel des opérations, fermeture, et ouverture du vrai Windows Terminal.
-    unsafe fn dessiner_terminal(&self, c: &Cible2D, app: &App, l: f32, h: f32, lignes: &[crate::journal::Operation], vue: &Vue) {
+    /// Corps de l'onglet JOURNAL (T4c) : les dernières opérations de `operations.csv` (copies, déplacements, corbeille,
+    /// renommages), la plus récente en bas comme dans un terminal ; ce qui ne tient pas dans la hauteur est omis par le haut
+    unsafe fn dessiner_journal_operations(&self, c: &Cible2D, zone: D2D_RECT_F, operations: &[crate::journal::Operation]) {
+        const RANGEE: f32 = 20.0;
+        const COL_HEURE: f32 = 52.0;
+        const COL_ACTION: f32 = 120.0;
+        let larg = zone.right - zone.left;
+        if operations.is_empty() {
+            self.couleur(c, &BLANC_FAIBLE);
+            self.texte(c, &self.f.petit, "AUCUNE OPERATION POUR L'INSTANT · COPIES, DEPLACEMENTS, CORBEILLE ET RENOMMAGES S'AFFICHENT ICI", rect(zone.left, zone.top + 4.0, larg, RANGEE));
+            return;
+        }
+        let places = ((zone.bottom - zone.top) / RANGEE).floor().max(0.0) as usize;
+        let debut = operations.len().saturating_sub(places);
+        for (k, o) in operations[debut..].iter().enumerate() {
+            let y = zone.top + k as f32 * RANGEE;
+            self.couleur(c, &BLANC_FAIBLE);
+            self.texte(c, &self.f.petit_mono, o.heure(), rect(zone.left, y, COL_HEURE, RANGEE));
+            self.couleur(c, &ACCENT);
+            self.texte(c, &self.f.petit, &o.action.to_uppercase(), rect(zone.left + COL_HEURE, y, COL_ACTION - 8.0, RANGEE));
+            self.couleur(c, &BLANC_DOUX);
+            self.texte(c, &self.f.petit_mono, &o.detail, rect(zone.left + COL_HEURE + COL_ACTION, y, (larg - COL_HEURE - COL_ACTION).max(0.0), RANGEE));
+        }
+    }
+
+    /// Panneau terminal intégré : un vrai shell (grille dessinée par `dessiner_grille_terminal`), fermeture, et ouverture du
+    /// vrai Windows Terminal. Onglet JOURNAL (T4c) : le journal des opérations prend la place de la grille.
+    unsafe fn dessiner_terminal(&self, c: &Cible2D, app: &App, l: f32, h: f32, vue: &Vue) {
+        let Some(vt) = vue.terminal.as_ref() else { return };
         let rt = &c.rt;
         let p = zone_terminal_panneau(l, h);
         if p.bottom - p.top < 40.0 || p.right - p.left < 80.0 {
             return;
         }
+        // Fond d'abord opaque (17/11/2026, retour de l'auteur : on voyait la liste à travers le panneau, lignes et journal
+        // superposés) ; PANNEAU, à 2,5 % de blanc, ne cache rien
+        self.couleur(c, &VOILE);
+        rt.FillRectangle(&p, &c.pinceau);
         self.couleur(c, &PANNEAU);
         rt.FillRectangle(&p, &c.pinceau);
         self.couleur(c, &LIGNE);
         rt.DrawRectangle(&p, &c.pinceau, 1.0, None);
 
-        // En-tête : invite `>_`, titre et journal des opérations
+        // En-tête : invite `>_`, titre, puis le titre que le shell a donné à sa fenêtre (ou, à défaut, son dossier)
         self.couleur(c, &ACCENT);
         self.points(c, p.left + 22.0, p.top + 21.0, 3.0, 1.15, &[(0, -2), (1, -1), (2, 0), (1, 1), (0, 2)]);
         rt.FillRectangle(&rect(p.left + 30.0, p.top + 24.0, 10.0, 1.5), &c.pinceau);
-        self.couleur(c, &BLANC);
-        self.texte(c, &self.f.petit, "TERMINAL", rect(p.left + 50.0, p.top + 10.0, 96.0, 24.0));
-        self.couleur(c, &BLANC_FAIBLE);
-        self.texte(c, &self.f.petit, "JOURNAL DES OPERATIONS", rect(p.left + 146.0, p.top + 10.0, p.right - p.left - 200.0, 24.0));
+        // Onglets (T4a) : un par shell, « 2 · projet » ; l'actif est éclairé, le survol s'éclaire en fondu. Le titre que le shell
+        // donne à sa fenêtre n'a plus de ligne à lui : le libellé suit le dossier annoncé par le shell.
+        let n = vt.onglets.len();
+        for (i, dossier) in vt.onglets.iter().enumerate() {
+            let cible = Cible::TerminalOnglet(i);
+            let z = decaler(zone_terminal_onglet(l, h, i, n), decalage_chrome(app, vue, cible));
+            // Le journal affiché prend la place de l'onglet actif : aucun onglet shell n'est éclairé
+            let actif = i == vt.actif && vt.journal.is_none();
+            let rond = D2D1_ROUNDED_RECT { rect: z, radiusX: RAYON_PETIT, radiusY: RAYON_PETIT };
+            if actif {
+                self.couleur(c, &SURVOL);
+                rt.FillRoundedRectangle(&rond, &c.pinceau);
+                self.couleur(c, if vt.focus { &ACCENT } else { &LIGNE });
+                rt.DrawRoundedRectangle(&rond, &c.pinceau, 1.0, None);
+            } else {
+                let fondu = self.survol_k(cible);
+                if fondu > 0.0 {
+                    self.couleur_k(c, &SURVOL, fondu);
+                    rt.FillRoundedRectangle(&rond, &c.pinceau);
+                }
+            }
+            self.reflet_sous(c, Cible::TerminalOnglet(i));
+            self.couleur(c, if actif { &BLANC } else if app.survol == cible { &BLANC_DOUX } else { &BLANC_FAIBLE });
+            let place = terminal_onglet_place_libelle(&z);
+            let max_car = (place / 8.0).floor().max(1.0) as usize;
+            self.texte(c, &self.f.petit, &crate::terminal::onglets::libelle(i, dossier, max_car), rect(z.left + 10.0, z.top, place, z.bottom - z.top));
+            // Croix de fermeture, dans l'onglet : discrète au repos, éclairée au survol
+            let cible_croix = Cible::TerminalOngletFermer(i);
+            let croix = decaler(zone_terminal_onglet_croix(l, h, i, n), decalage_chrome(app, vue, cible_croix));
+            let fondu_croix = self.survol_k(cible_croix);
+            if fondu_croix > 0.0 {
+                self.couleur_k(c, &SURVOL, fondu_croix);
+                rt.FillRoundedRectangle(&D2D1_ROUNDED_RECT { rect: croix, radiusX: RAYON_PETIT, radiusY: RAYON_PETIT }, &c.pinceau);
+            }
+            self.reflet_sous(c, Cible::TerminalOngletFermer(i));
+            self.couleur(c, if app.survol == cible_croix { &BLANC } else if actif { &BLANC_DOUX } else { &BLANC_FAIBLE });
+            self.points(c, (croix.left + croix.right) / 2.0, (croix.top + croix.bottom) / 2.0, 3.0, 0.95, &[(0, 0), (-1, -1), (1, -1), (-1, 1), (1, 1)]);
+        }
+        // « + » : un onglet de plus, tant qu'il en tient un dans l'en-tête
+        if crate::rendu::terminal_peut_ajouter(l, h, n) {
+            let plus = decaler(zone_terminal_plus(l, h, n), decalage_chrome(app, vue, Cible::TerminalNouveau));
+            let fondu = self.survol_k(Cible::TerminalNouveau);
+            if fondu > 0.0 {
+                self.couleur_k(c, &SURVOL, fondu);
+                rt.FillRoundedRectangle(&D2D1_ROUNDED_RECT { rect: plus, radiusX: RAYON_PETIT, radiusY: RAYON_PETIT }, &c.pinceau);
+            }
+            self.reflet_sous(c, Cible::TerminalNouveau);
+            self.couleur(c, if app.survol == Cible::TerminalNouveau { &BLANC } else { &BLANC_DOUX });
+            let (cx, cy) = ((plus.left + plus.right) / 2.0, (plus.top + plus.bottom) / 2.0);
+            self.points(c, cx, cy, 3.4, 1.1, &[(0, 0), (-1, 0), (1, 0), (0, -1), (0, 1)]);
+        }
+        // Onglet JOURNAL (T4c) : à droite de la bande des shells ; éclairé quand le journal est affiché. Absent d'une fenêtre
+        // trop étroite (largeur 0).
+        if terminal_journal_largeur(l, h) > 0.0 {
+            let cible = Cible::TerminalJournal;
+            let z = decaler(zone_terminal_journal(l, h), decalage_chrome(app, vue, cible));
+            let actif = vt.journal.is_some();
+            let rond = D2D1_ROUNDED_RECT { rect: z, radiusX: RAYON_PETIT, radiusY: RAYON_PETIT };
+            if actif {
+                self.couleur(c, &SURVOL);
+                rt.FillRoundedRectangle(&rond, &c.pinceau);
+                self.couleur(c, &LIGNE);
+                rt.DrawRoundedRectangle(&rond, &c.pinceau, 1.0, None);
+            } else {
+                let fondu = self.survol_k(cible);
+                if fondu > 0.0 {
+                    self.couleur_k(c, &SURVOL, fondu);
+                    rt.FillRoundedRectangle(&rond, &c.pinceau);
+                }
+            }
+            self.reflet_sous(c, Cible::TerminalJournal);
+            self.couleur(c, if actif { &BLANC } else if app.survol == cible { &BLANC_DOUX } else { &BLANC_FAIBLE });
+            self.texte(c, &self.f.petit, "JOURNAL", rect(z.left + 10.0, z.top, z.right - z.left - 14.0, z.bottom - z.top));
+        }
 
         // Fermeture : croix
         let fermer = decaler(zone_terminal_fermer(l, h), decalage_chrome(app, vue, Cible::TerminalFermer));
@@ -2067,48 +2599,49 @@ impl Rendu {
         let fondu_fermer = self.survol_k(Cible::TerminalFermer);
         if fondu_fermer > 0.0 {
             self.couleur_k(c, &SURVOL, fondu_fermer);
-            rt.FillRoundedRectangle(&D2D1_ROUNDED_RECT { rect: fermer, radiusX: 6.0, radiusY: 6.0 }, &c.pinceau);
+            rt.FillRoundedRectangle(&D2D1_ROUNDED_RECT { rect: fermer, radiusX: RAYON_PETIT, radiusY: RAYON_PETIT }, &c.pinceau);
         }
+        self.reflet_sous(c, Cible::TerminalFermer);
         self.couleur(c, if survole_fermer { &BLANC } else { &BLANC_DOUX });
         self.points(c, (fermer.left + fermer.right) / 2.0, (fermer.top + fermer.bottom) / 2.0, 3.4, 1.1, &[(0, 0), (-1, -1), (1, -1), (-1, 1), (1, 1)]);
 
         self.couleur(c, &LIGNE);
-        rt.FillRectangle(&rect(p.left, p.top + 42.0, p.right - p.left, 1.0), &c.pinceau);
+        rt.FillRectangle(&rect(p.left, p.top + TERMINAL_ENTETE_H, p.right - p.left, 1.0), &c.pinceau);
 
-        // Corps : les cinq dernières opérations, de la plus ancienne à la plus récente
-        let mut y0 = p.top + 46.0;
-        if lignes.is_empty() {
+        // Corps : la grille du shell, ou l'erreur si le shell n'a pas pu démarrer
+        let grille = zone_terminal_grille(l, h);
+        if let Some(operations) = vt.journal {
+            self.dessiner_journal_operations(c, grille, operations);
+        } else if let Some(erreur) = vt.panneau.erreur() {
+            self.couleur(c, &ACCENT);
+            self.texte(c, &self.f.petit, "LE TERMINAL N'A PAS PU DEMARRER", rect(grille.left, grille.top + 4.0, grille.right - grille.left, 20.0));
             self.couleur(c, &BLANC_FAIBLE);
-            self.texte(c, &self.f.petit, "AUCUNE OPERATION RECENTE", rect(p.left + 24.0, y0, p.right - p.left - 48.0, 20.0));
-            self.couleur(c, &BLANC_FAIBLE);
-            self.texte(c, &self.f.petit, "COPIE, DEPLACEMENT, CORBEILLE ET RENOMMAGE S'INSCRIVENT ICI.", rect(p.left + 24.0, y0 + 22.0, p.right - p.left - 48.0, 20.0));
+            self.texte(c, &self.f.petit_mono, erreur, rect(grille.left, grille.top + 28.0, grille.right - grille.left, 20.0));
         } else {
-            let place = ((p.bottom - 46.0 - y0) / 20.0).floor().max(0.0) as usize;
-            for op in lignes.iter().rev().take(place).rev() {
-                let heure = op.heure();
-                self.couleur(c, &BLANC_FAIBLE);
-                self.texte(c, &self.f.petit_mono, heure, rect(p.left + 24.0, y0, 44.0, 20.0));
+            self.dessiner_grille_terminal(c, grille, vt);
+            // Shell terminé : un bandeau en bas de la grille propose de le relancer
+            if let Some(code) = vt.panneau.fini() {
+                let bandeau = rect(grille.left - 6.0, grille.bottom - 24.0, grille.right - grille.left + 12.0, 24.0);
+                self.couleur(c, &VOILE);
+                rt.FillRectangle(&bandeau, &c.pinceau);
+                self.couleur(c, &LIGNE);
+                rt.FillRectangle(&rect(bandeau.left, bandeau.top, bandeau.right - bandeau.left, 1.0), &c.pinceau);
                 self.couleur(c, &ACCENT);
-                self.texte(c, &self.f.petit_mono, &op.action.to_uppercase(), rect(p.left + 72.0, y0, 86.0, 20.0));
-                self.couleur(c, &BLANC_DOUX);
-                self.texte(c, &self.f.petit_mono, &op.detail, rect(p.left + 164.0, y0, (p.right - p.left - 188.0).max(20.0), 20.0));
-                y0 += 20.0;
+                self.texte(c, &self.f.petit, &format!("SHELL TERMINE (CODE {code}) · ENTREE POUR RELANCER"), rect(grille.left, bandeau.top, grille.right - grille.left, 24.0));
             }
         }
 
-        // Bas du panneau : Échap ferme, et l'action séparée Windows Terminal
-        self.couleur(c, &LIGNE);
-        rt.FillRectangle(&rect(p.left, p.bottom - 44.0, p.right - p.left, 1.0), &c.pinceau);
-        self.aide(c, "ECHAP FERMER", rect(p.left + 24.0, p.bottom - 38.0, 180.0, 28.0), Pose::Gauche, &BLANC_FAIBLE);
+        // L'action séparée Windows Terminal, dans l'en-tête
         let action = decaler(zone_terminal_action(l, h), decalage_chrome(app, vue, Cible::TerminalExterne));
         let possible = app.dossier_ici().is_some();
         let survole_action = app.survol == Cible::TerminalExterne;
         if survole_action && possible {
             self.couleur(c, &SURVOL);
-            rt.FillRoundedRectangle(&D2D1_ROUNDED_RECT { rect: action, radiusX: 7.0, radiusY: 7.0 }, &c.pinceau);
+            rt.FillRoundedRectangle(&D2D1_ROUNDED_RECT { rect: action, radiusX: RAYON_PETIT, radiusY: RAYON_PETIT }, &c.pinceau);
         }
         self.couleur(c, if possible { &LIGNE } else { &BLANC_TRES_FAIBLE });
-        rt.DrawRoundedRectangle(&D2D1_ROUNDED_RECT { rect: action, radiusX: 7.0, radiusY: 7.0 }, &c.pinceau, 1.0, None);
+        rt.DrawRoundedRectangle(&D2D1_ROUNDED_RECT { rect: action, radiusX: RAYON_PETIT, radiusY: RAYON_PETIT }, &c.pinceau, 1.0, None);
+        self.reflet_sous(c, Cible::TerminalExterne);
         self.couleur(c, if !possible { &BLANC_TRES_FAIBLE } else if survole_action { &BLANC } else { &BLANC_DOUX });
         self.texte(c, &self.f.petit, "OUVRIR DANS WINDOWS TERMINAL", rect(action.left + 10.0, action.top, action.right - action.left - 20.0, action.bottom - action.top));
     }
@@ -2132,6 +2665,8 @@ impl Rendu {
                 m.oublier_page();
             }
         }
+        // Reflets de l'image : calculés d'abord pour que chaque élément éclairé peigne le sien entre son fond et son texte
+        self.preparer_reflet(app, l, h, vue);
         self.panneau.set(0);
         // Ouverture / fermeture (lot 12A) : tout le contenu est dessiné décalé, réduit autour du bas-centre, dans un calque
         // à coins arrondis et à opacité propre ; le VOILE déjà posé reste visible autour (pas de flash noir en thème clair)
@@ -2174,8 +2709,8 @@ impl Rendu {
         self.couleur(c, &BLANC);            self.texte(c, &f.marque, "SPACEFILES", rect(48.0, 0.0, largeur_volet() - 56.0, HAUTEUR_TITRE));
         self.dessiner_onglets(c, app, l, vue);
 
-        // ── Loupe, Essentiel et Réglages, à droite avant les contrôles système ──
-        for (quoi, r) in [(Cible::RechercheHaut, zone_recherche_haut(l)), (Cible::EssentielHaut, zone_essentiel_haut(l)), (Cible::Reglages, zone_reglages_haut(l))] {
+        // ── Essentiel et Réglages, à droite avant les contrôles système (la loupe a été retirée le 17/11/2026) ──
+        for (quoi, r) in [(Cible::EssentielHaut, zone_essentiel_haut(l)), (Cible::Reglages, zone_reglages_haut(l))] {
             let r = decaler(r, decalage_chrome(app, vue, quoi));
             let survole = app.survol == quoi;
             let actif = match quoi {
@@ -2186,12 +2721,12 @@ impl Rendu {
             let k = self.survol_k(quoi);
             if actif || k > 0.0 {
                 if actif { self.couleur(c, &SURVOL_FORT) } else { self.couleur_k(c, &SURVOL, k) }
-                rt.FillRoundedRectangle(&D2D1_ROUNDED_RECT { rect: r, radiusX: 8.0, radiusY: 8.0 }, &c.pinceau);
+                rt.FillRoundedRectangle(&D2D1_ROUNDED_RECT { rect: r, radiusX: RAYON_PETIT, radiusY: RAYON_PETIT }, &c.pinceau);
             }
+            self.reflet_sous(c, quoi);
             self.couleur(c, if actif { &ACCENT } else if survole { &BLANC } else { &BLANC_DOUX });
             let (cx, cy) = ((r.left + r.right) / 2.0, (r.top + r.bottom) / 2.0);
             match quoi {
-                Cible::RechercheHaut => self.points(c, cx, cy - 1.0, 2.6, 1.0, &[(0, -2), (1, -2), (-1, -1), (2, -1), (-1, 0), (2, 0), (0, 1), (1, 1), (2, 2), (3, 3)]),
                 Cible::EssentielHaut => self.points(c, cx, cy, 2.4, 1.0, &[(0, -3), (0, -2), (-1, -1), (0, -1), (1, -1), (0, 0), (0, 1), (0, 2), (0, 3), (-2, 0), (-1, 0), (1, 0), (2, 0)]),
                 _ => self.icone(c, Icone::Reglages, cx, cy, false, if survole || actif { 1.0 } else { 0.65 }),
             }
@@ -2219,43 +2754,67 @@ impl Rendu {
         // Lot 12D : le contenu du volet se fond en 250 ms pendant que sa colonne glisse (`.side`)
         let garde_volet = self.flip_pousser(c, &mouvement::Decalage { dx: 0.0, dy: 0.0, echelle: 1.0, opacite: self.fondu_volets.get().0 }, (0.0, 0.0), rect(0.0, HAUTEUR_TITRE, largeur_volet() + 1.0, h - HAUTEUR_TITRE), &self.couche_opacite(c, self.fondu_volets.get().0));
         // Le volet s'arrête au-dessus du bouton des réglages (beaucoup de stockages : la fin est coupée)
-        let bas_volet = h - 46.0;
+        let bas_volet = h - RETRAIT_BAS_VOLET;
         rt.PushAxisAlignedClip(&rect(0.0, HAUTEUR_TITRE + 1.0, largeur_volet(), bas_volet - HAUTEUR_TITRE - 1.0), D2D1_ANTIALIAS_MODE_ALIASED);
-        let (titres, zones) = disposition_volet(app);
+        let dispo = dispo_volet(app);
+        let (titres, zones, limites) = (dispo.titres, dispo.zones, dispo.limites);
+        // Chaque titre et chaque ligne est rogné à sa bande : le milieu défile sous Ce PC et au-dessus des disques, une section qui
+        // se replie glisse sans déborder sur la suivante
+        let bande = |(haut, bas): (f32, f32)| rect(0.0, haut, largeur_volet(), (bas - haut).max(0.0));
         self.couleur(c, &BLANC_DOUX);
-        for (titre, y, repliee, n) in titres {
-            self.texte(c, &f.petit, titre, rect(VOLET_PAD + 12.0, y, largeur_volet() - VOLET_PAD - 42.0, VOLET_ENTETE));
+        for (titre, y, repliee, n, lim) in titres {
+            rt.PushAxisAlignedClip(&bande(lim), D2D1_ANTIALIAS_MODE_ALIASED);
+            // Lot 7 (D-3) : le titre d'une section est un repère fixe, donc Doto en capitales ; les noms dessous restent en Segoe
+            self.texte_espace(c, &f.volet_nom, &titre.to_uppercase(), rect(VOLET_PAD + 12.0, y, largeur_volet() - VOLET_PAD - 42.0, VOLET_ENTETE));
             // Section repliée : son nombre d'éléments et « + » à droite ; au survol, « − » pour replier
             let survole = matches!(app.survol, Cible::TitreVolet(_)) && zones.iter().any(|(q, r)| *q == app.survol && (r.top - y).abs() < 0.5);
             if repliee || survole {
                 let t = if repliee { format!("{n}  +") } else { "−".to_string() };
                 self.texte(c, &f.petit_droite, &t, rect(VOLET_PAD, y, largeur_volet() - 2.0 * VOLET_PAD - 12.0, VOLET_ENTETE));
             }
+            rt.PopAxisAlignedClip();
+        }
+        if let Some(ys) = dispo.separateur {
+            // Le milieu défile : un trait fin le sépare des disques, qui restent en place
+            self.couleur(c, &LIGNE);
+            rt.FillRectangle(&rect(VOLET_PAD, ys, largeur_volet() - 2.0 * VOLET_PAD, 1.0), &c.pinceau);
         }
         let lignes_arbre = if crate::reglages::ARBRE.load(std::sync::atomic::Ordering::Relaxed) { app.lignes_arbre() } else { Vec::new() };
-        for (quoi, r) in zones {
+        // Un clip par ligne : les `continue` du corps sautent le retrait, qui se fait donc au début du tour suivant
+        let mut rogne = false;
+        for ((quoi, r), lim) in zones.into_iter().zip(limites) {
+            if rogne {
+                rt.PopAxisAlignedClip();
+            }
+            rt.PushAxisAlignedClip(&bande(lim), D2D1_ANTIALIAS_MODE_ALIASED);
+            rogne = true;
             let r = decaler(r, decalage_chrome(app, vue, quoi));
-            if quoi == Cible::CePc {
-                let actif = app.emplacement == Emplacement::CePC;
+            if quoi == Cible::CePc || quoi == Cible::EspaceVolet {
+                let (actif, icone, nom) = if quoi == Cible::CePc {
+                    (app.emplacement == Emplacement::CePC, Icone::Bureau, "Ce PC")
+                } else {
+                    (app.emplacement == Emplacement::Espace, Icone::Disque, "Espace disque")
+                };
                 let survole = app.survol == quoi;
                 let fondu = self.survol_k(quoi);
                 if actif || fondu > 0.0 {
+                    let rayon = rayon_cible(quoi).unwrap_or(RAYON_MOYEN);
                     if actif { self.couleur_ou(c, &SELECTION, &SELECTION_CLAIR); } else { self.couleur_k(c, &SURVOL, fondu); }
-                    rt.FillRoundedRectangle(&D2D1_ROUNDED_RECT { rect: r, radiusX: 10.0, radiusY: 10.0 }, &c.pinceau);
-                    if actif {
-                        self.couleur(c, &ACCENT_BORD);
-                        rt.DrawRoundedRectangle(&D2D1_ROUNDED_RECT { rect: r, radiusX: 10.0, radiusY: 10.0 }, &c.pinceau, 1.0, None);
-                    }
+                    rt.FillRoundedRectangle(&D2D1_ROUNDED_RECT { rect: r, radiusX: rayon, radiusY: rayon }, &c.pinceau);
+                }
+                self.reflet_sous(c, quoi);
+                if actif {
+                    self.barre_active_volet(c, r);
                 }
                 self.couleur(c, if actif || survole { &BLANC } else { &BLANC_DOUX });
-                self.icone(c, Icone::Bureau, r.left + 22.0, (r.top + r.bottom) / 2.0, false, if actif || survole { 1.0 } else { 0.72 });
+                self.icone(c, icone, r.left + 22.0, (r.top + r.bottom) / 2.0, false, if actif || survole { 1.0 } else { 0.72 });
                 self.couleur(c, &BLANC);
-                self.texte_espace(c, &f.volet_nom, "CE PC", rect(r.left + 46.0, r.top, r.right - r.left - 56.0, r.bottom - r.top));
+                self.texte(c, &f.volet, nom, rect(r.left + 46.0, r.top, r.right - r.left - 56.0, r.bottom - r.top));
                 continue;
             }
             if let Cible::Arbre(i) = quoi {
                 if let Some(l) = lignes_arbre.get(i) {
-                    self.ligne_arbre(c, app, l, r, app.survol == quoi, self.survol_k(quoi), app.depot == quoi);
+                    self.ligne_arbre(c, app, l, r, quoi, app.survol == quoi, self.survol_k(quoi), app.depot == quoi);
                 }
                 continue;
             }
@@ -2272,31 +2831,29 @@ impl Rendu {
             let survole = app.survol == quoi;
             let fondu = self.survol_k(quoi);
             if actif || fondu > 0.0 {
+                // Même rayon que le reflet (`rayon_cible`), le même pour toutes les lignes du volet, disque compris (lot 5, D-5)
+                let rayon = rayon_cible(quoi).unwrap_or(RAYON_PETIT);
                 if actif { self.couleur_ou(c, &SELECTION, &SELECTION_CLAIR); } else { self.couleur_k(c, &SURVOL, fondu); }
-                rt.FillRoundedRectangle(&D2D1_ROUNDED_RECT { rect: r, radiusX: 10.0, radiusY: 10.0 }, &c.pinceau);
-                if actif {
-                    self.couleur(c, &ACCENT_BORD);
-                    rt.DrawRoundedRectangle(&D2D1_ROUNDED_RECT { rect: r, radiusX: 10.0, radiusY: 10.0 }, &c.pinceau, 1.0, None);
-                }
+                rt.FillRoundedRectangle(&D2D1_ROUNDED_RECT { rect: r, radiusX: rayon, radiusY: rayon }, &c.pinceau);
             }
             if app.depot == quoi {
                 self.couleur(c, &ACCENT);
-                rt.DrawRoundedRectangle(&D2D1_ROUNDED_RECT { rect: r, radiusX: 7.0, radiusY: 7.0 }, &c.pinceau, 1.5, None);
+                rt.DrawRoundedRectangle(&D2D1_ROUNDED_RECT { rect: r, radiusX: RAYON_PETIT, radiusY: RAYON_PETIT }, &c.pinceau, 1.5, None);
+            }
+            self.reflet_sous(c, quoi);
+            if actif {
+                self.barre_active_volet(c, r);
             }
             if let Cible::Disque(i) = quoi {
                 let e = elasticite();
-                // Carte du disque (maquette v6) : contour, nom, jauge et place libre en toutes lettres
-                let carte = D2D1_ROUNDED_RECT { rect: r, radiusX: 14.0, radiusY: 14.0 };
-                self.couleur(c, &CHAMP_FOND);
-                rt.FillRoundedRectangle(&carte, &c.pinceau);
-                self.couleur(c, if actif { &ACCENT_BORD } else { &LIGNE });
-                rt.DrawRoundedRectangle(&carte, &c.pinceau, 1.0, None);
-                self.icone(c, Icone::Disque, r.left + 22.0, r.top + 24.0 * e, false, 0.85);
+                // Le disque est une ligne comme les autres (fond de survol / sélection, barre orange), sans cadre ni fond propres
+                // (lot 5, D-5) : nom, jauge et place libre en toutes lettres, sur 64 DIP (multiple de 4)
+                self.icone(c, Icone::Disque, r.left + 22.0, r.top + 18.0 * e, false, if actif || survole { 1.0 } else { 0.7 });
                 self.couleur(c, &BLANC);
-                self.texte_espace(c, &f.volet_nom, &nom.to_uppercase(), rect(r.left + 44.0, r.top + 6.0 * e, r.right - r.left - 56.0, 30.0 * e));
+                self.texte(c, &f.volet, &crate::dossier::casse_phrase(nom), rect(r.left + 46.0, r.top + 4.0 * e, r.right - r.left - 58.0, 28.0 * e));
                 if let Genre::Disque { libre, total, .. } = app.disques[i].genre {
                     let rempli = if total > 0 { 1.0 - libre as f64 / total as f64 } else { 0.0 };
-                    let (mx, my, mw) = (r.left + 14.0, r.top + 44.0 * e, r.right - r.left - 28.0);
+                    let (mx, my, mw) = (r.left + 14.0, r.top + 38.0 * e, r.right - r.left - 28.0);
                     self.couleur(c, &BLANC_TRES_FAIBLE);
                     rt.FillRoundedRectangle(&D2D1_ROUNDED_RECT { rect: rect(mx, my, mw, 4.0), radiusX: 2.0, radiusY: 2.0 }, &c.pinceau);
                     if rempli > 0.0 {
@@ -2310,11 +2867,11 @@ impl Rendu {
                         let place = r.right - r.left - 28.0 - 15.0;
                         let detail = crate::dossier::etiquette_disque(true, false, libre, &|t| self.mesurer(t, &f.petit) <= place);
                         self.couleur(c, &ERREUR);
-                        self.triangle_plein(c, x_texte + 4.5, r.top + 59.0 * e, 4.5);
-                        self.texte(c, &f.petit, &detail, rect(x_texte + 15.0, r.top + 50.0 * e, place, 18.0 * e));
+                        self.triangle_plein(c, x_texte + 4.5, r.top + 53.0 * e, 4.5);
+                        self.texte(c, &f.petit, &detail, rect(x_texte + 15.0, r.top + 44.0 * e, place, 18.0 * e));
                     } else {
                         self.couleur(c, &BLANC_FAIBLE);
-                        self.texte(c, &f.petit, &crate::dossier::libres_sur(libre, total), rect(x_texte, r.top + 50.0 * e, r.right - r.left - 28.0, 18.0 * e));
+                        self.texte(c, &f.petit, &crate::dossier::libres_sur(libre, total), rect(x_texte, r.top + 44.0 * e, r.right - r.left - 28.0, 18.0 * e));
                     }
                 }
                 continue;
@@ -2346,7 +2903,10 @@ impl Rendu {
             // `.it .d` : le nom est en `--i1` quelle que soit la ligne, seule l'icône reste atténuée
             self.couleur(c, &BLANC);
             let fin_nom = if cle_etat.is_some() { droite_nom } else { r.right - 12.0 };
-            self.texte_espace(c, &f.volet_nom, &nom.to_uppercase(), rect(r.left + 46.0, r.top, fin_nom - (r.left + 46.0), ligne_h));
+            self.texte(c, &f.volet, &crate::dossier::casse_phrase(nom), rect(r.left + 46.0, r.top, fin_nom - (r.left + 46.0), ligne_h));
+        }
+        if rogne {
+            rt.PopAxisAlignedClip();
         }
 
         rt.PopAxisAlignedClip();
@@ -2407,7 +2967,7 @@ impl Rendu {
             let etat = self.mouvements.borrow().page.etat(t_image);
             if let Some((false, e)) = etat {
                 let d = mouvement::Decalage { dx: 0.0, dy: 0.0, echelle: e.echelle, opacite: e.opacite };
-                self.avec_decalage(c, &d, (ll / 2.0, (HAUTEUR_TITRE + h - statut_h()) / 2.0), rect(0.0, HAUTEUR_TITRE, ll, h - HAUTEUR_TITRE), || self.dessiner_page(c, app, ll, h, sortie, true));
+                self.avec_decalage(c, &d, (ll / 2.0, (HAUTEUR_TITRE + h - statut_h()) / 2.0), rect(0.0, HAUTEUR_TITRE, ll, h - HAUTEUR_TITRE), || self.dessiner_page(c, app, ll, h, sortie, true, vue));
             }
         }
         // ── Pied de la fenêtre : séparateur et gestes sur toute la largeur, aperçu compris ──
@@ -2448,8 +3008,8 @@ impl Rendu {
         }
         *self.zones_pastilles.borrow_mut() = disposition;
         // Panneau terminal : au-dessus de la liste et des pastilles, jamais au-dessus du pied
-        if vue.terminal_visible {
-            self.dessiner_terminal(c, app, ll, h, vue.terminal_lignes, vue);
+        if vue.terminal.is_some() {
+            self.dessiner_terminal(c, app, ll, h, vue);
         }
         // Pixel dans la barre d'état : sous les fenêtres modales ; en vol ou dans la palette, il passe par-dessus (voir plus bas)
         if vue.pixel.place <= 0.0 {
@@ -2544,7 +3104,8 @@ impl Rendu {
             });
             self.avec_decalage(c, &d_menu, centre, plein, || self.dessiner_menu(c, m));
         }
-        // Reflet : une seule passe, par-dessus tout ce qui est déjà tracé
+        // Reflet : ce qu'aucun élément n'a peint sous son texte passe par-dessus (menu, conflits, pastilles, double panneau ;
+        // le test `chaque_cible_du_reflet_est_reclamee` tient la liste des cibles à jour)
         self.dessiner_reflet(c, app, l, h, vue);
         if calque.is_some() {
             rt.PopLayer();
@@ -2578,10 +3139,12 @@ impl Rendu {
 
     /// Élément éclairé par le reflet et rayon de coin de son fond : celui de `survol`, ou, sous une fenêtre modale, l'élément de la
     /// modale sous le pointeur (menu, boutons de la carte des conflits). Les rectangles sont ceux que le dessin et les clics
-    /// utilisent déjà (zones du volet, de la barre, des pastilles, des onglets, du menu) ; seuls `disposition_volet` (déjà
+    /// utilisent déjà (zones du volet, de la barre, des pastilles, des onglets, du menu) ; seuls `dispo_volet` (déjà
     /// calculée à chaque image) et les positions de la page des réglages sont relus, et seulement pour l'élément survolé.
     fn cible_du_reflet(&self, app: &App, l: f32, h: f32, vue: &Vue) -> Option<CibleReflet> {
         let libre = |zone: D2D_RECT_F, coin: f32| Some(CibleReflet { zone, coin, desactive: false, clip: None });
+        // Rayon de la cible survolée, lu dans la table que le dessin partage (`rayon_cible`)
+        let coin = rayon_cible(app.survol);
         // Menu ouvert : l'élément allumé du niveau le plus profond (`survol` vient de la souris, une touche efface le pointeur).
         // Indépendant du pointeur : la zone sert aussi de candidate à l'invalidation quand le pointeur y rentre sans que `survol` change.
         if let Some(m) = vue.menu {
@@ -2589,13 +3152,13 @@ impl Rendu {
             if let Some(j) = n.icone {
                 let k = n.lignes.iter().position(|l| matches!(l.genre, menu::Genre::Icones(_)))?;
                 let menu::Genre::Icones(v) = &n.lignes[k].genre else { return None };
-                return Some(CibleReflet { zone: n.case_icone(k, j), coin: 8.0, desactive: !v.get(j)?.2, clip: None });
+                return Some(CibleReflet { zone: n.case_icone(k, j), coin: RAYON_PETIT, desactive: !v.get(j)?.2, clip: None });
             }
-            return libre(n.zone(n.survol?), 6.0);
+            return libre(n.zone(n.survol?), RAYON_PETIT);
         }
         if vue.conflits.is_some() {
             let (px, py) = vue.pointeur?;
-            return self.zones_conflit.borrow().iter().find(|(r, _)| reflet::contient(r, px, py)).and_then(|(r, _)| libre(*r, 8.0));
+            return self.zones_conflit.borrow().iter().find(|(r, _)| reflet::contient(r, px, py)).and_then(|(r, _)| libre(*r, RAYON_PETIT));
         }
         if vue.palette.is_some() || vue.lot.is_some() || vue.galerie.is_some() {
             return None;
@@ -2607,22 +3170,37 @@ impl Rendu {
         let decale = |r: D2D_RECT_F| D2D_RECT_F { left: r.left + decalage, right: r.right + decalage, ..r };
         let zone_pastille = |z: pastilles::Zone| rect(z.x, z.y, z.l, z.h);
         match app.survol {
-            Cible::Onglet(k) | Cible::FermerOnglet(k) => zones_onglets(l, vue.onglets.len()).into_iter().find(|(q, _)| *q == Cible::Onglet(k)).and_then(|(_, r)| libre(r, 8.0)),
-            Cible::NouvelOnglet => zones_onglets(l, vue.onglets.len()).into_iter().find(|(q, _)| *q == Cible::NouvelOnglet).and_then(|(_, r)| libre(r, 8.0)),
-            Cible::CePc | Cible::Favori(_) | Cible::Epingle(_) | Cible::Disque(_) | Cible::Nuage(_) | Cible::Serveur(_) | Cible::Groupe(_) | Cible::Arbre(_) => {
-                // Le volet est rogné au-dessus du bouton des réglages : le reflet l'est aussi
-                let bas = h - 52.0;
-                let r = disposition_volet(app).1.into_iter().find(|(q, _)| *q == app.survol)?.1;
-                Some(CibleReflet { zone: r, coin: 7.0, desactive: false, clip: Some(rect(0.0, HAUTEUR_TITRE + 1.0, largeur_volet(), bas - HAUTEUR_TITRE - 1.0)) })
+            Cible::Onglet(k) | Cible::FermerOnglet(k) => zones_onglets(l, vue.onglets.len()).into_iter().find(|(q, _)| *q == Cible::Onglet(k)).and_then(|(_, r)| libre(r, coin?)),
+            Cible::NouvelOnglet => zones_onglets(l, vue.onglets.len()).into_iter().find(|(q, _)| *q == Cible::NouvelOnglet).and_then(|(_, r)| libre(r, coin?)),
+            Cible::CePc | Cible::EspaceVolet | Cible::Favori(_) | Cible::Epingle(_) | Cible::Disque(_) | Cible::Nuage(_) | Cible::Serveur(_) | Cible::Groupe(_) | Cible::Arbre(_) => {
+                // Le volet est rogné au-dessus du bouton des réglages : le reflet l'est de la même hauteur (constante partagée)
+                // et, comme le dessin, à la bande visible de la ligne (le milieu défile sous Ce PC et au-dessus des disques)
+                let d = dispo_volet(app);
+                let rang = d.zones.iter().position(|(q, _)| *q == app.survol)?;
+                let (haut, bas) = d.limites[rang];
+                Some(CibleReflet { zone: d.zones[rang].1, coin: coin?, desactive: false, clip: Some(rect(0.0, haut, largeur_volet(), (bas - haut).max(0.0))) })
             }
-            Cible::Reglages => libre(zone_reglages_haut(l), 8.0),
-            Cible::ReglagesFermer => libre(page::zone_fermer(l), 8.0),
-            Cible::ReglagesNav(k) => page::zones_nav().get(k).and_then(|(_, r)| libre(*r, REGLAGE_SEG_RAYON)),
-            Cible::RechercheHaut => libre(zone_recherche_haut(l), 8.0),
-            Cible::EssentielHaut => libre(zone_essentiel_haut(l), 8.0),
-            Cible::Terminal => libre(zone_terminal(l), 8.0),
-            Cible::TerminalFermer => libre(zone_terminal_fermer(ll, h), 8.0),
-            Cible::TerminalExterne => Some(CibleReflet { zone: zone_terminal_action(ll, h), coin: 8.0, desactive: app.dossier_ici().is_none(), clip: None }),
+            Cible::Reglages => libre(zone_reglages_haut(l), coin?),
+            // Largeur du panneau (`lp`) et décalage du panneau de droite : comme le dessin et le clic (`souris.rs`)
+            Cible::ReglagesFermer => libre(decale(page::zone_fermer(lp)), coin?),
+            Cible::ReglagesNav(k) => page::zones_nav().get(k).and_then(|(_, r)| libre(decale(*r), coin?)),
+            Cible::EssentielHaut => libre(zone_essentiel_haut(l), coin?),
+            Cible::Terminal => libre(decale(zone_terminal(lp)), coin?),
+            Cible::TerminalFermer => libre(zone_terminal_fermer(ll, h), coin?),
+            Cible::TerminalExterne => Some(CibleReflet { zone: zone_terminal_action(ll, h), coin: coin?, desactive: app.dossier_ici().is_none(), clip: None }),
+            Cible::TerminalOnglet(k) => {
+                let n = vue.terminal.as_ref().map_or(0, |t| t.onglets.len());
+                (k < n).then(|| libre(zone_terminal_onglet(ll, h, k, n), coin?)).flatten()
+            }
+            Cible::TerminalOngletFermer(k) => {
+                let n = vue.terminal.as_ref().map_or(0, |t| t.onglets.len());
+                (k < n).then(|| libre(zone_terminal_onglet_croix(ll, h, k, n), coin?)).flatten()
+            }
+            Cible::TerminalNouveau => {
+                let n = vue.terminal.as_ref().map_or(0, |t| t.onglets.len());
+                libre(zone_terminal_plus(ll, h, n), coin?)
+            }
+            Cible::TerminalJournal => libre(zone_terminal_journal(ll, h), coin?),
             Cible::Precedent | Cible::Suivant | Cible::Parent => {
                 let possible = match app.survol {
                     Cible::Precedent => app.peut_reculer(),
@@ -2630,26 +3208,29 @@ impl Rendu {
                     _ => app.emplacement.parent().is_some(),
                 };
                 let r = boutons_nav().into_iter().find(|(q, _)| *q == app.survol)?.1;
-                Some(CibleReflet { zone: decale(r), coin: 8.0, desactive: !possible, clip: None })
+                Some(CibleReflet { zone: decale(r), coin: coin?, desactive: !possible, clip: None })
             }
             Cible::Outil(o) => {
                 let p = app.zones.barre.iter().find(|p| p.outil == o)?;
-                Some(CibleReflet { zone: decale(p.zone), coin: o.rayon_coin(), desactive: !app.outil_possible(o), clip: None })
+                // Le reflet éclaire la forme du fond (`Outil::forme`), pas la zone de clic
+                let (zone, coin) = o.forme(decale(p.zone));
+                Some(CibleReflet { zone, coin, desactive: !app.outil_possible(o), clip: None })
             }
-            Cible::Note => libre(decale(app.zones.note?), 11.0),
-            Cible::Puce(k) => libre(decale(*app.zones.puces.get(k)?), 8.0),
-            Cible::Corbeille => libre(decale(app.zones.corbeille?), 10.0),
-            Cible::StockageCePc(_) | Cible::AjouterStockage => libre(decale(app.zones.stockages.iter().find(|(_, q)| *q == app.survol)?.0), 10.0),
+            Cible::Note => libre(decale(app.zones.note?), coin?),
+            Cible::Puce(k) => libre(decale(*app.zones.puces.get(k)?), coin?),
+            Cible::Corbeille => libre(decale(app.zones.corbeille?), coin?),
+            Cible::StockageCePc(_) | Cible::AjouterStockage | Cible::OuvrirEspace | Cible::OuvrirNettoyage => libre(decale(app.zones.stockages.iter().find(|(_, q)| *q == app.survol)?.0), coin?),
             Cible::Reglage(k) => {
                 let vp = vue.page.as_ref()?;
                 let (y0, hl) = *page::positions(vp.lignes, vp.page.categorie).get(k)?;
-                if hl == 0.0 {
+                // Les lignes d'information (raccourcis) n'ont ni carte ni fond de survol : rien à éclairer
+                if hl == 0.0 || vp.lignes.get(k)?.compacte() {
                     return None;
                 }
                 let (haut, bas) = (page::PAGE_Y, h - statut_h());
                 let y = haut + y0 - vp.page.defilement;
                 let clip = rect(REGLAGES_NAV + 2.0, haut, lp - REGLAGES_NAV - 2.0, bas - haut);
-                Some(CibleReflet { zone: page::rect_carte(y, lp), coin: REGLAGE_CARTE_RAYON, desactive: false, clip: Some(clip) })
+                Some(CibleReflet { zone: decale(page::rect_carte(y, lp)), coin: coin?, desactive: false, clip: Some(decale(clip)) })
             }
             Cible::Champ(k) => {
                 // Seuls le sélecteur de genre et les deux boutons sont des boutons ; les champs de saisie ne sont pas éclairés
@@ -2657,9 +3238,9 @@ impl Rendu {
                 let carte = page::carte_formulaire(lp, h);
                 let z = page::zones_formulaire(carte).into_iter().find(|(q, _)| *q == k)?.1;
                 if k == page::F_GENRE {
-                    libre(decale(rect(z.left + 150.0, z.top + 2.0, z.right - z.left - 150.0, z.bottom - z.top - 4.0)), 7.0)
+                    libre(decale(rect(z.left + 150.0, z.top + 2.0, z.right - z.left - 150.0, z.bottom - z.top - 4.0)), RAYON_PETIT)
                 } else if k >= page::F_AJOUTER {
-                    libre(decale(z), 19.0)
+                    libre(decale(z), rayon_pilule(&z))
                 } else {
                     None
                 }
@@ -2671,7 +3252,7 @@ impl Rendu {
             Cible::BoutonPastille(i, b) => {
                 let d = self.zones_pastilles.borrow();
                 let z = d.places.iter().find(|p| p.index == i)?.boutons.iter().find(|(q, _, _)| *q == b).map(|(_, z, _)| *z)?;
-                libre(zone_pastille(z), if b == Bouton::Destination { 8.0 } else { 10.0 })
+                libre(zone_pastille(z), if b == Bouton::Destination { RAYON_PETIT } else { RAYON_MOYEN })
             }
             Cible::PlusPastilles => libre(zone_pastille(self.zones_pastilles.borrow().plus?.1), pastilles::RAYON),
             _ => None,
@@ -2681,51 +3262,120 @@ impl Rendu {
     /// Reflet qui suit le curseur : halo de fond puis lueur du contour de l'élément survolé, avec le pinceau radial partagé.
     /// Rien si le reflet est coupé (mouvement réduit, Contraste élevé), si l'élément est désactivé ou trop grand, ou si le pointeur
     /// est inconnu (voir `reflet.rs`). `zone_reflet` garde ce qui a été éclairé pour l'invalidation de la souris.
+    /// Peint ici (par-dessus tout) seulement ce qu'aucun élément n'a réclamé avec `reflet_sous` : arbre, menus, conflits, pastilles,
+    /// cartes, terminal, champs, double panneau.
     /// Invariant (unsafe) : appelée entre `BeginDraw` et `EndDraw` de `c.rt`, sur le fil d'interface ; le pinceau `c.reflet` vit
-    /// avec la cible et n'est modifié (centre, rayon, opacité) que d'ici, jamais recréé.
+    /// avec la cible et n'est modifié (centre, rayon, opacité) que par `peindre_reflet`, jamais recréé.
     unsafe fn dessiner_reflet(&self, c: &Cible2D, app: &App, l: f32, h: f32, vue: &Vue) {
+        // Menu, carte des conflits et pastilles : leurs zones ne sont connues qu'après leur dessin dans cette image, le reflet est
+        // calculé ici et peint par-dessus
+        if Self::reflet_tardif(app, vue) {
+            self.calculer_reflet(app, l, h, vue, true);
+        }
+        let restes = reclamer_reflets(&mut self.reflets_attente.borrow_mut(), None);
+        for (p, clip, k) in restes {
+            self.peindre_reflet(c, p, clip, k);
+        }
+    }
+
+    /// Vrai si le reflet de l'image ne peut pas être calculé avant le dessin : l'élément éclairé est dans le menu, la carte des
+    /// conflits ou une pastille, dont les zones sont posées pendant le dessin
+    fn reflet_tardif(app: &App, vue: &Vue) -> bool {
+        vue.menu.is_some() || vue.conflits.is_some() || matches!(app.survol, Cible::Pastille(_) | Cible::BoutonPastille(..) | Cible::PlusPastilles)
+    }
+
+    /// Début d'image : calcule les reflets pour que chaque élément éclairé puisse peindre le sien sous son texte
+    fn preparer_reflet(&self, app: &App, l: f32, h: f32, vue: &Vue) {
+        self.reflets_attente.borrow_mut().clear();
+        if !Self::reflet_tardif(app, vue) {
+            self.calculer_reflet(app, l, h, vue, false);
+        }
+    }
+
+    /// Peint, juste après son fond et avant son texte, le reflet de l'élément `cible` (et ceux qu'il a quittés et qui s'éteignent) ;
+    /// ce qu'aucun élément ne réclame est peint par-dessus en fin d'image.
+    /// Invariant (unsafe) : celui de `peindre_reflet` (entre `BeginDraw` et `EndDraw` de `c.rt`, fil d'interface, pinceau `c.reflet`
+    /// partagé) ; l'emprunt de `reflets_attente` est relâché avant de peindre.
+    unsafe fn reflet_sous(&self, c: &Cible2D, cible: Cible) {
+        let a_peindre = reclamer_reflets(&mut self.reflets_attente.borrow_mut(), Some(cible));
+        for (p, clip, k) in a_peindre {
+            self.peindre_reflet(c, p, clip, k);
+        }
+    }
+
+    /// Comme `reflet_sous`, pour un élément du contenu d'un panneau : en double panneau le panneau de droite est dessiné décalé et
+    /// le plan l'est déjà, le reflet reste alors en dernière passe.
+    /// Invariant (unsafe) : celui de `reflet_sous`.
+    unsafe fn reflet_sous_contenu(&self, c: &Cible2D, vue: &Vue, cible: Cible) {
+        if !vue.double {
+            self.reflet_sous(c, cible);
+        }
+    }
+
+    /// Zones et plans du reflet de l'image, rangés dans `reflets_attente`. `tardif` : calculé en fin d'image, sans étiquette
+    fn calculer_reflet(&self, app: &App, l: f32, h: f32, vue: &Vue, tardif: bool) {
         let actif = reflet::actif_maintenant();
         let cible = if actif { self.cible_du_reflet(app, l, h, vue) } else { None };
+        // L'élément du chrome survolé se soulève (`SURVOL_DECALAGE`) : le reflet suit son fond, sinon il déborde de 2 px en bas.
+        // La croix d'un onglet soulève l'onglet entier. Le pointeur est testé sur la zone de clic (au repos), la forme dessinée est
+        // décalée ensuite : le reflet ne clignote pas dans la bande de 2 px que le soulèvement dégage.
+        let soulevee = if let Cible::FermerOnglet(k) = app.survol { Cible::Onglet(k) } else { app.survol };
+        let dy = decalage_chrome(app, vue, soulevee);
+        let union = |a: D2D_RECT_F, b: D2D_RECT_F| D2D_RECT_F { left: a.left.min(b.left), top: a.top.min(b.top), right: a.right.max(b.right), bottom: a.bottom.max(b.bottom) };
         // Candidate : l'élément éclairable même si le pointeur n'est pas (encore) dedans ; la souris l'invalide aussi, sinon le halo
         // n'apparaîtrait pas quand le pointeur y entre sans que la cible change. Carte des conflits : la bande de ses boutons.
         let candidate = if actif && vue.menu.is_none() && vue.conflits.is_some() {
-            self.zones_conflit.borrow().iter().map(|(r, _)| *r).reduce(|a, b| D2D_RECT_F { left: a.left.min(b.left), top: a.top.min(b.top), right: a.right.max(b.right), bottom: a.bottom.max(b.bottom) })
+            self.zones_conflit.borrow().iter().map(|(r, _)| *r).reduce(union)
         } else {
-            cible.as_ref().filter(|z| reflet::eligible(&z.zone, z.desactive)).map(|z| z.zone)
+            // Union de la zone au repos et de la zone soulevée : le pointeur peut entrer par l'une ou l'autre
+            cible.as_ref().filter(|z| reflet::eligible(&z.zone, z.desactive)).map(|z| union(z.zone, decaler(z.zone, dy)))
         };
         self.zone_candidate.set(candidate);
-        let plan = cible.and_then(|z| reflet::planifier(z.zone, z.coin, z.desactive, vue.pointeur, true).map(|p| (p, z.clip)));
-        self.zone_reflet.set(plan.as_ref().map(|(p, _)| p.zone));
+        // Plan sur la zone au repos (le pointeur y est testé, et `Reflets::maj` y reconnaît le reflet d'une image à l'autre : un
+        // décalage qui change à chaque image du ressort ne doit pas le faire passer pour un nouveau) ; le décalage ne sert qu'au dessin
+        let plan = cible.and_then(|z| {
+            reflet::planifier(z.zone, z.coin, z.desactive, vue.pointeur, true).map(|p| (reflet::Plan { decalage: dy, cible: if tardif { None } else { Some(soulevee) }, ..p }, z.clip))
+        });
+        self.zone_reflet.set(plan.as_ref().map(|(p, _)| union(p.zone, p.decale().zone)));
         // Lot 12C (`.rv:after { transition: opacity .18s }`) : le reflet apparaît et disparaît en 180 ms ; celui qu'on vient de quitter
         // reste à sa dernière place le temps de s'éteindre
-        let a_dessiner = self.mouvements.borrow_mut().reflets.maj(plan, self.t_image.get(), crate::reglages::animations_actives());
+        // Reflet coupé (réglage, Contraste élevé) : on vide le fondu au lieu de le laisser s'éteindre 180 ms sur des couleurs système
+        let a_dessiner = self.mouvements.borrow_mut().reflets.maj(plan, self.t_image.get(), actif && crate::reglages::animations_actives());
+        *self.reflets_attente.borrow_mut() = a_dessiner.into_iter().map(|(p, clip, k)| (p, clip, k, false)).collect();
+    }
+
+    /// Peint un reflet : halo de fond puis arête claire du haut, avec le pinceau radial partagé.
+    /// Invariant (unsafe) : voir `dessiner_reflet` (entre `BeginDraw` et `EndDraw`, pinceau `c.reflet` réglé seulement d'ici).
+    unsafe fn peindre_reflet(&self, c: &Cible2D, p: reflet::Plan, clip: Option<D2D_RECT_F>, k: f32) {
         let rt = &c.rt;
         let pinceau = &c.reflet;
-        for (p, clip, k) in a_dessiner {
-            if let Some(r) = &clip {
-                rt.PushAxisAlignedClip(r, D2D1_ANTIALIAS_MODE_ALIASED);
-            }
-            pinceau.SetCenter(D2D_POINT_2F { x: p.centre.0, y: p.centre.1 });
-            pinceau.SetGradientOriginOffset(D2D_POINT_2F { x: 0.0, y: 0.0 });
-            // Calque 1 : halo dans le fond, découpé au rectangle arrondi de l'élément (le remplissage a cette forme)
-            pinceau.SetRadiusX(p.rayon_halo);
-            pinceau.SetRadiusY(p.rayon_halo);
-            pinceau.SetOpacity(crate::theme::sans_renfort(&REFLET_FOND).a * k);
-            rt.FillRoundedRectangle(&D2D1_ROUNDED_RECT { rect: p.zone, radiusX: p.rayon_coin, radiusY: p.rayon_coin }, pinceau);
-            // Calque 2 : lueur sur le contour (1 px, tracé au milieu du pixel comme les autres traits). Garde : curseur à 90 DIP ou plus
-            // du trait, la lueur serait invisible (jamais le cas d'un élément éligible, 160 DIP de haut au plus, mais le plan le dit)
-            if p.alpha_trait_maximal() > 0.0 {
-                pinceau.SetRadiusX(p.rayon_lueur);
-                pinceau.SetRadiusY(p.rayon_lueur);
-                pinceau.SetOpacity(crate::theme::sans_renfort(&REFLET_TRAIT).a * k);
-                let z = p.zone;
-                let coin = (p.rayon_coin - 0.5).max(0.0);
-                let contour = D2D1_ROUNDED_RECT { rect: rect(z.left + 0.5, z.top + 0.5, z.right - z.left - 1.0, z.bottom - z.top - 1.0), radiusX: coin, radiusY: coin };
-                rt.DrawRoundedRectangle(&contour, pinceau, 1.0, None);
-            }
-            if clip.is_some() {
-                rt.PopAxisAlignedClip();
-            }
+        let p = p.decale();
+        if let Some(r) = &clip {
+            rt.PushAxisAlignedClip(r, D2D1_ANTIALIAS_MODE_ALIASED);
+        }
+        pinceau.SetCenter(D2D_POINT_2F { x: p.centre.0, y: p.centre.1 });
+        pinceau.SetGradientOriginOffset(D2D_POINT_2F { x: 0.0, y: 0.0 });
+        // Calque 1 : halo dans le fond, découpé au rectangle arrondi de l'élément (le remplissage a cette forme)
+        pinceau.SetRadiusX(p.rayon_halo);
+        pinceau.SetRadiusY(p.rayon_halo);
+        pinceau.SetOpacity(crate::theme::sans_renfort(&REFLET_FOND).a * k);
+        rt.FillRoundedRectangle(&D2D1_ROUNDED_RECT { rect: p.zone, radiusX: p.rayon_coin, radiusY: p.rayon_coin }, pinceau);
+        // Calque 2 : arête claire en haut (lot 2 de l'audit UX). Le contour de 1 px est tracé au milieu du pixel comme les autres
+        // traits, mais découpé à la bande du haut (`bande_arete`) : seuls le trait du haut et ses deux arcs de coin restent, jamais
+        // les côtés, qui se lisaient comme un trait isolé. Garde : curseur à 90 DIP ou plus du bord haut, l'arête serait invisible
+        if p.alpha_trait_maximal() > 0.0 {
+            pinceau.SetRadiusX(p.rayon_lueur);
+            pinceau.SetRadiusY(p.rayon_lueur);
+            pinceau.SetOpacity(crate::theme::sans_renfort(&REFLET_TRAIT).a * k);
+            let z = p.zone;
+            let coin = (p.rayon_coin - 0.5).max(0.0);
+            let contour = D2D1_ROUNDED_RECT { rect: rect(z.left + 0.5, z.top + 0.5, z.right - z.left - 1.0, z.bottom - z.top - 1.0), radiusX: coin, radiusY: coin };
+            rt.PushAxisAlignedClip(&p.bande_arete(), D2D1_ANTIALIAS_MODE_ALIASED);
+            rt.DrawRoundedRectangle(&contour, pinceau, 1.0, None);
+            rt.PopAxisAlignedClip();
+        }
+        if clip.is_some() {
+            rt.PopAxisAlignedClip();
         }
     }
 
@@ -2738,7 +3388,7 @@ impl Rendu {
         let fondu = self.survol_k(Cible::Section(s));
         if fondu > 0.0 {
             self.couleur_k(c, &SURVOL, fondu);
-            rt.FillRoundedRectangle(&D2D1_ROUNDED_RECT { rect: rect(x0, y + 1.0, largeur, hauteur_ligne() - 2.0), radiusX: 7.0, radiusY: 7.0 }, &c.pinceau);
+            rt.FillRoundedRectangle(&D2D1_ROUNDED_RECT { rect: rect(x0, y + 1.0, largeur, hauteur_ligne() - 2.0), radiusX: RAYON_PETIT, radiusY: RAYON_PETIT }, &c.pinceau);
         }
         let cy = y + hauteur_ligne() / 2.0;
         // Chevron : vers le bas ouvert, vers la droite replié
@@ -2778,10 +3428,9 @@ impl Rendu {
         let f = &self.f;
         for (i, n) in m.niveaux.iter().enumerate() {
             let cadre = n.cadre();
-            // Ombre légère, puis la carte
-            self.couleur(c, &rgba(0, 0, 0, 0.35));
-            rt.FillRoundedRectangle(&D2D1_ROUNDED_RECT { rect: rect(cadre.left + 2.0, cadre.top + 4.0, cadre.right - cadre.left, cadre.bottom - cadre.top), radiusX: 10.0, radiusY: 10.0 }, &c.pinceau);
-            let arrondi = D2D1_ROUNDED_RECT { rect: cadre, radiusX: 10.0, radiusY: 10.0 };
+            // Ombre douce, puis la carte
+            self.ombre_flottante(c, cadre, RAYON_MOYEN, 14.0);
+            let arrondi = D2D1_ROUNDED_RECT { rect: cadre, radiusX: RAYON_MOYEN, radiusY: RAYON_MOYEN };
             self.couleur(c, &rgba(16, 16, 16, 0.98));
             rt.FillRoundedRectangle(&arrondi, &c.pinceau);
             self.trame_arrondie(c, &arrondi);
@@ -2808,7 +3457,7 @@ impl Rendu {
                         let survolee = n.icone == Some(j) && *possible;
                         if survolee {
                             self.couleur(c, &SURVOL_FORT);
-                            rt.FillRoundedRectangle(&D2D1_ROUNDED_RECT { rect: r, radiusX: 8.0, radiusY: 8.0 }, &c.pinceau);
+                            rt.FillRoundedRectangle(&D2D1_ROUNDED_RECT { rect: r, radiusX: RAYON_PETIT, radiusY: RAYON_PETIT }, &c.pinceau);
                         }
                         let couleur = if !possible { &BLANC_TRES_FAIBLE } else if survolee { &BLANC } else { &BLANC_DOUX };
                         self.couleur(c, couleur);
@@ -2823,7 +3472,7 @@ impl Rendu {
                 let allume = n.survol == Some(k) || ouvert == Some(k);
                 if allume {
                     self.couleur(c, &SURVOL);
-                    rt.FillRoundedRectangle(&D2D1_ROUNDED_RECT { rect: z, radiusX: 6.0, radiusY: 6.0 }, &c.pinceau);
+                    rt.FillRoundedRectangle(&D2D1_ROUNDED_RECT { rect: z, radiusX: RAYON_PETIT, radiusY: RAYON_PETIT }, &c.pinceau);
                 }
                 if l.coche {
                     self.couleur(c, &ACCENT);
@@ -2851,20 +3500,15 @@ impl Rendu {
     unsafe fn dessiner_barre(&self, c: &Cible2D, app: &App, vue: &Vue, double: bool) {
         let rt = &c.rt;
         // Les trois vues forment un seul groupe arrondi (maquette `.tgrp`), pas trois boutons séparés
-        let vues: Vec<&crate::barre::Place> = app.zones.barre.iter().filter(|p| matches!(p.outil, Outil::VueListe | Outil::VueGrille | Outil::VueColonnes | Outil::VueTailles | Outil::Double)).collect();
+        // Lot 4 de l'audit UX : chaque groupe (NOUVEAU, CONFORT / COMPACT, vues) a un seul cadre, une pilule de la hauteur d'un bouton
+        // (`cadre_groupe`), et son élément actif est un fond plein, sans contour, inscrit dans ce cadre (`Outil::forme`)
+        let vues: Vec<&crate::barre::Place> = app.zones.barre.iter().filter(|p| p.outil.est_vue()).collect();
         if let (Some(premier), Some(dernier)) = (vues.first(), vues.last()) {
-            let zone = rect(premier.zone.left - 4.0, premier.zone.top - 4.0, dernier.zone.right - premier.zone.left + 8.0, premier.zone.bottom - premier.zone.top + 8.0);
-            self.couleur(c, &PANNEAU);
-            rt.FillRoundedRectangle(&D2D1_ROUNDED_RECT { rect: zone, radiusX: 18.0, radiusY: 18.0 }, &c.pinceau);
-            self.couleur(c, &LIGNE);
-            rt.DrawRoundedRectangle(&D2D1_ROUNDED_RECT { rect: zone, radiusX: 18.0, radiusY: 18.0 }, &c.pinceau, 1.0, None);
+            let marge = crate::barre::GROUPE_MARGE;
+            self.cadre_groupe(c, rect(premier.zone.left - marge, premier.zone.top, dernier.zone.right - premier.zone.left + 2.0 * marge, premier.zone.bottom - premier.zone.top));
         }
         if let [Some(confort), Some(compact)] = app.zones.densite {
-            let cadre = rect(confort.left - 3.0, confort.top - 4.0, compact.right - confort.left + 6.0, compact.bottom - confort.top + 8.0);
-            self.couleur(c, &PANNEAU);
-            rt.FillRoundedRectangle(&D2D1_ROUNDED_RECT { rect: cadre, radiusX: 18.0, radiusY: 18.0 }, &c.pinceau);
-            self.couleur(c, &LIGNE);
-            rt.DrawRoundedRectangle(&D2D1_ROUNDED_RECT { rect: cadre, radiusX: 18.0, radiusY: 18.0 }, &c.pinceau, 1.0, None);
+            self.cadre_groupe(c, rect(confort.left - crate::barre::GROUPE_MARGE, confort.top, compact.right - confort.left + 2.0 * crate::barre::GROUPE_MARGE, compact.bottom - confort.top));
             for (k, r) in [confort, compact].into_iter().enumerate() {
                 let r = decaler(r, decalage_chrome(app, vue, Cible::Densite(k)));
                 let actif = (k == 0 && crate::reglages::lignes_confort()) || (k == 1 && !crate::reglages::lignes_confort());
@@ -2872,7 +3516,10 @@ impl Rendu {
                 let fondu = self.survol_k(Cible::Densite(k));
                 if actif || fondu > 0.0 {
                     if actif { self.couleur(c, &SURVOL_FORT) } else { self.couleur_k(c, &SURVOL, fondu) }
-                    rt.FillRoundedRectangle(&D2D1_ROUNDED_RECT { rect: r, radiusX: 15.0, radiusY: 15.0 }, &c.pinceau);
+                    // Fond inscrit dans le cadre : même marge en haut qu'à gauche, rayon concentrique
+                    let m = crate::barre::GROUPE_MARGE;
+                    let fond = rect(r.left, r.top + m, r.right - r.left, r.bottom - r.top - 2.0 * m);
+                    rt.FillRoundedRectangle(&D2D1_ROUNDED_RECT { rect: fond, radiusX: rayon_pilule(&fond), radiusY: rayon_pilule(&fond) }, &c.pinceau);
                 }
                 self.couleur(c, if actif || survole { &BLANC } else { &BLANC_DOUX });
                 self.texte(c, &self.f.petit_centre, if k == 0 { "CONFORT" } else { "COMPACT" }, r);
@@ -2889,12 +3536,15 @@ impl Rendu {
             // Fondu du fond de survol (160 ms) ; un menu de la barre ouvert garde l'outil allumé
             let fondu = if !possible { 0.0 } else if app.menu_barre == Some(o) { 1.0 } else { self.survol_k(Cible::Outil(o)) };
             if o == Outil::Nouveau {
-                // Pilule « + NOUVEAU », contour discret, comme la maquette
+                // Pilule « + NOUVEAU » : le même cadre que les deux autres groupes (fond du panneau, contour de ligne), le survol
+                // s'ajoute au fond au lieu de le remplacer
                 let arrondi = D2D1_ROUNDED_RECT { rect: r, radiusX: o.rayon_coin(), radiusY: o.rayon_coin() };
-                self.couleur(c, &D2D1_COLOR_F { a: mouvement::melanger(SURVOL.a, SURVOL_FORT.a, fondu), ..SURVOL });
-                rt.FillRoundedRectangle(&arrondi, &c.pinceau);
-                self.couleur(c, &BLANC_TRES_FAIBLE);
-                rt.DrawRoundedRectangle(&arrondi, &c.pinceau, 1.0, None);
+                self.cadre_groupe(c, r);
+                if fondu > 0.0 {
+                    self.couleur(c, &D2D1_COLOR_F { a: SURVOL_FORT.a * fondu, ..SURVOL_FORT });
+                    rt.FillRoundedRectangle(&arrondi, &c.pinceau);
+                }
+                self.reflet_sous_contenu(c, vue, Cible::Outil(o));
                 self.couleur(c, if survole { &BLANC } else { &BLANC_DOUX });
                 self.points(c, r.left + 18.0, (r.top + r.bottom) / 2.0, 5.0, 1.6, o.motif());
                 self.couleur(c, &BLANC);
@@ -2907,7 +3557,8 @@ impl Rendu {
                 self.couleur(c, &LIGNE);
                 rt.FillRectangle(&rect(r.left - 9.0, r.top + 9.0, 1.0, r.bottom - r.top - 18.0), &c.pinceau);
             }
-            let arrondi = D2D1_ROUNDED_RECT { rect: r, radiusX: o.rayon_coin(), radiusY: o.rayon_coin() };
+            let (fond, rayon_fond) = o.forme(r);
+            let arrondi = D2D1_ROUNDED_RECT { rect: fond, radiusX: rayon_fond, radiusY: rayon_fond };
             // Un outil de vue allumé n'a pas de fond propre quand le fond glissant le porte
             let fond_allume = allume && !(glisse && Self::OUTILS_VUE.contains(&o));
             if fondu > 0.0 || fond_allume {
@@ -2924,6 +3575,7 @@ impl Rendu {
             } else {
                 &BLANC_DOUX
             };
+            self.reflet_sous_contenu(c, vue, Cible::Outil(o));
             let cy = (r.top + r.bottom) / 2.0;
             let menu = o.a_menu() && o != Outil::Plus;
             let cx = if menu { r.left + 15.0 } else { (r.left + r.right) / 2.0 };
@@ -2961,10 +3613,20 @@ impl Rendu {
         let bornes: Vec<(f32, f32)> = zones.iter().map(|z| (z.left, z.right)).collect();
         let Some((gauche, droite)) = mouvement::interpoler(&bornes, m.vue.valeur(t)) else { return false };
         let dy = decalage_chrome(app, vue, Cible::Outil(Self::OUTILS_VUE[k]));
-        let z = decaler(zones[k], dy);
-        self.couleur(c, &SURVOL);
-        c.rt.FillRoundedRectangle(&D2D1_ROUNDED_RECT { rect: D2D_RECT_F { left: gauche, right: droite, ..z }, radiusX: 10.0, radiusY: 10.0 }, &c.pinceau);
+        let (z, rayon) = Self::OUTILS_VUE[k].forme(decaler(zones[k], dy));
+        self.couleur(c, &SURVOL_FORT);
+        c.rt.FillRoundedRectangle(&D2D1_ROUNDED_RECT { rect: D2D_RECT_F { left: gauche, right: droite, ..z }, radiusX: rayon, radiusY: rayon }, &c.pinceau);
         true
+    }
+
+    /// Cadre commun des groupes de la barre : pilule au fond du panneau et au contour de ligne. Un seul trait par groupe ; l'élément
+    /// actif s'y inscrit par un fond plein, sans second contour.
+    unsafe fn cadre_groupe(&self, c: &Cible2D, zone: D2D_RECT_F) {
+        let forme = D2D1_ROUNDED_RECT { rect: zone, radiusX: rayon_pilule(&zone), radiusY: rayon_pilule(&zone) };
+        self.couleur(c, &PANNEAU);
+        c.rt.FillRoundedRectangle(&forme, &c.pinceau);
+        self.couleur(c, &LIGNE);
+        c.rt.DrawRoundedRectangle(&forme, &c.pinceau, 1.0, None);
     }
 
     /// Bulle sous le bouton survolé de la barre : nom et raccourci
@@ -2980,9 +3642,10 @@ impl Rendu {
         let w = self.largeur_aide(&segmenter_aide(texte)) + 24.0;
         let x = ((p.zone.left + p.zone.right) / 2.0 - w / 2.0).clamp(largeur_volet() + 8.0, (l - w - 8.0).max(largeur_volet() + 8.0));
         let r = rect(x, p.zone.bottom + 6.0, w, 26.0);
-        let arrondi = D2D1_ROUNDED_RECT { rect: r, radiusX: 8.0, radiusY: 8.0 };
+        let arrondi = D2D1_ROUNDED_RECT { rect: r, radiusX: RAYON_PETIT, radiusY: RAYON_PETIT };
         let d = mouvement::Decalage { dx: 0.0, dy, echelle: 1.0, opacite };
         self.avec_decalage(c, &d, ((r.left + r.right) / 2.0, (r.top + r.bottom) / 2.0), rect(r.left - 12.0, r.top - 12.0, w + 24.0, 50.0), || {
+            self.ombre_flottante(c, r, RAYON_PETIT, 8.0);
             self.couleur(c, &CHAMP_FOND);
             c.rt.FillRoundedRectangle(&arrondi, &c.pinceau);
             self.couleur(c, &BLANC_TRES_FAIBLE);
@@ -3006,9 +3669,10 @@ impl Rendu {
         let w = self.largeur_aide(&segmenter_aide(&texte)) + 24.0;
         let x = ((z.left + z.right) / 2.0 - w / 2.0).clamp(largeur_volet() + 8.0, (l - w - 8.0).max(largeur_volet() + 8.0));
         let r = rect(x, z.bottom + 6.0, w, 26.0);
-        let arrondi = D2D1_ROUNDED_RECT { rect: r, radiusX: 8.0, radiusY: 8.0 };
+        let arrondi = D2D1_ROUNDED_RECT { rect: r, radiusX: RAYON_PETIT, radiusY: RAYON_PETIT };
         let d = mouvement::Decalage { dx: 0.0, dy, echelle: 1.0, opacite };
         self.avec_decalage(c, &d, ((r.left + r.right) / 2.0, (r.top + r.bottom) / 2.0), rect(r.left - 12.0, r.top - 12.0, w + 24.0, 50.0), || {
+            self.ombre_flottante(c, r, RAYON_PETIT, 8.0);
             self.couleur(c, &CHAMP_FOND);
             c.rt.FillRoundedRectangle(&arrondi, &c.pinceau);
             self.couleur(c, &BLANC_TRES_FAIBLE);
@@ -3040,8 +3704,9 @@ impl Rendu {
             let fondu = if possible { self.survol_k(quoi) } else { 0.0 };
             if fondu > 0.0 {
                 self.couleur_k(c, &SURVOL, fondu);
-                rt.FillRoundedRectangle(&D2D1_ROUNDED_RECT { rect: r, radiusX: 8.0, radiusY: 8.0 }, &c.pinceau);
+                rt.FillRoundedRectangle(&D2D1_ROUNDED_RECT { rect: r, radiusX: RAYON_PETIT, radiusY: RAYON_PETIT }, &c.pinceau);
             }
+            self.reflet_sous_contenu(c, vue, quoi);
             self.couleur(c, if !possible { &BLANC_TRES_FAIBLE } else if app.survol == quoi { &BLANC } else { &BLANC_DOUX });
             let motif: &[(i32, i32)] = match quoi {
                 Cible::Precedent => &[(1, -2), (0, -1), (-1, 0), (0, 1), (1, 2)],
@@ -3056,7 +3721,7 @@ impl Rendu {
             // Le champ s'arrête avant le bouton « >_ » : sinon « ECHAP » passait dessus (audit, capture 11b)
             let reserve = if app.emplacement == Emplacement::Reglages { 0.0 } else { TERMINAL_RESERVE };
             let r = rect(chemin_x() - 10.0, nav_y() + 3.0, (l - MARGE_LISTE - reserve - chemin_x() + 10.0).max(80.0), nav_h() - 6.0);
-            let arrondi = D2D1_ROUNDED_RECT { rect: r, radiusX: 8.0, radiusY: 8.0 };
+            let arrondi = D2D1_ROUNDED_RECT { rect: r, radiusX: RAYON_PETIT, radiusY: RAYON_PETIT };
             self.couleur(c, &CHAMP_FOND);
             rt.FillRoundedRectangle(&arrondi, &c.pinceau);
             self.couleur(c, &ACCENT);
@@ -3072,7 +3737,7 @@ impl Rendu {
             // Vide du chemin survolé : il se clique pour taper un chemin
             let fin = app.zones.segments.last().map_or(chemin_x(), |s| s.0.right);
             self.couleur(c, &SURVOL);
-            rt.FillRoundedRectangle(&D2D1_ROUNDED_RECT { rect: rect(chemin_x() - 10.0, nav_y() + 3.0, (l - MARGE_LISTE - chemin_x() + 10.0).max(80.0), nav_h() - 6.0), radiusX: 8.0, radiusY: 8.0 }, &c.pinceau);
+            rt.FillRoundedRectangle(&D2D1_ROUNDED_RECT { rect: rect(chemin_x() - 10.0, nav_y() + 3.0, (l - MARGE_LISTE - chemin_x() + 10.0).max(80.0), nav_h() - 6.0), radiusX: RAYON_PETIT, radiusY: RAYON_PETIT }, &c.pinceau);
             self.couleur(c, &BLANC_FAIBLE);
             self.texte(c, &f.petit, "CLIC : TAPER UN CHEMIN", rect(fin + 24.0, nav_y(), (l - MARGE_LISTE - fin - 30.0).max(0.0), nav_h()));
         }
@@ -3083,7 +3748,7 @@ impl Rendu {
             // `.crumb:hover` : fond `--hov`, rayon 10 ; dernier segment `--i1`, parents `--i2`
             if survole {
                 self.couleur(c, &SURVOL);
-                rt.FillRoundedRectangle(&D2D1_ROUNDED_RECT { rect: rect(r.left, r.top + 3.0, r.right - r.left, nav_h() - 6.0), radiusX: 10.0, radiusY: 10.0 }, &c.pinceau);
+                rt.FillRoundedRectangle(&D2D1_ROUNDED_RECT { rect: rect(r.left, r.top + 3.0, r.right - r.left, nav_h() - 6.0), radiusX: RAYON_MOYEN, radiusY: RAYON_MOYEN }, &c.pinceau);
             }
             // Groupe ouvert (lot 14, `.gc`) : un point de la couleur choisie pour le groupe devant son nom
             let point = match &app.emplacement {
@@ -3099,8 +3764,9 @@ impl Rendu {
             // +2 DIP : la mesure et le dessin arrondissent chacun de leur côté, sans marge « ÉTÉ CAFÉ » finirait en « ÉTÉ CAF… »
             self.texte_espace(c, &f.chemin, texte, rect(r.left + CRUMB_MARGE + decal, r.top, r.right - r.left - 2.0 * CRUMB_MARGE + 2.0 - decal, nav_h()));
             if !dernier {
-                self.couleur(c, &BLANC_TRES_FAIBLE);
-                self.texte_espace(c, &f.chemin, "›", rect(r.right + CRUMB_ECART, r.top, 40.0, nav_h()));
+                // Lot 7 : séparateur en encre faible (et non « très faible », presque invisible sur le fond noir)
+                self.couleur(c, &BLANC_FAIBLE);
+                self.texte_espace(c, &f.chemin, "›",rect(r.right + CRUMB_ECART, r.top, 40.0, nav_h()));
             }
         }
 
@@ -3110,7 +3776,7 @@ impl Rendu {
         if let Some((r, m, opacite)) = self.zone_filtre(app, l, rang) {
             let d = mouvement::Decalage { dx: 0.0, dy: 0.0, echelle: 1.0, opacite };
             self.avec_decalage(c, &d, ((r.left + r.right) / 2.0, (r.top + r.bottom) / 2.0), rect(r.left - 4.0, r.top - 4.0, r.right - r.left + 8.0, r.bottom - r.top + 8.0), || {
-                let arrondi = D2D1_ROUNDED_RECT { rect: r, radiusX: 8.0, radiusY: 8.0 };
+                let arrondi = D2D1_ROUNDED_RECT { rect: r, radiusX: RAYON_PETIT, radiusY: RAYON_PETIT };
                 self.couleur(c, &CHAMP_FOND);
                 rt.FillRoundedRectangle(&arrondi, &c.pinceau);
                 // Bord rouge dès qu'il y a un filtre ; ouvert à vide, le bord discret `--s2` de la maquette
@@ -3135,10 +3801,11 @@ impl Rendu {
                     let fondu = self.survol_k(Cible::Puce(i));
                     if fondu > 0.0 {
                         self.couleur_k(c, &SURVOL, fondu);
-                        rt.FillRoundedRectangle(&D2D1_ROUNDED_RECT { rect: *p, radiusX: 8.0, radiusY: 8.0 }, &c.pinceau);
+                        rt.FillRoundedRectangle(&D2D1_ROUNDED_RECT { rect: *p, radiusX: RAYON_PETIT, radiusY: RAYON_PETIT }, &c.pinceau);
                     }
                     self.couleur(c, &BLANC_TRES_FAIBLE);
-                    rt.DrawRoundedRectangle(&D2D1_ROUNDED_RECT { rect: rect(p.left + 0.5, p.top + 0.5, p.right - p.left - 1.0, p.bottom - p.top - 1.0), radiusX: 8.0, radiusY: 8.0 }, &c.pinceau, 1.0, None);
+                    rt.DrawRoundedRectangle(&D2D1_ROUNDED_RECT { rect: rect(p.left + 0.5, p.top + 0.5, p.right - p.left - 1.0, p.bottom - p.top - 1.0), radiusX: RAYON_PETIT, radiusY: RAYON_PETIT }, &c.pinceau, 1.0, None);
+                    self.reflet_sous_contenu(c, vue, Cible::Puce(i));
                     self.couleur(c, &BLANC_DOUX);
                     self.texte(c, &f.petit_centre, jeton, *p);
                 }
@@ -3155,7 +3822,7 @@ impl Rendu {
             let wf = self.largeur_filtre(app, l, rang);
             let place_filtre = if wf > 0.0 { wf + 16.0 } else { 0.0 };
             let r = rect(l - MARGE_LISTE - TERMINAL_RESERVE - place_filtre - wb, nav_y() + 9.0, wb, nav_h() - 18.0);
-            let arrondi = D2D1_ROUNDED_RECT { rect: r, radiusX: 11.0, radiusY: 11.0 };
+            let arrondi = D2D1_ROUNDED_RECT { rect: r, radiusX: RAYON_MOYEN, radiusY: RAYON_MOYEN };
             self.couleur(c, &BLANC_TRES_FAIBLE);
             rt.DrawRoundedRectangle(&arrondi, &c.pinceau, 1.0, None);
             let modifie = app.git.as_ref().is_some_and(|g| g.etats.values().any(|&e| e != '?'));
@@ -3171,23 +3838,35 @@ impl Rendu {
         if app.emplacement != Emplacement::Reglages {
             let r = decaler(zone_terminal(l), decalage_chrome(app, vue, Cible::Terminal));
             let possible = app.dossier_ici().is_some();
-            let survole = app.survol == Cible::Terminal;
-            let ouvert = vue.terminal_visible;
-            if (survole && possible) || ouvert {
+            let ouvert = vue.terminal.is_some();
+            // Traitement des boutons Précédent / Suivant / Parent (lot 6, D-6) : pas de contour au repos, fond qui se fond au survol ;
+            // le contour orange ne reste que pour dire « panneau ouvert »
+            if ouvert {
                 self.couleur(c, &SURVOL);
-                rt.FillRoundedRectangle(&D2D1_ROUNDED_RECT { rect: r, radiusX: 8.0, radiusY: 8.0 }, &c.pinceau);
+                rt.FillRoundedRectangle(&D2D1_ROUNDED_RECT { rect: r, radiusX: RAYON_PETIT, radiusY: RAYON_PETIT }, &c.pinceau);
+                self.couleur(c, &ACCENT_BORD);
+                rt.DrawRoundedRectangle(&D2D1_ROUNDED_RECT { rect: r, radiusX: RAYON_PETIT, radiusY: RAYON_PETIT }, &c.pinceau, 1.0, None);
+            } else if possible {
+                let fondu = self.survol_k(Cible::Terminal);
+                if fondu > 0.0 {
+                    self.couleur_k(c, &SURVOL, fondu);
+                    rt.FillRoundedRectangle(&D2D1_ROUNDED_RECT { rect: r, radiusX: RAYON_PETIT, radiusY: RAYON_PETIT }, &c.pinceau);
+                }
             }
-            self.couleur(c, if ouvert { &ACCENT_BORD } else { &LIGNE });
-            rt.DrawRoundedRectangle(&D2D1_ROUNDED_RECT { rect: r, radiusX: 8.0, radiusY: 8.0 }, &c.pinceau, 1.0, None);
-            self.couleur(c, if !possible { &BLANC_TRES_FAIBLE } else if survole || ouvert { &BLANC } else { &BLANC_DOUX });
-            self.texte(c, &f.petit_mono, ">_", rect(r.left, r.top, r.right - r.left, r.bottom - r.top));
+            self.reflet_sous_contenu(c, vue, Cible::Terminal);
+            // Blanc franc au repos (17/11/2026, retour de l'auteur : « difficile à voir ») ; seul « indisponible » reste éteint
+            self.couleur(c, if !possible { &BLANC_FAIBLE } else { &BLANC });
+            // Le glyphe est centré sur sa largeur mesurée : le format mono est aligné à gauche, il collait au bord (constat du lot 4)
+            let gauche = r.left + ((r.right - r.left - self.mesurer(">_", &f.petit_mono)) / 2.0).max(0.0);
+            self.texte(c, &f.petit_mono, ">_", rect(gauche, r.top, r.right - gauche, r.bottom - r.top));
         }
 
         // ── Note du dossier (O8), à gauche de la branche : point rouge et texte ──
         if let (Some(r), Some(n)) = (app.zones.note, app.note.as_deref()) {
-            let arrondi = D2D1_ROUNDED_RECT { rect: r, radiusX: 11.0, radiusY: 11.0 };
+            let arrondi = D2D1_ROUNDED_RECT { rect: r, radiusX: RAYON_MOYEN, radiusY: RAYON_MOYEN };
             self.couleur(c, if app.survol == Cible::Note { &SURVOL } else { &CHAMP_FOND });
             rt.FillRoundedRectangle(&arrondi, &c.pinceau);
+            self.reflet_sous_contenu(c, vue, Cible::Note);
             self.couleur(c, &ACCENT);
             rt.FillEllipse(&ellipse(r.left + 14.0, (r.top + r.bottom) / 2.0, 3.0), &c.pinceau);
             self.couleur(c, &BLANC);
@@ -3200,17 +3879,21 @@ impl Rendu {
             match etat {
                 Some((true, e)) => {
                     let d = mouvement::Decalage { dx: 0.0, dy: 0.0, echelle: e.echelle, opacite: e.opacite };
-                    self.avec_decalage(c, &d, (l / 2.0, (HAUTEUR_TITRE + h - statut_h()) / 2.0), rect(0.0, HAUTEUR_TITRE, l, h - HAUTEUR_TITRE), || self.dessiner_page(c, app, l, h, p, premier));
+                    self.avec_decalage(c, &d, (l / 2.0, (HAUTEUR_TITRE + h - statut_h()) / 2.0), rect(0.0, HAUTEUR_TITRE, l, h - HAUTEUR_TITRE), || self.dessiner_page(c, app, l, h, p, premier, vue));
                 }
-                _ => self.dessiner_page(c, app, l, h, p, premier),
+                _ => self.dessiner_page(c, app, l, h, p, premier, vue),
             }
+            return;
+        }
+        if let Some(ve) = vue.espace.as_ref().filter(|_| focus && app.emplacement == Emplacement::Espace) {
+            self.dessiner_espace(c, app, l, h, ve, vue);
             return;
         }
 
         self.dessiner_barre(c, app, vue, vue.double);
 
         match app.affichage {
-            Affichage::Liste => self.dessiner_liste(c, app, l, !vue.double || focus, vue.focus_clavier),
+            Affichage::Liste => self.dessiner_liste(c, app, l, !vue.double || focus, vue.focus_clavier, vue),
             Affichage::Grille => self.dessiner_grille(c, app, l, vue.focus_clavier && focus),
             Affichage::Colonnes => self.dessiner_miller(c, app, l),
         }
@@ -3427,7 +4110,7 @@ impl Rendu {
         }
     }
 
-    unsafe fn dessiner_liste(&self, c: &Cible2D, app: &App, l: f32, actif: bool, focus_clavier: bool) {
+    unsafe fn dessiner_liste(&self, c: &Cible2D, app: &App, l: f32, actif: bool, focus_clavier: bool, vue: &Vue) {
         let rt = &c.rt;
         let f = &self.f;
         let taille_max = if app.tailles { app.taille_max() } else { 0 };
@@ -3461,10 +4144,18 @@ impl Rendu {
             };
             let droite = col == Colonne::Taille;
             let zone = if col == Colonne::Nom { rect(x + 28.0, entete_y(), w - 36.0, entete_h()) } else { rect(x, entete_y(), w - 8.0, entete_h()) };
-            self.texte(c, if droite { &f.petit_droite } else { &f.petit }, nom, zone);
+            // Lot 7 (D-3) : un en-tête est un repère fixe, donc Doto ; place mesurée par DirectWrite (point de tri compris, 20 DIP),
+            // et repli sur le Segoe 12 d'avant si le mot ne tient pas (fenêtre ou colonne étroite, texte agrandi) : jamais coupé
+            let doto = self.mesurer_espace(nom, &f.volet_nom) + 20.0 <= zone.right - zone.left;
+            let (fmt, fmt_d) = if doto { (&f.volet_nom, &f.repere_droite) } else { (&f.petit, &f.petit_droite) };
+            if doto {
+                self.texte_espace(c, if droite { fmt_d } else { fmt }, nom, zone);
+            } else {
+                self.texte(c, if droite { fmt_d } else { fmt }, nom, zone);
+            }
             if actif {
                 // Point rouge : plein = croissant, anneau = décroissant
-                let tw = self.mesurer(nom, &f.petit);
+                let tw = if doto { self.mesurer_espace(nom, fmt) } else { self.mesurer(nom, fmt) };
                 let px = if droite { zone.right - tw - 10.0 } else { zone.left + tw + 9.0 };
                 self.couleur(c, &ACCENT);
                 let p = ellipse(px, entete_y() + entete_h() / 2.0, 3.0);
@@ -3560,7 +4251,7 @@ impl Rendu {
 
             let fond = rect(x0, y + 1.0, largeur_fond, hauteur_ligne() - 2.0);
             let choisie = app.marques.contains(&i);
-            let arrondi = D2D1_ROUNDED_RECT { rect: fond, radiusX: 12.0, radiusY: 12.0 };
+            let arrondi = D2D1_ROUNDED_RECT { rect: fond, radiusX: RAYON_MOYEN, radiusY: RAYON_MOYEN };
             if choisie {
                 // Sélection de la maquette v6 : fond neutre et trait d'accent à gauche ; panneau sans focus : estompé
                 if actif { self.couleur_ou(c, &SELECTION, &SELECTION_CLAIR); } else { self.couleur(c, &SELECTION_TERNE); }
@@ -3694,7 +4385,7 @@ impl Rendu {
                         let pastille = rect(xg, y + 10.0, wg, hauteur_ligne() - 20.0);
                         let fond_pastille = if choisie { rgba(0, 0, 0, 0.18) } else { SURVOL };
                         self.couleur(c, &fond_pastille);
-                        rt.FillRoundedRectangle(&D2D1_ROUNDED_RECT { rect: pastille, radiusX: 9.0, radiusY: 9.0 }, &c.pinceau);
+                        rt.FillRoundedRectangle(&D2D1_ROUNDED_RECT { rect: pastille, radiusX: rayon_pilule(&pastille), radiusY: rayon_pilule(&pastille) }, &c.pinceau);
                         self.couleur(c, &if choisie { BLANC } else { Self::couleur_groupe(app.groupes.iter().find(|x| x.nom == *g).map_or('r', |x| x.couleur)) });
                         rt.FillEllipse(&ellipse(xg + 9.0, y + hauteur_ligne() / 2.0, 2.6), &c.pinceau);
                         self.couleur(c, if choisie { &BLANC } else { &BLANC_DOUX });
@@ -3707,7 +4398,7 @@ impl Rendu {
                         let wg = self.mesurer(t, &f.petit) + 16.0;
                         if xg + wg <= zone_nom.right {
                             let pastille = rect(xg, y + 9.0, wg, hauteur_ligne() - 18.0);
-                            let arrondi = D2D1_ROUNDED_RECT { rect: pastille, radiusX: 9.0, radiusY: 9.0 };
+                            let arrondi = D2D1_ROUNDED_RECT { rect: pastille, radiusX: rayon_pilule(&pastille), radiusY: rayon_pilule(&pastille) };
                             self.couleur(c, if choisie { &BLANC } else { &ACCENT });
                             rt.DrawRoundedRectangle(&arrondi, &c.pinceau, 1.0, None);
                             self.texte(c, &f.petit, t, rect(xg + 8.0, y, wg - 10.0, hauteur_ligne()));
@@ -3724,7 +4415,7 @@ impl Rendu {
                         }
                         if xg + wg <= zone_nom.right {
                             let pastille = rect(xg, y + 9.0, wg, hauteur_ligne() - 18.0);
-                            let arrondi = D2D1_ROUNDED_RECT { rect: pastille, radiusX: 9.0, radiusY: 9.0 };
+                            let arrondi = D2D1_ROUNDED_RECT { rect: pastille, radiusX: rayon_pilule(&pastille), radiusY: rayon_pilule(&pastille) };
                             let fort = ecart.a_copier();
                             self.couleur(c, if choisie { &BLANC } else if fort { &ACCENT } else { &BLANC_DOUX });
                             rt.DrawRoundedRectangle(&arrondi, &c.pinceau, 1.0, None);
@@ -3838,7 +4529,7 @@ impl Rendu {
             self.flip_retirer(c, garde);
         }
         if app.emplacement == Emplacement::CePC {
-            self.dessiner_carte(c, app, l, haut_carte(app));
+            self.dessiner_carte(c, app, l, haut_carte(app), vue);
         }
         rt.PopAxisAlignedClip();
 
@@ -3858,7 +4549,7 @@ impl Rendu {
         let (e, choisie, h) = (&ligne.entree, ligne.choisie, hauteur_ligne());
         if choisie {
             if actif { self.couleur_ou(c, &SELECTION, &SELECTION_CLAIR); } else { self.couleur(c, &SELECTION_TERNE); }
-            rt.FillRoundedRectangle(&D2D1_ROUNDED_RECT { rect: rect(x0, y + 1.0, largeur_fond, h - 2.0), radiusX: 12.0, radiusY: 12.0 }, &c.pinceau);
+            rt.FillRoundedRectangle(&D2D1_ROUNDED_RECT { rect: rect(x0, y + 1.0, largeur_fond, h - 2.0), radiusX: RAYON_MOYEN, radiusY: RAYON_MOYEN }, &c.pinceau);
             self.couleur(c, if actif { &ACCENT } else { &BLANC_FAIBLE });
             rt.FillRoundedRectangle(&D2D1_ROUNDED_RECT { rect: rect(x0 + 2.0, y + 12.0, 3.0, (h - 24.0).max(6.0)), radiusX: 1.5, radiusY: 1.5 }, &c.pinceau);
         }
@@ -3995,19 +4686,21 @@ impl Rendu {
     }
 
     /// Sections CLOUD et SERVEURS de Ce PC (maquette `renderPC`)
-    unsafe fn dessiner_stockages_ce_pc(&self, c: &Cible2D, app: &App, st: &StockagesCePc) {
+    unsafe fn dessiner_stockages_ce_pc(&self, c: &Cible2D, app: &App, st: &StockagesCePc, vue: &Vue) {
         let (f, rt) = (&self.f, &c.rt);
         let x = largeur_volet() + MARGE_LISTE + 4.0;
         for &(titre, y) in &st.titres {
             self.couleur(c, &BLANC_DOUX);
-            self.texte(c, &f.petit, titre, rect(x, y, 400.0, 18.0));
+            self.texte_espace(c, &f.volet_nom, &titre.to_uppercase(), rect(x, y, 400.0, 20.0));
         }
         for &(r, quoi) in &st.lignes {
             let survol = app.survol == quoi;
             if survol {
                 self.couleur(c, &SURVOL);
-                rt.FillRoundedRectangle(&D2D1_ROUNDED_RECT { rect: r, radiusX: 10.0, radiusY: 10.0 }, &c.pinceau);
+                let rayon = rayon_cible(quoi).unwrap_or(RAYON_MOYEN);
+                rt.FillRoundedRectangle(&D2D1_ROUNDED_RECT { rect: r, radiusX: rayon, radiusY: rayon }, &c.pinceau);
             }
+            self.reflet_sous_contenu(c, vue, quoi);
             let h = r.bottom - r.top;
             let lieu = match quoi {
                 Cible::StockageCePc(i) => app.nuages.iter().chain(&app.serveurs).nth(i),
@@ -4016,7 +4709,14 @@ impl Rendu {
             let Some(lieu) = lieu else {
                 // « + Ajouter un stockage » : centré, atténué
                 self.couleur(c, if survol { &BLANC } else { &BLANC_DOUX });
-                self.texte(c, &f.petit_centre, "+ AJOUTER UN STOCKAGE", r);
+                let texte = match quoi {
+                    Cible::OuvrirEspace => "ESPACE DISQUE : OÙ EST PASSÉE LA PLACE".to_string(),
+                    Cible::OuvrirNettoyage => crate::espace::instantane::resume()
+                        .map(|(i, p)| crate::espace::instantane::libelle_carte(&i, p.as_ref(), crate::systeme::taille))
+                        .unwrap_or_default(),
+                    _ => "+ AJOUTER UN STOCKAGE".to_string(),
+                };
+                self.texte(c, &f.petit_centre, &texte, r);
                 continue;
             };
             self.icone(c, lieu.icone, r.left + 22.0, r.top + h / 2.0, false, if survol { 1.0 } else { 0.7 });
@@ -4025,28 +4725,35 @@ impl Rendu {
                 None => r.right - 12.0,
             };
             self.couleur(c, &BLANC);
-            self.texte_espace(c, &f.volet_nom, &lieu.nom.to_uppercase(), rect(r.left + 46.0, r.top, (fin_nom - (r.left + 46.0)).max(0.0), h));
+            self.texte(c, &f.volet, &crate::dossier::casse_phrase(&lieu.nom), rect(r.left + 46.0, r.top, (fin_nom - (r.left + 46.0)).max(0.0), h));
         }
     }
 
+    /// Géométrie de la Corbeille avec la largeur réelle de ses textes (mesure DirectWrite, même format que le dessin)
+    fn geometrie_corbeille(&self, bx: f32, by: f32, e: &crate::corbeille::Etat) -> GeometrieCorbeille {
+        let largeur = lignes_corbeille(e).iter().map(|t| self.mesurer(t, &self.f.petit)).fold(0.0_f32, f32::max);
+        geometrie_corbeille(bx, by, largeur)
+    }
+
     /// Corbeille Glyph (O7) : 100 points, allumés selon la place qu'elle occupe ; vidée, ils se dissolvent
-    unsafe fn dessiner_corbeille(&self, c: &Cible2D, app: &App, (bx, by): (f32, f32)) {
-        const PAS: f32 = 12.0;
+    unsafe fn dessiner_corbeille(&self, c: &Cible2D, app: &App, (bx, by): (f32, f32), vue: &Vue) {
+        const PAS: f32 = MATRICE_PAS;
         let Some(e) = crate::corbeille::etat() else { return };
         let f = &self.f;
+        let geo = self.geometrie_corbeille(bx, by, &e);
         let survol = app.survol == Cible::Corbeille;
         if survol {
-            if let Some(z) = app.zones.corbeille {
-                self.couleur(c, &SURVOL);
-                c.rt.FillRoundedRectangle(&D2D1_ROUNDED_RECT { rect: z, radiusX: 10.0, radiusY: 10.0 }, &c.pinceau);
-            }
+            self.couleur(c, &SURVOL);
+            let rayon = rayon_cible(Cible::Corbeille).unwrap_or(RAYON_MOYEN);
+            c.rt.FillRoundedRectangle(&D2D1_ROUNDED_RECT { rect: geo.carte, radiusX: rayon, radiusY: rayon }, &c.pinceau);
         }
+        self.reflet_sous_contenu(c, vue, Cible::Corbeille);
         self.couleur(c, if survol { &BLANC } else { &BLANC_DOUX });
-        self.texte(c, &f.petit, "CORBEILLE", rect(bx, by, CARTE_BLOC_L - 20.0, 18.0));
+        self.texte(c, &f.petit, "CORBEILLE", rect(bx, by, geo.texte_x - bx - CORBEILLE_ECART_TEXTE, CORBEILLE_LIGNE_H));
         let allumes = crate::corbeille::points(&e);
         // Dissolution : les points allumés avant le vidage s'éteignent un à un, dans le désordre
         let vidage = app.vidage.map(|(t, avant)| (avant, (t.elapsed().as_secs_f32() / 1.2).min(1.0)));
-        let (gx, gy) = (bx + 6.0, by + 32.0);
+        let (gx, gy) = (bx + MATRICE_DX, by + MATRICE_DY);
         for n in 0..100usize {
             let (px, py) = (gx + (n % 10) as f32 * PAS, gy + (n / 10) as f32 * PAS);
             let (allume, alpha) = match vidage {
@@ -4060,22 +4767,16 @@ impl Rendu {
                 let dernier = vidage.map_or(n + 1 == allumes, |(avant, _)| n + 1 == avant);
                 let col = if dernier { ACCENT } else { BLANC };
                 self.couleur(c, &D2D1_COLOR_F { a: col.a * alpha, ..col });
-                c.rt.FillEllipse(&ellipse(px, py, 4.2), &c.pinceau);
+                c.rt.FillEllipse(&ellipse(px, py, MATRICE_RAYON_POINT), &c.pinceau);
             } else {
                 self.couleur(c, &BLANC_TRES_FAIBLE);
                 c.rt.DrawEllipse(&ellipse(px, py, 3.6), &c.pinceau, 1.0, None);
             }
         }
-        let lx = gx + 10.0 * PAS + 8.0;
-        let lignes = [
-            if e.elements == 0 { "VIDE".to_string() } else { format!("{} · {} ELEMENT{}", systeme::taille(e.octets), e.elements, if e.elements > 1 { "S" } else { "" }) },
-            if e.capacite > 0 { format!("RESERVE {}", systeme::taille(e.capacite)) } else { String::new() },
-            "CLIC : OUVRIR".to_string(),
-            "PALETTE : VIDER".to_string(),
-        ];
-        for (k, t) in lignes.iter().filter(|t| !t.is_empty()).enumerate() {
+        // Colonne de texte : la largeur vient de la mesure, donc rien ne dépasse de la carte à droite
+        for (k, t) in lignes_corbeille(&e).iter().enumerate() {
             self.couleur(c, if k == 0 { &BLANC } else { &BLANC_DOUX });
-            self.texte(c, &f.petit, t, rect(lx + 8.0, by + 26.0 + k as f32 * 16.0, CARTE_BLOC_L - (lx - bx) - 18.0, 18.0));
+            self.texte(c, &f.petit, t, rect(geo.texte_x, by + 26.0 + k as f32 * CORBEILLE_PAS_LIGNES, geo.texte_l, CORBEILLE_LIGNE_H));
         }
     }
 
@@ -4089,7 +4790,7 @@ impl Rendu {
 
     /// Carte du disque (O6) : sous les disques de Ce PC, un carré de 10 × 10 points par disque,
     /// chaque point = 1 % du disque, teinté selon la famille de fichiers ; anneaux = place libre
-    unsafe fn dessiner_carte(&self, c: &Cible2D, app: &App, l: f32, y0: f32) {
+    unsafe fn dessiner_carte(&self, c: &Cible2D, app: &App, l: f32, y0: f32, vue: &Vue) {
         const TEINTES: [D2D1_COLOR_F; 7] = [ACCENT, BLANC, D2D1_COLOR_F { a: 0.5, ..ACCENT }, BLANC_DOUX, rgba(255, 255, 255, 0.32), rgba(255, 255, 255, 0.2), rgba(255, 255, 255, 0.1)];
         const PAS: f32 = 12.0;
         const BLOC_L: f32 = CARTE_BLOC_L;
@@ -4100,8 +4801,8 @@ impl Rendu {
             self.texte(c, &f.petit, "CARTE DU DISQUE : LECTURE DE L'INDEX…", rect(largeur_volet() + MARGE_LISTE + 4.0, y0 - 20.0, 400.0, 20.0));
         }
         let nb = disques_carte(app).count();
-        self.dessiner_corbeille(c, app, bloc_carte(l, y0, nb));
-        self.dessiner_stockages_ce_pc(c, app, &stockages_ce_pc(app, l, y0));
+        self.dessiner_corbeille(c, app, bloc_carte(l, y0, nb), vue);
+        self.dessiner_stockages_ce_pc(c, app, &stockages_ce_pc(app, l, y0), vue);
         let Some(carte) = carte else { return };
         for (k, (racine, libre, total)) in disques_carte(app).enumerate() {
             let (bx, by) = bloc_carte(l, y0, k);
@@ -4172,7 +4873,7 @@ impl Rendu {
                 self.couleur(c, &BLANC_DOUX);
                 // La taille reste entière à droite ; c'est le nom qui cède de la place, mot par mot (14 DIP : « SYSTEME, NON INDEXE »
                 // et sa taille ne tiennent plus ensemble dans la carte)
-                let place = BLOC_L - (lx - bx) - 26.0;
+                let place = place_legende(lx - bx);
                 let taille = systeme::taille(octets[fam]);
                 let nom = self.tronquer_aux_mots(nom, place - self.mesurer(&taille, &f.petit) - 8.0);
                 self.texte(c, &f.petit, &nom, rect(lx + 16.0, ly, place, 18.0));
@@ -4205,14 +4906,14 @@ impl Rendu {
             let (x, y) = place(i);
             let garde = self.flip_pousser(c, &decalages[i - debut], (x + cote / 2.0, y + (cote + GRILLE_NOM) / 2.0), rect(x - 8.0, y - 8.0, cote + 16.0, cote + GRILLE_NOM + 16.0), &couche_flip);
             let fond = rect(x, y, cote, cote + GRILLE_NOM);
-            let arrondi = D2D1_ROUNDED_RECT { rect: fond, radiusX: 12.0, radiusY: 12.0 };
+            let arrondi = D2D1_ROUNDED_RECT { rect: fond, radiusX: RAYON_MOYEN, radiusY: RAYON_MOYEN };
             let choisie = app.marques.contains(&i);
             if choisie {
                 self.couleur_ou(c, &SELECTION, &SELECTION_CLAIR);
                 rt.FillRoundedRectangle(&arrondi, &c.pinceau);
                 self.couleur(c, &BORDURE_SELECTION_GRILLE);
                 // Trait de 1 DIP rentré d'une demi-épaisseur : sur la première rangée, centré sur le bord il était rogné par le clip
-                rt.DrawRoundedRectangle(&D2D1_ROUNDED_RECT { rect: rect(x + 0.5, y + 0.5, cote - 1.0, cote + GRILLE_NOM - 1.0), radiusX: 11.5, radiusY: 11.5 }, &c.pinceau, 1.0, None);
+                rt.DrawRoundedRectangle(&D2D1_ROUNDED_RECT { rect: rect(x + 0.5, y + 0.5, cote - 1.0, cote + GRILLE_NOM - 1.0), radiusX: RAYON_MOYEN - 0.5, radiusY: RAYON_MOYEN - 0.5 }, &c.pinceau, 1.0, None);
             } else if app.survol == Cible::Ligne(i) {
                 self.couleur(c, &SURVOL);
                 rt.FillRoundedRectangle(&arrondi, &c.pinceau);
@@ -4287,7 +4988,7 @@ impl Rendu {
             let e = &ligne.entree;
             if ligne.choisie {
                 self.couleur_ou(c, &SELECTION, &SELECTION_CLAIR);
-                rt.FillRoundedRectangle(&D2D1_ROUNDED_RECT { rect: rect(x, y, r[2], r[3]), radiusX: 12.0, radiusY: 12.0 }, &c.pinceau);
+                rt.FillRoundedRectangle(&D2D1_ROUNDED_RECT { rect: rect(x, y, r[2], r[3]), radiusX: RAYON_MOYEN, radiusY: RAYON_MOYEN }, &c.pinceau);
             }
             let (cx, cy) = (x + r[2] / 2.0, y + r[2] / 2.0);
             match Self::glyphe_de(app, e) {
@@ -4318,7 +5019,7 @@ impl Rendu {
                 None => None,
             };
             let fond = rect(x, y + 1.0, w, hauteur_ligne() - 2.0);
-            let arrondi = D2D1_ROUNDED_RECT { rect: fond, radiusX: 7.0, radiusY: 7.0 };
+            let arrondi = D2D1_ROUNDED_RECT { rect: fond, radiusX: RAYON_PETIT, radiusY: RAYON_PETIT };
             let (marque, focus) = choisie(i);
             if marque {
                 self.couleur(c, &ACCENT_SELECTION);
@@ -4408,7 +5109,7 @@ impl Rendu {
             let garde = self.flip_pousser(c, d, (x + r[2] / 2.0, y + r[3] / 2.0), rect(x - 8.0, y - 8.0, r[2] + 16.0, r[3] + 16.0), &self.couche_opacite(c, d.opacite));
             if ligne.choisie {
                 self.couleur(c, &ACCENT_SELECTION);
-                rt.FillRoundedRectangle(&D2D1_ROUNDED_RECT { rect: rect(x, y + 1.0, r[2], r[3] - 2.0), radiusX: 7.0, radiusY: 7.0 }, &c.pinceau);
+                rt.FillRoundedRectangle(&D2D1_ROUNDED_RECT { rect: rect(x, y + 1.0, r[2], r[3] - 2.0), radiusX: RAYON_PETIT, radiusY: RAYON_PETIT }, &c.pinceau);
             }
             self.icone(c, icones::pour(&ligne.entree), x + 16.0, y + r[3] / 2.0, ligne.choisie, 1.0);
             self.couleur(c, if ligne.choisie { &BLANC } else { &BLANC_DOUX });
@@ -4459,9 +5160,31 @@ impl Rendu {
         }
     }
 
+    /// Ombre douce sous un élément flottant (menus, cartes, infobulles ; choix de l'auteur au lot 8, D-7) : 8 couches de plus en plus
+    /// étroites, chacune très transparente, décalées de 40 % de la portée vers le bas (lumière d'en haut). Presque invisible sur le fond
+    /// noir, utile surtout en thème clair. Rien en Contraste élevé de Windows (tout reste plat).
+    unsafe fn ombre_flottante(&self, c: &Cible2D, r: D2D_RECT_F, rayon: f32, portee: f32) {
+        if crate::reglages::CONTRASTE_WINDOWS.load(std::sync::atomic::Ordering::Relaxed) {
+            return;
+        }
+        const COUCHES: u32 = 8;
+        for k in 0..COUCHES {
+            let e = portee * (1.0 - k as f32 / COUCHES as f32);
+            let decalage = portee * 0.4;
+            self.couleur(c, &rgba(0, 0, 0, 0.05));
+            let forme = D2D1_ROUNDED_RECT {
+                rect: D2D_RECT_F { left: r.left - e, top: r.top - e + decalage, right: r.right + e, bottom: r.bottom + e + decalage },
+                radiusX: rayon + e,
+                radiusY: rayon + e,
+            };
+            c.rt.FillRoundedRectangle(&forme, &c.pinceau);
+        }
+    }
+
     /// Carte posée par-dessus la fenêtre : fond, trame, contour
     unsafe fn carte(&self, c: &Cible2D, r: D2D_RECT_F) {
-        let arrondi = D2D1_ROUNDED_RECT { rect: r, radiusX: 14.0, radiusY: 14.0 };
+        self.ombre_flottante(c, r, RAYON_GRAND, 28.0);
+        let arrondi = D2D1_ROUNDED_RECT { rect: r, radiusX: RAYON_GRAND, radiusY: RAYON_GRAND };
         self.couleur(c, &CHAMP_FOND);
         c.rt.FillRoundedRectangle(&arrondi, &c.pinceau);
         self.trame_arrondie(c, &arrondi);
@@ -4576,7 +5299,7 @@ impl Rendu {
             if let (Some(pl), Some(chemin)) = (d.places.iter().find(|p| p.index == i), vue.pastilles.get(i).and_then(|p| p.destination.as_deref())) {
                 let w = (self.mesurer(chemin, &f.petit_mono) + 20.0).min(720.0);
                 let r = rect(pl.zone.x, pl.zone.y - 30.0, w, 24.0);
-                let arrondi = D2D1_ROUNDED_RECT { rect: r, radiusX: 8.0, radiusY: 8.0 };
+                let arrondi = D2D1_ROUNDED_RECT { rect: r, radiusX: RAYON_PETIT, radiusY: RAYON_PETIT };
                 self.couleur(c, &CHAMP_FOND);
                 rt.FillRoundedRectangle(&arrondi, &c.pinceau);
                 self.couleur(c, &BLANC_TRES_FAIBLE);
@@ -4768,7 +5491,7 @@ impl Rendu {
         }
         let rt = &c.rt;
         let haut = (zone.bottom - zone.top) * fraction;
-        let (Ok(calque), Ok(masque)) = (rt.CreateLayer(None), self.d2d.CreateRoundedRectangleGeometry(&D2D1_ROUNDED_RECT { rect: rect(zone.left, zone.top, zone.right - zone.left, haut.max(0.0)), radiusX: 14.0, radiusY: 14.0 })) else {
+        let (Ok(calque), Ok(masque)) = (rt.CreateLayer(None), self.d2d.CreateRoundedRectangleGeometry(&D2D1_ROUNDED_RECT { rect: rect(zone.left, zone.top, zone.right - zone.left, haut.max(0.0)), radiusX: RAYON_GRAND, radiusY: RAYON_GRAND })) else {
             dessiner();
             return;
         };
@@ -4902,7 +5625,7 @@ impl Rendu {
             }
             let r = rect(cx, cy, wp, 28.0);
             let on = if *courante { anim.categorie(*rang, t) } else { 0.0 };
-            let arrondi = D2D1_ROUNDED_RECT { rect: D2D_RECT_F { left: r.left + 0.5, top: r.top + 0.5, right: r.right - 0.5, bottom: r.bottom - 0.5 }, radiusX: 14.0, radiusY: 14.0 };
+            let arrondi = D2D1_ROUNDED_RECT { rect: D2D_RECT_F { left: r.left + 0.5, top: r.top + 0.5, right: r.right - 0.5, bottom: r.bottom - 0.5 }, radiusX: rayon_pilule(&r), radiusY: rayon_pilule(&r) };
             if *courante && on > 0.001 {
                 self.couleur_k(c, &ACCENT, 0.10 * on);
                 rt.FillRoundedRectangle(&arrondi, &c.pinceau);
@@ -4927,7 +5650,7 @@ impl Rendu {
         if rang_choisi.is_some() {
             let r = rect(lx + 10.0, ly + p_haut - defil, largeur_liste - 20.0, p_hauteur);
             self.couleur(c, &LIGNE);
-            rt.FillRoundedRectangle(&D2D1_ROUNDED_RECT { rect: r, radiusX: 14.0, radiusY: 14.0 }, &c.pinceau);
+            rt.FillRoundedRectangle(&D2D1_ROUNDED_RECT { rect: r, radiusX: rayon_pilule(&r), radiusY: rayon_pilule(&r) }, &c.pinceau);
             self.couleur(c, &ACCENT);
             rt.FillRoundedRectangle(&D2D1_ROUNDED_RECT { rect: rect(r.left, r.top + 13.0, 3.0, (p_hauteur - 26.0).max(0.0)), radiusX: 1.5, radiusY: 1.5 }, &c.pinceau);
         }
@@ -4954,7 +5677,7 @@ impl Rendu {
                     // Puce d'icône `.pt` : 30 × 30, rayon 10, bord et couleur passent à l'accent sur la ligne courante
                     let puce = rect(ligne_x + 16.0, yr + (hauteur - 30.0) / 2.0, 30.0, 30.0);
                     self.couleur(c, &melange_couleurs(&LIGNE, &D2D1_COLOR_F { a: 0.6, ..ACCENT }, cur));
-                    rt.DrawRoundedRectangle(&D2D1_ROUNDED_RECT { rect: D2D_RECT_F { left: puce.left + 0.5, top: puce.top + 0.5, right: puce.right - 0.5, bottom: puce.bottom - 0.5 }, radiusX: 10.0, radiusY: 10.0 }, &c.pinceau, 1.0, None);
+                    rt.DrawRoundedRectangle(&D2D1_ROUNDED_RECT { rect: D2D_RECT_F { left: puce.left + 0.5, top: puce.top + 0.5, right: puce.right - 0.5, bottom: puce.bottom - 0.5 }, radiusX: RAYON_MOYEN, radiusY: RAYON_MOYEN }, &c.pinceau, 1.0, None);
                     self.icone(c, it.icone, puce.left + 15.0, puce.top + 15.0, false, if it.grise { 0.35 } else { 0.7 + 0.3 * cur });
                     // Libellé (surligné par la requête, `hlq`), détail, raccourci
                     let wr = largeur_touches(it.raccourci) + 20.0;
@@ -5078,12 +5801,12 @@ impl Rendu {
         if a.art == palette::Art::Aucun || art.bottom - art.top < 40.0 {
             return;
         }
-        let cadre = D2D1_ROUNDED_RECT { rect: art, radiusX: 16.0, radiusY: 16.0 };
+        let cadre = D2D1_ROUNDED_RECT { rect: art, radiusX: RAYON_GRAND, radiusY: RAYON_GRAND };
         self.couleur(c, &VOILE);
         rt.FillRoundedRectangle(&cadre, &c.pinceau);
         self.trame_arrondie(c, &cadre);
         self.couleur(c, &LIGNE);
-        rt.DrawRoundedRectangle(&D2D1_ROUNDED_RECT { rect: D2D_RECT_F { left: art.left + 0.5, top: art.top + 0.5, right: art.right - 0.5, bottom: art.bottom - 0.5 }, radiusX: 16.0, radiusY: 16.0 }, &c.pinceau, 1.0, None);
+        rt.DrawRoundedRectangle(&D2D1_ROUNDED_RECT { rect: D2D_RECT_F { left: art.left + 0.5, top: art.top + 0.5, right: art.right - 0.5, bottom: art.bottom - 0.5 }, radiusX: RAYON_GRAND, radiusY: RAYON_GRAND }, &c.pinceau, 1.0, None);
         let dedans = D2D_RECT_F { left: art.left + 14.0, top: art.top + 14.0, right: art.right - 14.0, bottom: art.bottom - 14.0 };
         // `vin` : le dessin monte de 8 DIP en se fondant, au ressort ; coupé en mouvement réduit (la valeur est alors 1)
         let d = mouvement::Decalage { dx: 0.0, dy: mouvement::VIN_DECALAGE * (1.0 - vin), echelle: 1.0, opacite: vin.clamp(0.0, 1.0) };
@@ -5124,7 +5847,7 @@ impl Rendu {
     /// Colonne `.colm` : fond s1, rayon 8, quatre barres de 6 DIP (celle de `accent` en accent) ; `fondu` : opacité de la colonne
     unsafe fn colonne_art(&self, c: &Cible2D, r: D2D_RECT_F, barres: usize, accent: Option<usize>, fondu: f32) {
         self.couleur_k(c, &LIGNE, fondu);
-        c.rt.FillRoundedRectangle(&D2D1_ROUNDED_RECT { rect: r, radiusX: 8.0, radiusY: 8.0 }, &c.pinceau);
+        c.rt.FillRoundedRectangle(&D2D1_ROUNDED_RECT { rect: r, radiusX: RAYON_PETIT, radiusY: RAYON_PETIT }, &c.pinceau);
         for j in 0..barres {
             let b = rect(r.left + 6.0, r.top + 8.0 + j as f32 * 11.0, (r.right - r.left - 12.0).max(0.0), 6.0);
             if b.right > b.left && b.bottom <= r.bottom {
@@ -5156,7 +5879,7 @@ impl Rendu {
                     let dans = if rang == rangs - 1 { 6 - rang * par } else { par };
                     let x0 = d.left + (l - (dans as f32 * 44.0 + (dans - 1) as f32 * 8.0)) / 2.0;
                     self.couleur(c, &BLANC_TRES_FAIBLE);
-                    c.rt.FillRoundedRectangle(&D2D1_ROUNDED_RECT { rect: rect(x0 + col as f32 * 52.0, y0 + rang as f32 * 44.0, 44.0, 36.0), radiusX: 8.0, radiusY: 8.0 }, &c.pinceau);
+                    c.rt.FillRoundedRectangle(&D2D1_ROUNDED_RECT { rect: rect(x0 + col as f32 * 52.0, y0 + rang as f32 * 44.0, 44.0, 36.0), radiusX: RAYON_PETIT, radiusY: RAYON_PETIT }, &c.pinceau);
                 }
             }
             Art::Colonnes => {
@@ -5201,7 +5924,7 @@ impl Rendu {
                     }
                     let r = rect(x0, y0 + 29.0, w, 22.0);
                     self.couleur(c, &BLANC_TRES_FAIBLE);
-                    c.rt.DrawRoundedRectangle(&D2D1_ROUNDED_RECT { rect: D2D_RECT_F { left: r.left + 0.5, top: r.top + 0.5, right: r.right - 0.5, bottom: r.bottom - 0.5 }, radiusX: 11.0, radiusY: 11.0 }, &c.pinceau, 1.0, None);
+                    c.rt.DrawRoundedRectangle(&D2D1_ROUNDED_RECT { rect: D2D_RECT_F { left: r.left + 0.5, top: r.top + 0.5, right: r.right - 0.5, bottom: r.bottom - 0.5 }, radiusX: RAYON_MOYEN, radiusY: RAYON_MOYEN }, &c.pinceau, 1.0, None);
                     self.couleur(c, &BLANC_DOUX);
                     self.texte(c, &self.f.petit_centre, puce, r);
                     x0 += w + 6.0;
@@ -5246,7 +5969,7 @@ impl Rendu {
 
     /// Phrase d'effet dans un cadre : accent à demi pour ce qui va arriver, rouge pour un avertissement
     unsafe fn encadre_phrase(&self, c: &Cible2D, texte: &str, avertissement: bool, zone: D2D_RECT_F) {
-        let cadre = D2D1_ROUNDED_RECT { rect: D2D_RECT_F { left: zone.left + 0.5, top: zone.top + 0.5, right: zone.right - 0.5, bottom: zone.bottom - 0.5 }, radiusX: 10.0, radiusY: 10.0 };
+        let cadre = D2D1_ROUNDED_RECT { rect: D2D_RECT_F { left: zone.left + 0.5, top: zone.top + 0.5, right: zone.right - 0.5, bottom: zone.bottom - 0.5 }, radiusX: RAYON_MOYEN, radiusY: RAYON_MOYEN };
         self.couleur(c, if avertissement { &ERREUR } else { &ACCENT_BORD });
         c.rt.DrawRoundedRectangle(&cadre, &c.pinceau, 1.0, None);
         self.couleur(c, if avertissement { &ERREUR } else { &BLANC_DOUX });
@@ -5319,7 +6042,7 @@ impl Rendu {
             let choisi = k == p.choix;
             if choisi {
                 self.couleur(c, &SURVOL_FORT);
-                rt.FillRoundedRectangle(&D2D1_ROUNDED_RECT { rect: fond, radiusX: 8.0, radiusY: 8.0 }, &c.pinceau);
+                rt.FillRoundedRectangle(&D2D1_ROUNDED_RECT { rect: fond, radiusX: RAYON_PETIT, radiusY: RAYON_PETIT }, &c.pinceau);
                 self.couleur(c, &ACCENT);
                 rt.FillRectangle(&rect(fond.left, fond.top + 9.0, 2.0, RANG - 20.0), &c.pinceau);
             }
@@ -5363,7 +6086,7 @@ impl Rendu {
                 self.champ(c, &lot.champs[k], rect(champ.left + 10.0, champ.top, champ.right - champ.left - 10.0, 36.0));
             } else {
                 self.couleur(c, &BLANC_TRES_FAIBLE);
-                rt.DrawRoundedRectangle(&D2D1_ROUNDED_RECT { rect: champ, radiusX: 5.0, radiusY: 5.0 }, &c.pinceau, 1.0, None);
+                rt.DrawRoundedRectangle(&D2D1_ROUNDED_RECT { rect: champ, radiusX: RAYON_PETIT, radiusY: RAYON_PETIT }, &c.pinceau, 1.0, None);
                 self.couleur(c, &BLANC_DOUX);
                 self.texte_w(c, &f.liste, &lot.champs[k].texte, rect(champ.left + 10.0, champ.top, champ.right - champ.left - 20.0, 36.0));
             }
@@ -5467,7 +6190,7 @@ impl Rendu {
         for (k, (fiche, autre, titre)) in [(&x.source, &x.cible, arrive), (&x.cible, &x.source, "DEJA LA")].into_iter().enumerate() {
             let fx = x0 + 24.0 + k as f32 * (lf + 40.0);
             self.couleur(c, &BLANC_TRES_FAIBLE);
-            rt.DrawRoundedRectangle(&D2D1_ROUNDED_RECT { rect: rect(fx, yf, lf, 236.0), radiusX: 10.0, radiusY: 10.0 }, &c.pinceau, 1.0, None);
+            rt.DrawRoundedRectangle(&D2D1_ROUNDED_RECT { rect: rect(fx, yf, lf, 236.0), radiusX: RAYON_MOYEN, radiusY: RAYON_MOYEN }, &c.pinceau, 1.0, None);
             self.couleur(c, if k == 0 { &ACCENT } else { &BLANC_DOUX });
             self.texte(c, &f.petit, titre, rect(fx + 14.0, yf + 8.0, lf - 28.0, 20.0));
             // Miniature (fichiers), sinon grande icône en points
@@ -5517,7 +6240,7 @@ impl Rendu {
         let mut zones = self.zones_conflit.borrow_mut();
         for (k, choix) in Choix::TOUS.into_iter().enumerate() {
             let r = rect(x0 + 24.0 + k as f32 * (lb + 10.0), yb, lb, 64.0);
-            let arrondi = D2D1_ROUNDED_RECT { rect: r, radiusX: 8.0, radiusY: 8.0 };
+            let arrondi = D2D1_ROUNDED_RECT { rect: r, radiusX: RAYON_PETIT, radiusY: RAYON_PETIT };
             self.couleur(c, &SURVOL);
             rt.FillRoundedRectangle(&arrondi, &c.pinceau);
             let actif = x.choix == Some(choix);
@@ -5588,13 +6311,13 @@ impl Rendu {
         self.avec_decalage(c, &d, (l / 2.0, h / 2.0), rect(0.0, 0.0, l, h), || {
             // Fond : un rectangle arrondi dont le bord droit est hors fenêtre (seuls les coins gauches se voient), puis le bord gauche
             // de 1 px (`border-left`) et le liseré intérieur (`inset 1px 0 0 var(--rim)`)
-            let fond = D2D1_ROUNDED_RECT { rect: rect(z.left, z.top, TIROIR_L + 20.0, hz), radiusX: 20.0, radiusY: 20.0 };
+            let fond = D2D1_ROUNDED_RECT { rect: rect(z.left, z.top, TIROIR_L + 20.0, hz), radiusX: RAYON_GRAND, radiusY: RAYON_GRAND };
             self.couleur_ou(c, &CARTE, &CARTE_CLAIR);
             rt.FillRoundedRectangle(&fond, &c.pinceau);
             self.trame_arrondie(c, &fond);
             rt.PushAxisAlignedClip(&rect(z.left - 1.0, z.top - 1.0, 22.0, hz + 2.0), D2D1_ANTIALIAS_MODE_ALIASED);
             self.couleur(c, &BLANC_TRES_FAIBLE);
-            rt.DrawRoundedRectangle(&D2D1_ROUNDED_RECT { rect: rect(z.left + 0.5, z.top + 0.5, TIROIR_L + 19.0, hz - 1.0), radiusX: 19.5, radiusY: 19.5 }, &c.pinceau, 1.0, None);
+            rt.DrawRoundedRectangle(&D2D1_ROUNDED_RECT { rect: rect(z.left + 0.5, z.top + 0.5, TIROIR_L + 19.0, hz - 1.0), radiusX: RAYON_GRAND - 0.5, radiusY: RAYON_GRAND - 0.5 }, &c.pinceau, 1.0, None);
             rt.PopAxisAlignedClip();
             self.couleur(c, &LIGNE);
             rt.FillRectangle(&rect(z.left + 1.0, z.top + 20.0, 1.0, (hz - 40.0).max(0.0)), &c.pinceau);
@@ -5628,7 +6351,7 @@ impl Rendu {
                 if e.etat == crate::journal_historique::Etat::Annulable {
                     let r = rect(x_fin - HIST_BOUTON_L, y + (ligne - HIST_BOUTON_H) / 2.0, HIST_BOUTON_L, HIST_BOUTON_H);
                     let dessus = pointeur.is_some_and(|(px, py)| dedans(&r, px - dx, py)) && r.bottom > y_liste && r.top < y_bas;
-                    let arrondi = D2D1_ROUNDED_RECT { rect: r, radiusX: 8.0, radiusY: 8.0 };
+                    let arrondi = D2D1_ROUNDED_RECT { rect: r, radiusX: RAYON_PETIT, radiusY: RAYON_PETIT };
                     self.couleur(c, if dessus { &SURVOL_FORT } else { &SURVOL });
                     rt.FillRoundedRectangle(&arrondi, &c.pinceau);
                     self.couleur(c, if dessus { &ACCENT_BORD } else { &BLANC_TRES_FAIBLE });
@@ -5762,9 +6485,571 @@ impl Rendu {
         ("…".to_string(), 1)
     }
 
+    /// Page ESPACE (E1), à la place des colonnes et de la liste : rail des pages à gauche, puis l'arbre trié par taille.
+    /// Même squelette que les réglages (panneau modal sous la barre de titre, rail de 236) ; un seul accent orange :
+    /// la barre de proportion de la ligne choisie.
+    unsafe fn dessiner_espace(&self, c: &Cible2D, app: &App, l: f32, h: f32, ve: &VueEspace, vue: &Vue) {
+        let rt = &c.rt;
+        let f = &self.f;
+        let (gauche, droite) = (page::gauche(), page::droite(l));
+        let (haut, bas) = (page::PAGE_Y, h - statut_h());
+        let e = ve.etat;
+        self.couleur(c, &VOILE);
+        rt.FillRectangle(&rect(0.0, HAUTEUR_TITRE, l, bas - HAUTEUR_TITRE), &c.pinceau);
+        // Le fond noir opaque cache la trame de la fenêtre : on la repose sur toute la page, comme derrière la liste de fichiers
+        self.trame_plein(c, &rect(0.0, HAUTEUR_TITRE, l, bas - HAUTEUR_TITRE));
+        self.couleur(c, &LIGNE);
+        rt.FillRectangle(&rect(REGLAGES_NAV, HAUTEUR_TITRE, 1.0, bas - HAUTEUR_TITRE), &c.pinceau);
+        self.couleur(c, &BLANC);
+        self.texte(c, &f.carte_titre, "Espace disque", rect(page::NAV_X + 12.0, HAUTEUR_TITRE + 14.0, REGLAGES_NAV - 48.0, 30.0));
+        for (k, nom) in espace::PAGES.iter().enumerate() {
+            let r = rect(page::NAV_X, page::NAV_Y + k as f32 * page::NAV_H, page::NAV_W, page::NAV_H - 2.0);
+            let actif = e.page == k;
+            let fondu = self.survol_k(Cible::EspaceNav(k));
+            if !actif && fondu > 0.0 {
+                self.couleur_k(c, &SURVOL, fondu);
+                rt.FillRoundedRectangle(&D2D1_ROUNDED_RECT { rect: r, radiusX: REGLAGE_SEG_RAYON, radiusY: REGLAGE_SEG_RAYON }, &c.pinceau);
+            }
+            if actif {
+                self.couleur_ou(c, &SELECTION, &SELECTION_CLAIR);
+                let arrondi = D2D1_ROUNDED_RECT { rect: r, radiusX: REGLAGE_SEG_RAYON, radiusY: REGLAGE_SEG_RAYON };
+                rt.FillRoundedRectangle(&arrondi, &c.pinceau);
+                if ve.focus_clavier && e.zone == espace::Zone::Rail {
+                    self.couleur(c, &ACCENT_BORD);
+                    rt.DrawRoundedRectangle(&D2D1_ROUNDED_RECT { rect: rect(r.left + 0.5, r.top + 0.5, r.right - r.left - 1.0, r.bottom - r.top - 1.0), radiusX: REGLAGE_SEG_RAYON, radiusY: REGLAGE_SEG_RAYON }, &c.pinceau, 1.0, None);
+                }
+                self.couleur(c, &ACCENT);
+                rt.FillRoundedRectangle(&D2D1_ROUNDED_RECT { rect: rect(r.left + 6.0, (r.top + r.bottom) / 2.0 - 8.0, 3.0, 16.0), radiusX: 1.5, radiusY: 1.5 }, &c.pinceau);
+            }
+            self.couleur(c, if actif || app.survol == Cible::EspaceNav(k) { &BLANC } else if k == espace::PAGE_ANALYSE { &BLANC_DOUX } else { &BLANC_FAIBLE });
+            self.texte(c, &f.volet, nom, rect(r.left + 20.0, r.top, r.right - r.left - 24.0, r.bottom - r.top));
+        }
+        rt.PushAxisAlignedClip(&rect(REGLAGES_NAV + 2.0, haut, l - REGLAGES_NAV - 2.0, bas - haut), D2D1_ANTIALIAS_MODE_ALIASED);
+        self.couleur(c, &BLANC);
+        self.texte(c, &f.h2, espace::TITRES[e.page], rect(gauche, haut + 16.0, droite - gauche - 48.0, 32.0));
+        // Croix : la sortie visible de la page (même place et même geste que celle des réglages)
+        let fermer = page::zone_fermer(l);
+        let fondu_fermer = self.survol_k(Cible::EspaceFermer);
+        if fondu_fermer > 0.0 {
+            self.couleur_k(c, &SURVOL, fondu_fermer);
+            rt.FillRoundedRectangle(&D2D1_ROUNDED_RECT { rect: fermer, radiusX: RAYON_PETIT, radiusY: RAYON_PETIT }, &c.pinceau);
+        }
+        self.couleur(c, if app.survol == Cible::EspaceFermer { &BLANC } else { &BLANC_DOUX });
+        let (cx, cy) = ((fermer.left + fermer.right) / 2.0, (fermer.top + fermer.bottom) / 2.0);
+        self.trait_signe(c, (cx - 4.0, cy - 4.0), (cx + 4.0, cy + 4.0), 1.4);
+        self.trait_signe(c, (cx - 4.0, cy + 4.0), (cx + 4.0, cy - 4.0), 1.4);
+        if e.page == espace::PAGE_NETTOYAGE {
+            self.dessiner_espace_nettoyage(c, app, l, h, ve);
+            rt.PopAxisAlignedClip();
+            return;
+        }
+        if e.page != espace::PAGE_ANALYSE {
+            self.couleur(c, &BLANC_FAIBLE);
+            self.texte(c, &f.vide, "Cette page arrive dans une prochaine étape.", rect(gauche, haut + 120.0, droite - gauche, 40.0));
+            rt.PopAxisAlignedClip();
+            return;
+        }
+        let Some(arbre) = e.arbre.as_ref() else {
+            let message = if ve.index_enregistre { "Lecture de l'index enregistré…" } else { "Aucun index enregistré : une première recherche globale (Ctrl+K) le construit." };
+            self.couleur(c, &BLANC_FAIBLE);
+            self.texte(c, &f.vide, message, rect(gauche, haut + 120.0, droite - gauche, 40.0));
+            rt.PopAxisAlignedClip();
+            return;
+        };
+        // Sous-titre : l'âge de l'index (jamais de parcours devant l'utilisateur) et ce qu'il couvre
+        self.couleur(c, &BLANC_DOUX);
+        let age = espace::analyse::age(ve.maintenant.saturating_sub(arbre.construit()));
+        self.texte(c, &f.volet, &format!("Index enregistré {age} · {} analysés", systeme::taille(arbre.total)), rect(gauche, haut + 50.0, droite - gauche - espace_vues_largeur() - 16.0, 22.0));
+        // Contrôle de vue : un segment par vue (`espace::VUES`), celui de la vue montrée est plein
+        for (k, nom) in espace::VUES.iter().enumerate() {
+            let r = espace_segment_vue(l, k);
+            let actif = e.vue.rang() == k;
+            let fondu = self.survol_k(Cible::EspaceVue(k));
+            let arrondi = D2D1_ROUNDED_RECT { rect: r, radiusX: REGLAGE_SEG_RAYON, radiusY: REGLAGE_SEG_RAYON };
+            if actif {
+                self.couleur_ou(c, &ESPACE_SEGMENT_ACTIF, &ESPACE_SEGMENT_ACTIF_CLAIR);
+                rt.FillRoundedRectangle(&arrondi, &c.pinceau);
+                self.couleur(c, &ACCENT);
+                rt.FillRoundedRectangle(&D2D1_ROUNDED_RECT { rect: rect(r.left + 8.0, r.bottom - 4.0, r.right - r.left - 16.0, 2.0), radiusX: 1.0, radiusY: 1.0 }, &c.pinceau);
+            } else if fondu > 0.0 {
+                self.couleur_k(c, &SURVOL, fondu);
+                rt.FillRoundedRectangle(&arrondi, &c.pinceau);
+            }
+            self.couleur(c, if actif || app.survol == Cible::EspaceVue(k) { &BLANC } else { &BLANC_DOUX });
+            // Centré sur sa largeur mesurée : les écarts entre libellés restent égaux quelle que soit leur longueur
+            let x_libelle = (r.left + ((r.right - r.left) - self.mesurer(nom, &f.volet)) / 2.0).max(r.left + 4.0);
+            self.texte(c, &f.volet, nom, rect(x_libelle, r.top, r.right - x_libelle, r.bottom - r.top));
+        }
+        if e.vue == espace::Vue::Carte {
+            self.dessiner_espace_carte(c, app, l, h, ve);
+            rt.PopAxisAlignedClip();
+            return;
+        }
+        let (pas, liste_y) = (ve.pas, ESPACE_LISTE_Y);
+        let (barre_l, pct_l, taille_l) = (ESPACE_BARRE_L, 56.0, 92.0);
+        let x_pct = droite - pct_l;
+        let x_taille = x_pct - taille_l - 8.0;
+        let x_barre = x_taille - barre_l - 12.0;
+        // Les lignes qui montent s'arrêtent sous le sous-titre : coupe nette, le titre reste lisible
+        rt.PushAxisAlignedClip(&rect(REGLAGES_NAV + 2.0, liste_y - 2.0, l - REGLAGES_NAV - 2.0, (bas - liste_y + 2.0).max(0.0)), D2D1_ANTIALIAS_MODE_ALIASED);
+        let bilan = e.vue.est_bilan();
+        // Bilan en cours de calcul ou vide : on le dit au lieu de laisser une page blanche
+        if bilan && e.lignes().is_empty() {
+            self.couleur(c, &BLANC_FAIBLE);
+            self.texte(c, &f.vide, "Aucun fichier dans l'index enregistré.", rect(gauche, liste_y + 16.0, droite - gauche, 40.0));
+        }
+        for (k, ligne) in e.lignes().iter().enumerate() {
+            let y = liste_y + k as f32 * pas - e.affiche;
+            if y + pas < liste_y || y > bas {
+                continue;
+            }
+            let choisie = k == e.focus;
+            let fond = D2D1_ROUNDED_RECT { rect: rect(gauche - 8.0, y, droite - gauche + 16.0, pas - 2.0), radiusX: RAYON_PETIT, radiusY: RAYON_PETIT };
+            let fondu = self.survol_k(Cible::EspaceLigne(k));
+            if !choisie && fondu > 0.0 {
+                self.couleur_k(c, &SURVOL, fondu);
+                rt.FillRoundedRectangle(&fond, &c.pinceau);
+            }
+            if choisie {
+                self.couleur_ou(c, &SELECTION, &SELECTION_CLAIR);
+                rt.FillRoundedRectangle(&fond, &c.pinceau);
+                if ve.focus_clavier && e.zone == espace::Zone::Liste {
+                    self.couleur(c, &ACCENT_BORD);
+                    rt.DrawRoundedRectangle(&D2D1_ROUNDED_RECT { rect: rect(gauche - 7.5, y + 0.5, droite - gauche + 15.0, pas - 3.0), radiusX: RAYON_PETIT, radiusY: RAYON_PETIT }, &c.pinceau, 1.0, None);
+                }
+            }
+            let x_nom = gauche + ligne.niveau as f32 * 18.0;
+            if ligne.dossier {
+                self.couleur(c, &BLANC_DOUX);
+                self.texte(c, &f.liste, if ligne.ouvert { "▾" } else { "▸" }, rect(x_nom, y, 18.0, pas - 2.0));
+            }
+            // Bilans : la pastille reprend la couleur du genre dans la carte ; un groupe d'âge n'en a pas (le texte commence plus tôt)
+            // Sans pastille (groupes d'âge), pas de vide à gauche du nom
+            let mut x_texte = x_nom + if bilan && ligne.pastille.is_none() { 2.0 } else { 20.0 };
+            if let Some(g) = ligne.pastille {
+                self.couleur(c, &couleur_genre(g, 0.85));
+                rt.FillRoundedRectangle(&D2D1_ROUNDED_RECT { rect: rect(x_nom + 2.0, y + (pas - 2.0 - 10.0) / 2.0, 10.0, 10.0), radiusX: 2.0, radiusY: 2.0 }, &c.pinceau);
+            }
+            self.couleur(c, &BLANC);
+            // Un fichier : son nom, puis son dossier en gris à droite ; un groupe : son nom, puis « 1 234 fichiers »
+            let zone_nom = (x_barre - x_texte - 12.0).max(40.0);
+            if bilan && !ligne.detail.is_empty() {
+                // Le nom prend sa largeur mesurée (au plus 55 % de la zone) : le reste va au dossier, dont la fin est la
+                // partie utile — trop long, il perd son début (« …\Films\2024 »), pas sa fin
+                let l_nom = (self.mesurer(&ligne.nom, &f.liste) + 6.0).min(zone_nom * 0.55).max(40.0);
+                self.texte(c, &f.liste, &ligne.nom, rect(x_texte, y, l_nom, pas - 2.0));
+                x_texte += l_nom + 8.0;
+                self.couleur(c, &BLANC_FAIBLE);
+                let l_detail = (x_barre - x_texte - 12.0).max(40.0);
+                let detail = if ligne.fichier.is_some() { self.raccourcir_a_gauche(&ligne.detail, &f.petit, l_detail) } else { ligne.detail.clone() };
+                self.texte(c, &f.petit, &detail, rect(x_texte, y, l_detail, pas - 2.0));
+            } else {
+                self.texte(c, &f.liste, &ligne.nom, rect(x_texte, y, zone_nom, pas - 2.0));
+            }
+            // Barre de proportion : la part du dossier parent (des disques, pour un disque)
+            let piste = rect(x_barre, y + (pas - 2.0 - 6.0) / 2.0, barre_l, 6.0);
+            self.couleur(c, &BLANC_TRES_FAIBLE);
+            rt.FillRoundedRectangle(&D2D1_ROUNDED_RECT { rect: piste, radiusX: rayon_pilule(&piste), radiusY: rayon_pilule(&piste) }, &c.pinceau);
+            // Gros fichiers : chaque fichier pèse au plus quelques % du total, les barres seraient toutes minuscules ;
+            // on les compare au plus gros de la liste (le pourcentage à droite reste la vraie part du total)
+            let part_barre = if e.vue == espace::Vue::Gros { e.lignes().first().map_or(0.0, |p| if p.taille > 0 { ligne.taille as f32 / p.taille as f32 } else { 0.0 }) } else { ligne.part };
+            let rempli = if ligne.taille > 0 { (barre_l * part_barre).max(3.0) } else { 0.0 };
+            if rempli > 0.0 {
+                // Types et Gros fichiers : la barre reprend la couleur du genre (comme la carte) ; la ligne choisie reste orange
+                match (choisie, ligne.pastille) {
+                    (false, Some(g)) => self.couleur(c, &couleur_genre(g, 0.85)),
+                    (true, _) => self.couleur(c, &ACCENT),
+                    (false, None) => self.couleur(c, &BLANC_DOUX),
+                }
+                rt.FillRoundedRectangle(&D2D1_ROUNDED_RECT { rect: rect(piste.left, piste.top, rempli, 6.0), radiusX: rayon_pilule(&piste), radiusY: rayon_pilule(&piste) }, &c.pinceau);
+            }
+            self.couleur(c, &BLANC);
+            self.texte(c, &f.petit_droite, &systeme::taille(ligne.taille), rect(x_taille, y, taille_l, pas - 2.0));
+            self.couleur(c, &BLANC_DOUX);
+            self.texte(c, &f.petit_droite, &espace::analyse::pourcent(ligne.part), rect(x_pct, y, pct_l, pas - 2.0));
+        }
+        // Repère de défilement : un filet de 3 DIP au bord droit, seulement quand la liste dépasse la page
+        let n_lignes = e.lignes().len() as f32;
+        let visible = (bas - liste_y).max(1.0);
+        let contenu = n_lignes * pas;
+        if contenu > visible + 1.0 {
+            let (x_rep, piste_h) = (l - 9.0, visible - 8.0);
+            let poignee_h = (piste_h * visible / contenu).max(24.0).min(piste_h);
+            let haut_p = liste_y + 4.0 + (piste_h - poignee_h) * (e.affiche / (contenu - visible)).clamp(0.0, 1.0);
+            self.couleur(c, &BLANC_TRES_FAIBLE);
+            rt.FillRoundedRectangle(&D2D1_ROUNDED_RECT { rect: rect(x_rep, liste_y + 4.0, 3.0, piste_h), radiusX: 1.5, radiusY: 1.5 }, &c.pinceau);
+            self.couleur(c, &BLANC_FAIBLE);
+            rt.FillRoundedRectangle(&D2D1_ROUNDED_RECT { rect: rect(x_rep, haut_p, 3.0, poignee_h), radiusX: 1.5, radiusY: 1.5 }, &c.pinceau);
+        }
+        let _ = vue;
+        rt.PopAxisAlignedClip();
+        rt.PopAxisAlignedClip();
+    }
+
+    /// Page NETTOYAGE (E4) : une ligne par catégorie de la liste blanche trouvée sur ce PC, triées par taille. Espace
+    /// coche, Entrée demande la suppression : la confirmation montre alors la liste exacte, la taille et le mode.
+    unsafe fn dessiner_espace_nettoyage(&self, c: &Cible2D, app: &App, l: f32, h: f32, ve: &VueEspace) {
+        let rt = &c.rt;
+        let f = &self.f;
+        let e = ve.etat;
+        let (gauche, droite) = (page::gauche(), page::droite(l));
+        let (haut, bas) = (page::PAGE_Y, h - statut_h());
+        if let espace::EtapeNet::Confirmation(choisies) = &e.net_etape {
+            self.dessiner_confirmation_nettoyage(c, app, l, h, choisies);
+            return;
+        }
+        let Some(cats) = e.nettoyage.as_ref() else {
+            let suppression;
+            let texte = match e.net_etape {
+                espace::EtapeNet::Suppression => {
+                    let (fait, total) = espace::nettoyage::progres();
+                    suppression = format!("Suppression en cours… {fait} / {total} · Échap : quitter la page, elle continue en fond");
+                    suppression.as_str()
+                }
+                espace::EtapeNet::Preparation => "Nouvelle mesure avant la confirmation…",
+                _ => "Mesure en cours…",
+            };
+            self.couleur(c, &BLANC_FAIBLE);
+            self.texte(c, &f.vide, texte, rect(gauche, haut + 120.0, droite - gauche, 40.0));
+            if let Some(m) = e.net_message.as_deref() {
+                self.couleur(c, &BLANC_DOUX);
+                self.texte(c, &f.volet, m, rect(gauche, haut + 50.0, droite - gauche - 16.0, 22.0));
+            }
+            return;
+        };
+        self.couleur(c, &BLANC_DOUX);
+        let sous_titre = if let Some(m) = e.net_message.as_deref() {
+            m.to_string()
+        } else if cats.is_empty() {
+            "Rien à nettoyer sur ce PC".to_string()
+        } else if e.net_cochees.is_empty() {
+            format!("{} récupérables · ESPACE coche, ENTRÉE supprime après confirmation", systeme::taille(espace::nettoyage::total(cats)))
+        } else {
+            let (n, o) = cats.iter().filter(|k| e.net_cochees.contains(&k.id)).fold((0, 0), |(n, o), k| (n + 1, o + k.octets));
+            format!("{} coché{} · {} · ENTRÉE pour confirmer", n, if n > 1 { "s" } else { "" }, systeme::taille(o))
+        };
+        self.texte(c, &f.volet, &sous_titre, rect(gauche, haut + 50.0, droite - gauche - 16.0, 22.0));
+        let liste_y = haut + 84.0;
+        rt.PushAxisAlignedClip(&rect(REGLAGES_NAV + 2.0, liste_y - 2.0, l - REGLAGES_NAV - 2.0, (bas - liste_y + 2.0).max(0.0)), D2D1_ANTIALIAS_MODE_ALIASED);
+        let (taille_l, mode_l) = (92.0_f32, 96.0_f32);
+        let x_taille = droite - taille_l;
+        let x_mode = x_taille - mode_l - 12.0;
+        // Le texte de risque et le bouton occupent les 48 DIP du bas ; la liste s'arrête au-dessus. La plage montrée est la
+        // règle que la souris lit aussi (`net_plage`) : suivre la ligne choisie, ou le début fixé par la molette.
+        let (debut, fin) = net_plage(cats.len(), e.net_focus, e.net_debut, h);
+        for (k, cat) in cats.iter().enumerate().take(fin).skip(debut) {
+            let rang = k - debut;
+            let y = liste_y + rang as f32 * NET_PAS;
+            let pas = NET_PAS;
+            let fond = D2D1_ROUNDED_RECT { rect: net_rect_ligne(l, rang), radiusX: RAYON_PETIT, radiusY: RAYON_PETIT };
+            if k == e.net_focus {
+                self.couleur_ou(c, &SELECTION, &SELECTION_CLAIR);
+                rt.FillRoundedRectangle(&fond, &c.pinceau);
+                if ve.focus_clavier && e.zone == espace::Zone::Liste {
+                    self.couleur(c, &ACCENT_BORD);
+                    rt.DrawRoundedRectangle(&D2D1_ROUNDED_RECT { rect: rect(gauche - 7.5, y + 0.5, droite - gauche + 15.0, pas - 5.0), radiusX: RAYON_PETIT, radiusY: RAYON_PETIT }, &c.pinceau, 1.0, None);
+                }
+            } else {
+                // Survol : la ligne entière, y compris quand le pointeur est sur sa case
+                let fondu = self.survol_k(Cible::NettoyageLigne(k)).max(self.survol_k(Cible::NettoyageCase(k)));
+                if fondu > 0.0 {
+                    self.couleur_k(c, &SURVOL, fondu);
+                    rt.FillRoundedRectangle(&fond, &c.pinceau);
+                }
+            }
+            // Case à cocher : contour fin, remplie d'accent quand la catégorie est cochée ; le contour s'éclaire sous le pointeur
+            let case = D2D1_ROUNDED_RECT { rect: net_rect_case(rang), radiusX: RAYON_PETIT, radiusY: RAYON_PETIT };
+            if e.net_cochees.contains(&cat.id) {
+                self.couleur(c, &ACCENT);
+                rt.FillRoundedRectangle(&case, &c.pinceau);
+            } else {
+                self.couleur(c, if app.survol == Cible::NettoyageCase(k) { &BLANC } else { &BLANC_FAIBLE });
+                rt.DrawRoundedRectangle(&case, &c.pinceau, 1.5, None);
+            }
+            let (gauche, zone_texte) = (gauche + 32.0, (x_mode - gauche - 44.0).max(40.0));
+            self.couleur(c, &BLANC);
+            self.texte(c, &f.liste, cat.libelle, rect(gauche, y + 2.0, zone_texte, 24.0));
+            // Deuxième ligne : le détail mesuré, puis le risque (ce que l'utilisateur doit savoir avant de supprimer)
+            let mut detail = espace::nettoyage::detail_comptes(cat.elements, cat.fichiers);
+            if cat.illisibles > 0 {
+                detail.push_str(&format!(" · {} ignorés", cat.illisibles));
+            }
+            if cat.anormal {
+                detail.push_str(" · TRÈS GROS");
+            }
+            self.couleur(c, if cat.anormal { &ACCENT } else { &BLANC_FAIBLE });
+            self.texte(c, &f.petit, &detail, rect(gauche, y + 26.0, zone_texte, 20.0));
+            self.couleur(c, &BLANC_DOUX);
+            self.texte(c, &f.petit_droite, cat.mode.libelle(), rect(x_mode, y, mode_l, pas - 4.0));
+            self.couleur(c, &BLANC);
+            self.texte(c, &f.petit_droite, &systeme::taille(cat.octets), rect(x_taille, y, taille_l, pas - 4.0));
+        }
+        // Le risque de la ligne choisie, en bas de page : il reste lisible sans alourdir chaque ligne ; le bouton est à sa droite
+        if let Some(cat) = cats.get(e.net_focus) {
+            self.couleur(c, &BLANC_DOUX);
+            self.texte(c, &f.petit, cat.risque, rect(gauche, bas - 40.0, droite - gauche - 190.0 - 16.0, 32.0));
+        }
+        if !cats.is_empty() {
+            // Sans case cochée le bouton reste là (on voit ce qu'il fait) mais s'éteint : le clic dit alors quoi faire
+            let n = e.net_cochees.len();
+            let libelle = if n > 0 { format!("SUPPRIMER ({n})") } else { "SUPPRIMER".to_string() };
+            self.bouton_nettoyage(c, app, espace::NET_SUPPRIMER, net_bouton(l, h, espace::NET_SUPPRIMER), &libelle, n > 0, n > 0);
+        }
+        rt.PopAxisAlignedClip();
+    }
+
+    /// Bouton de la page NETTOYAGE : fond de sélection, fondu de survol, texte centré ; `accent` pour celui qui supprime
+    /// pour de bon, `actif` faux quand le bouton n'a rien à faire pour l'instant (texte atténué)
+    unsafe fn bouton_nettoyage(&self, c: &Cible2D, app: &App, k: usize, r: D2D_RECT_F, libelle: &str, accent: bool, actif: bool) {
+        let rt = &c.rt;
+        let cible = Cible::NettoyageBouton(k);
+        let arrondi = D2D1_ROUNDED_RECT { rect: r, radiusX: RAYON_PETIT, radiusY: RAYON_PETIT };
+        self.couleur_ou(c, &SELECTION, &SELECTION_CLAIR);
+        rt.FillRoundedRectangle(&arrondi, &c.pinceau);
+        let fondu = self.survol_k(cible);
+        if fondu > 0.0 {
+            self.couleur_k(c, &SURVOL, fondu);
+            rt.FillRoundedRectangle(&arrondi, &c.pinceau);
+        }
+        if accent && actif {
+            self.couleur(c, &ACCENT_BORD);
+            rt.DrawRoundedRectangle(&D2D1_ROUNDED_RECT { rect: rect(r.left + 0.5, r.top + 0.5, r.right - r.left - 1.0, r.bottom - r.top - 1.0), radiusX: RAYON_PETIT, radiusY: RAYON_PETIT }, &c.pinceau, 1.0, None);
+        }
+        self.couleur(c, if !actif { &BLANC_FAIBLE } else if accent { &ACCENT } else if app.survol == cible { &BLANC } else { &BLANC_DOUX });
+        let x = (r.left + ((r.right - r.left) - self.mesurer(libelle, &self.f.volet)) / 2.0).max(r.left + 4.0);
+        self.texte(c, &self.f.volet, libelle, rect(x, r.top, r.right - x, r.bottom - r.top));
+    }
+
+    /// Confirmation d'un nettoyage : la liste exacte de ce qui va être effacé (mesurée à l'instant), la taille de
+    /// chaque catégorie, ce qui arrivera à ses éléments, et le total. Entrée confirme, Échap annule.
+    unsafe fn dessiner_confirmation_nettoyage(&self, c: &Cible2D, app: &App, l: f32, h: f32, choisies: &[espace::nettoyage::Categorie]) {
+        let rt = &c.rt;
+        let f = &self.f;
+        let (gauche, droite) = (page::gauche(), page::droite(l));
+        let (haut, bas) = (page::PAGE_Y, h - statut_h());
+        self.couleur(c, &BLANC);
+        self.texte(c, &f.volet, "Confirmer la suppression", rect(gauche, haut + 50.0, droite - gauche - 16.0, 22.0));
+        let (liste_y, pas) = (haut + 84.0, 56.0_f32);
+        let zone_bas = bas - 48.0;
+        rt.PushAxisAlignedClip(&rect(REGLAGES_NAV + 2.0, liste_y - 2.0, l - REGLAGES_NAV - 2.0, (bas - liste_y + 2.0).max(0.0)), D2D1_ANTIALIAS_MODE_ALIASED);
+        let taille_l = 92.0_f32;
+        let x_taille = droite - taille_l;
+        for (k, cat) in choisies.iter().enumerate() {
+            let y = liste_y + k as f32 * pas;
+            if y + pas > zone_bas + 4.0 {
+                break;
+            }
+            let zone_texte = (x_taille - gauche - 12.0).max(40.0);
+            self.couleur(c, &BLANC);
+            self.texte(c, &f.liste, cat.libelle, rect(gauche, y + 2.0, zone_texte, 24.0));
+            let detail = format!("{} · {}", espace::nettoyage::detail_comptes(cat.elements, cat.fichiers), cat.mode.description());
+            self.couleur(c, &BLANC_FAIBLE);
+            self.texte(c, &f.petit, &detail, rect(gauche, y + 26.0, zone_texte, 20.0));
+            self.couleur(c, &BLANC);
+            self.texte(c, &f.petit_droite, &systeme::taille(cat.octets), rect(x_taille, y, taille_l, pas - 4.0));
+        }
+        // Total et touches, en bas de page ; l'accent n'est que sur l'action qui supprime
+        let total = format!("Total : {}", systeme::taille(espace::nettoyage::total(choisies)));
+        // Les deux boutons sont à droite ; le total et le rappel des touches à gauche, sur la largeur qui reste
+        let reste = (net_bouton(l, h, espace::NET_CONFIRMER).left - gauche - 16.0).max(40.0);
+        self.couleur(c, &BLANC_DOUX);
+        self.texte(c, &f.petit, &total, rect(gauche, bas - 40.0, reste, 18.0));
+        self.couleur(c, &ACCENT);
+        self.texte(c, &f.petit, "ENTRÉE confirme · ÉCHAP annule", rect(gauche, bas - 22.0, reste, 18.0));
+        self.bouton_nettoyage(c, app, espace::NET_CONFIRMER, net_bouton(l, h, espace::NET_CONFIRMER), "CONFIRMER", true, true);
+        self.bouton_nettoyage(c, app, espace::NET_ANNULER, net_bouton(l, h, espace::NET_ANNULER), "ANNULER", false, true);
+        rt.PopAxisAlignedClip();
+    }
+
+    /// Page ESPACE, vue CARTE (E2) : un rectangle par élément du dossier, d'aire proportionnelle à sa taille. Les dossiers
+    /// sont un peu plus clairs que les fichiers ; le seul accent orange est le contour du rectangle choisi.
+    unsafe fn dessiner_espace_carte(&self, c: &Cible2D, app: &App, l: f32, h: f32, ve: &VueEspace) {
+        let rt = &c.rt;
+        let f = &self.f;
+        let e = ve.etat;
+        let Some(arbre) = e.arbre.as_ref() else { return };
+        let (gauche, droite) = (page::gauche(), page::droite(l));
+        // Fil d'Ariane : une pastille cliquable par dossier de la pile (la dernière, où l'on est, ne l'est pas), puis la taille
+        let miettes = espace_miettes(e, l);
+        let total = e.carte_parent().map_or(arbre.total, |id| arbre.taille_de(id));
+        for (i, (r, m)) in miettes.iter().enumerate() {
+            let dernier = i + 1 == miettes.len();
+            let forme = D2D1_ROUNDED_RECT { rect: *r, radiusX: RAYON_PETIT, radiusY: RAYON_PETIT };
+            let survole = app.survol == Cible::EspaceChemin(m.niveau);
+            if dernier {
+                self.couleur_ou(c, &SELECTION, &SELECTION_CLAIR);
+                rt.FillRoundedRectangle(&forme, &c.pinceau);
+            } else {
+                let fondu = self.survol_k(Cible::EspaceChemin(m.niveau));
+                // Un fond léger au repos dit « bouton » ; il se renforce au survol
+                self.couleur_k(c, &SELECTION, 1.0);
+                rt.FillRoundedRectangle(&forme, &c.pinceau);
+                if fondu > 0.0 {
+                    self.couleur_k(c, &SURVOL, fondu);
+                    rt.FillRoundedRectangle(&forme, &c.pinceau);
+                }
+            }
+            rt.PushAxisAlignedClip(r, D2D1_ANTIALIAS_MODE_ALIASED);
+            self.couleur(c, if dernier || survole { &BLANC } else { &BLANC_DOUX });
+            self.texte(c, &f.volet, &m.libelle, rect(r.left + 11.0, r.top, r.right - r.left - 11.0, r.bottom - r.top));
+            rt.PopAxisAlignedClip();
+            if !dernier {
+                self.couleur(c, &BLANC_FAIBLE);
+                self.texte(c, &f.volet, "›", rect(r.right + 5.0, r.top, 12.0, r.bottom - r.top));
+            }
+        }
+        let fin = miettes.last().map_or(gauche, |(r, _)| r.right);
+        self.couleur(c, &BLANC_FAIBLE);
+        self.texte(c, &f.volet, &format!("· {}", systeme::taille(total)), rect(fin + 10.0, ESPACE_LISTE_Y, 120.0, ESPACE_MIETTE_H));
+        // À droite, le rectangle choisi au clavier (utile quand il est trop petit pour son nom)
+        let x_info = gauche + (droite - gauche) * 0.66 + 12.0;
+        if let Some(cel) = e.carte.get(e.carte_focus) {
+            self.couleur(c, &BLANC_FAIBLE);
+            let info = format!("{} · {} · {}", cel.nom, systeme::taille(cel.taille), espace::analyse::pourcent(cel.part));
+            self.texte(c, &f.petit_droite, &info, rect(x_info, ESPACE_LISTE_Y, (droite - x_info).max(0.0), ESPACE_MIETTE_H));
+        }
+        let zone = espace_zone_carte(l, h);
+        self.dessiner_espace_aide(c, e, zone, l);
+        if e.carte.is_empty() {
+            self.couleur(c, &BLANC_FAIBLE);
+            self.texte(c, &f.vide, "Rien à montrer dans ce dossier.", rect(gauche, zone.y + 40.0, droite - gauche, 40.0));
+            return;
+        }
+        let cases = e.cases(zone);
+        for (k, (cel, r)) in e.carte.iter().zip(&cases).enumerate() {
+            if r.l < 3.0 || r.h < 3.0 {
+                continue;
+            }
+            // Gouttière de 2 px entre deux rectangles
+            let dedans = rect(r.x + 1.0, r.y + 1.0, r.l - 2.0, r.h - 2.0);
+            let rayon = RAYON_PETIT.min(r.l / 2.0 - 1.0).min(r.h / 2.0 - 1.0).max(1.0);
+            let forme = D2D1_ROUNDED_RECT { rect: dedans, radiusX: rayon, radiusY: rayon };
+            let choisie = k == e.carte_focus;
+            // La couleur dit le genre (légende sous la carte) ; un dossier est un peu plus marqué qu'un fichier
+            self.couleur(c, &couleur_genre(cel.genre, if cel.dossier { 0.30 } else { 0.40 }));
+            rt.FillRoundedRectangle(&forme, &c.pinceau);
+            // Dossier assez grand : ses plus gros éléments se dessinent dedans (cliquer n'importe où dans le cadre y descend)
+            let apercu = e.carte_apercus.get(k).filter(|a| cel.dossier && !a.is_empty() && r.l >= 110.0 && r.h >= 84.0);
+            if let Some(a) = apercu {
+                rt.PushAxisAlignedClip(&dedans, D2D1_ANTIALIAS_MODE_ALIASED);
+                let poids: Vec<u64> = a.iter().map(|x| x.taille).collect();
+                let interieur = espace::carte::Rect { x: r.x + 7.0, y: r.y + 47.0, l: r.l - 14.0, h: r.h - 54.0 };
+                for (sous, r2) in a.iter().zip(espace::carte::disposer(&poids, interieur.x, interieur.y, interieur.l, interieur.h)) {
+                    if r2.l < 4.0 || r2.h < 4.0 {
+                        continue;
+                    }
+                    let d2 = rect(r2.x + 1.0, r2.y + 1.0, r2.l - 2.0, r2.h - 2.0);
+                    self.couleur(c, &couleur_genre(sous.genre, 0.55));
+                    rt.FillRoundedRectangle(&D2D1_ROUNDED_RECT { rect: d2, radiusX: 2.0, radiusY: 2.0 }, &c.pinceau);
+                    if r2.l >= 56.0 && r2.h >= 18.0 {
+                        rt.PushAxisAlignedClip(&d2, D2D1_ANTIALIAS_MODE_ALIASED);
+                        self.couleur(c, &BLANC);
+                        self.texte(c, &f.petit, &sous.nom, rect(r2.x + 6.0, r2.y + 1.0, r2.l - 10.0, 18.0));
+                        rt.PopAxisAlignedClip();
+                    }
+                }
+                rt.PopAxisAlignedClip();
+            }
+            let fondu = self.survol_k(Cible::EspaceCellule(k));
+            if fondu > 0.0 {
+                self.couleur_k(c, &SURVOL, fondu);
+                rt.FillRoundedRectangle(&forme, &c.pinceau);
+            }
+            if choisie {
+                self.couleur_ou(c, &SELECTION, &SELECTION_CLAIR);
+                rt.FillRoundedRectangle(&forme, &c.pinceau);
+                self.couleur(c, &ACCENT);
+                let contour = D2D1_ROUNDED_RECT { rect: rect(dedans.left + 0.75, dedans.top + 0.75, r.l - 3.5, r.h - 3.5), radiusX: rayon, radiusY: rayon };
+                rt.DrawRoundedRectangle(&contour, &c.pinceau, 1.5, None);
+            }
+            // Le nom s'écrit dans le rectangle s'il y tient ; la taille aussi quand il est assez haut
+            if r.l >= 64.0 && r.h >= 24.0 {
+                rt.PushAxisAlignedClip(&dedans, D2D1_ANTIALIAS_MODE_ALIASED);
+                self.couleur(c, &BLANC);
+                self.texte(c, &f.liste, &cel.nom, rect(r.x + 9.0, r.y + 4.0, r.l - 18.0, 22.0));
+                if r.h >= 48.0 {
+                    self.couleur(c, if app.survol == Cible::EspaceCellule(k) { &BLANC } else { &BLANC_DOUX });
+                    self.texte(c, &f.petit, &format!("{} · {}", systeme::taille(cel.taille), espace::analyse::pourcent(cel.part)), rect(r.x + 9.0, r.y + 26.0, r.l - 18.0, 18.0));
+                }
+                rt.PopAxisAlignedClip();
+            }
+        }
+        // Infobulle du rectangle survolé : nom, genre, taille, part, chemin et ce que le clic fera (utile surtout aux petits
+        // rectangles, trop étroits pour écrire leur nom). Elle paraît en fondu avec le survol.
+        if let Cible::EspaceCellule(k) = app.survol {
+            if let (Some(cel), Some(r)) = (e.carte.get(k), cases.get(k)) {
+                let fondu = self.survol_k(Cible::EspaceCellule(k));
+                if fondu > 0.01 {
+                    self.dessiner_espace_infobulle(c, arbre, cel, r, zone, fondu);
+                }
+            }
+        }
+    }
+
+    /// Légende des couleurs (les genres présents) et ligne d'aide, sous la carte : dit comment remonter et comment descendre
+    unsafe fn dessiner_espace_aide(&self, c: &Cible2D, e: &espace::Etat, zone: espace::carte::Rect, l: f32) {
+        let f = &self.f;
+        let (gauche, droite) = (page::gauche(), page::droite(l));
+        let y = zone.y + zone.h + 6.0;
+        let mut x = gauche;
+        for g in espace::analyse::GENRES {
+            let present = e.carte.iter().any(|x| x.genre == g) || e.carte_apercus.iter().flatten().any(|x| x.genre == g);
+            if !present {
+                continue;
+            }
+            self.couleur(c, &couleur_genre(g, 0.85));
+            c.rt.FillRoundedRectangle(&D2D1_ROUNDED_RECT { rect: rect(x, y + 6.0, 9.0, 9.0), radiusX: 2.0, radiusY: 2.0 }, &c.pinceau);
+            self.couleur(c, &BLANC_FAIBLE);
+            let w = self.mesurer(g.libelle(), &f.petit);
+            self.texte(c, &f.petit, g.libelle(), rect(x + 14.0, y, w + 6.0, 20.0));
+            x += 14.0 + w + 18.0;
+        }
+        self.couleur(c, &BLANC_FAIBLE);
+        self.texte(
+            c,
+            &f.petit,
+            "Clic : entrer dans un dossier  ·  Fil d'Ariane ou Retour arrière : remonter  ·  O : ouvrir dans l'explorateur  ·  V : arbre",
+            rect(gauche, y + 20.0, droite - gauche, 20.0),
+        );
+    }
+
+    /// Carte flottante du rectangle `cel` (dessiné en `r`) : sous lui s'il y a la place, sinon en bas dedans ; toujours dans `zone`
+    unsafe fn dessiner_espace_infobulle(&self, c: &Cible2D, arbre: &espace::analyse::Arbre, cel: &espace::analyse::Cellule, r: &espace::carte::Rect, zone: espace::carte::Rect, fondu: f32) {
+        let f = &self.f;
+        let chemin = cel.id.filter(|_| cel.dossier).map(|id| arbre.chemin_de(id));
+        let genre = if cel.id.is_none() { "Petits éléments regroupés" } else if cel.dossier { "Dossier" } else { cel.genre.libelle() };
+        let action = if cel.dossier && cel.id.is_some() { "Clic : entrer dans ce dossier" } else if cel.id.is_none() { "Trop petits pour être dessinés un par un" } else { "Fichier" };
+        let lignes = [
+            (cel.nom.clone(), &BLANC),
+            (format!("{genre} · {} · {}", systeme::taille(cel.taille), espace::analyse::pourcent(cel.part)), &BLANC_DOUX),
+            (chemin.unwrap_or_default(), &BLANC_FAIBLE),
+            (action.to_string(), &ACCENT),
+        ];
+        let lignes: Vec<&(String, &D2D1_COLOR_F)> = lignes.iter().filter(|(t, _)| !t.is_empty()).collect();
+        let largeur = lignes.iter().map(|(t, _)| self.mesurer(t, &f.petit)).fold(0.0f32, f32::max).clamp(180.0, 420.0) + 24.0;
+        let hauteur = lignes.len() as f32 * 20.0 + 14.0;
+        let x = (r.x + 10.0).clamp(zone.x, (zone.x + zone.l - largeur).max(zone.x));
+        let sous = r.y + r.h + 6.0;
+        let y = if sous + hauteur <= zone.y + zone.h + 40.0 { sous } else { (r.y + r.h - hauteur - 8.0).max(zone.y) };
+        let carte = rect(x, y, largeur, hauteur);
+        let arrondi = D2D1_ROUNDED_RECT { rect: carte, radiusX: RAYON_PETIT, radiusY: RAYON_PETIT };
+        let d = mouvement::Decalage { dx: 0.0, dy: 0.0, echelle: 1.0, opacite: fondu };
+        self.avec_decalage(c, &d, ((carte.left + carte.right) / 2.0, (carte.top + carte.bottom) / 2.0), rect(carte.left - 12.0, carte.top - 12.0, largeur + 24.0, hauteur + 40.0), || {
+            self.ombre_flottante(c, carte, RAYON_PETIT, 8.0);
+            self.couleur(c, &CHAMP_FOND);
+            c.rt.FillRoundedRectangle(&arrondi, &c.pinceau);
+            self.couleur(c, &BLANC_TRES_FAIBLE);
+            c.rt.DrawRoundedRectangle(&arrondi, &c.pinceau, 1.0, None);
+            for (i, (t, couleur)) in lignes.iter().enumerate() {
+                self.couleur(c, couleur);
+                self.texte(c, &f.petit, t, rect(x + 12.0, y + 7.0 + i as f32 * 20.0, largeur - 20.0, 20.0));
+            }
+        });
+    }
+
     /// Page des réglages, à la place des colonnes et de la liste : rail des catégories à gauche, puis la catégorie
     /// choisie (titre h2 et cartes) à droite (maquette v6 `.set`)
-    unsafe fn dessiner_page(&self, c: &Cible2D, app: &App, l: f32, h: f32, vp: &VuePage, premier: bool) {
+    unsafe fn dessiner_page(&self, c: &Cible2D, app: &App, l: f32, h: f32, vp: &VuePage, premier: bool, vue: &Vue) {
         let rt = &c.rt;
         let f = &self.f;
         let (gauche, droite) = (page::gauche(), page::droite(l));
@@ -5786,6 +7071,7 @@ impl Rendu {
                 if actif { self.couleur_ou(c, &SELECTION, &SELECTION_CLAIR); } else { self.couleur_k(c, &SURVOL, fondu); }
                 rt.FillRoundedRectangle(&D2D1_ROUNDED_RECT { rect: r, radiusX: REGLAGE_SEG_RAYON, radiusY: REGLAGE_SEG_RAYON }, &c.pinceau);
             }
+            self.reflet_sous_contenu(c, vue, Cible::ReglagesNav(k));
             // Barre d'accent de 3 x 16 (maquette `.ni .b3`, opacité 200 ms) : celle de la catégorie quittée s'éteint pendant que
             // la nouvelle s'allume
             let barre = self.mouvements.borrow_mut().barre_rail(k, actif, self.t_image.get(), crate::reglages::animations_actives());
@@ -5816,7 +7102,7 @@ impl Rendu {
                 // Une touche modifiable : la ligne choisie a un cadre, et celle qui attend sa touche le dit en couleur d'accent
                 let en_capture = matches!(ligne.element, Element::Raccourci(i) if p.capture == Some(i));
                 if p.focus == k && formulaire.is_none() && matches!(ligne.element, Element::Raccourci(_)) {
-                    let cadre = D2D1_ROUNDED_RECT { rect: rect(gauche + 0.5, y + 2.5, droite - gauche - 1.0, hl - 5.0), radiusX: 8.0, radiusY: 8.0 };
+                    let cadre = D2D1_ROUNDED_RECT { rect: rect(gauche + 0.5, y + 2.5, droite - gauche - 1.0, hl - 5.0), radiusX: RAYON_PETIT, radiusY: RAYON_PETIT };
                     self.couleur(c, &ACCENT_BORD);
                     rt.DrawRoundedRectangle(&cadre, &c.pinceau, 1.0, None);
                 }
@@ -5847,6 +7133,7 @@ impl Rendu {
             let bord = D2D1_ROUNDED_RECT { rect: rect(carte.left + 0.5, carte.top + 0.5, carte.right - carte.left - 1.0, carte.bottom - carte.top - 1.0), radiusX: REGLAGE_CARTE_RAYON, radiusY: REGLAGE_CARTE_RAYON };
             self.couleur(c, if choisie { &ACCENT_BORD } else { &LIGNE });
             rt.DrawRoundedRectangle(&bord, &c.pinceau, 1.0, None);
+            self.reflet_sous_contenu(c, vue, Cible::Reglage(k));
 
             // Tuile de 36 : l'icône du réglage (celle du lieu pour un stockage)
             let cy = (carte.top + carte.bottom) / 2.0;
@@ -5913,7 +7200,7 @@ impl Rendu {
                     let b = rect(bord_droit - tw, cy - 14.0, tw, 28.0);
                     gauche_controle = b.left;
                     anneau_controle = Some(b);
-                    let rb = D2D1_ROUNDED_RECT { rect: b, radiusX: 14.0, radiusY: 14.0 };
+                    let rb = D2D1_ROUNDED_RECT { rect: b, radiusX: rayon_pilule(&b), radiusY: rayon_pilule(&b) };
                     let rouge = ligne.element == Element::Ajouter || (choisie && ligne.element == Element::Reinitialiser);
                     self.couleur(c, if rouge { &ACCENT } else if choisie { &BLANC } else { &BLANC_DOUX });
                     if rouge && choisie {
@@ -5962,8 +7249,9 @@ impl Rendu {
         let fondu_fermer = self.survol_k(Cible::ReglagesFermer);
         if fondu_fermer > 0.0 {
             self.couleur_k(c, &SURVOL, fondu_fermer);
-            rt.FillRoundedRectangle(&D2D1_ROUNDED_RECT { rect: fermer, radiusX: 8.0, radiusY: 8.0 }, &c.pinceau);
+            rt.FillRoundedRectangle(&D2D1_ROUNDED_RECT { rect: fermer, radiusX: RAYON_PETIT, radiusY: RAYON_PETIT }, &c.pinceau);
         }
+        self.reflet_sous_contenu(c, vue, Cible::ReglagesFermer);
         self.couleur(c, if app.survol == Cible::ReglagesFermer { &BLANC } else { &BLANC_DOUX });
         let (cx, cy) = ((fermer.left + fermer.right) / 2.0, (fermer.top + fermer.bottom) / 2.0);
         self.trait_signe(c, (cx - 4.0, cy - 4.0), (cx + 4.0, cy + 4.0), 1.4);
@@ -6012,18 +7300,18 @@ impl Rendu {
         let d_form = self.decalage_apparition(mouvement::APPARU_FORMULAIRE, formulaire.is_some(), mouvement::APPARU_CARTE_MS, 14.0, 0.96);
         if let Some(fo) = formulaire {
             let carte = page::carte_formulaire(l, h);
-            self.avec_decalage(c, &d_form, ((carte.left + carte.right) / 2.0, (carte.top + carte.bottom) / 2.0), rect(0.0, 0.0, l, h), || self.dessiner_formulaire(c, app, l, h, fo));
+            self.avec_decalage(c, &d_form, ((carte.left + carte.right) / 2.0, (carte.top + carte.bottom) / 2.0), rect(0.0, 0.0, l, h), || self.dessiner_formulaire(c, app, l, h, fo, vue));
         }
     }
 
     /// Carte « ajouter un stockage », par-dessus la page assombrie
-    unsafe fn dessiner_formulaire(&self, c: &Cible2D, app: &App, l: f32, h: f32, fo: &page::Formulaire) {
+    unsafe fn dessiner_formulaire(&self, c: &Cible2D, app: &App, l: f32, h: f32, fo: &page::Formulaire, vue: &Vue) {
         let rt = &c.rt;
         let f = &self.f;
         self.couleur(c, &rgba(0, 0, 0, 0.55));
         rt.FillRectangle(&rect(0.0, HAUTEUR_TITRE + 1.0, l, h - HAUTEUR_TITRE - 1.0), &c.pinceau);
         let carte = page::carte_formulaire(l, h);
-        let arrondi = D2D1_ROUNDED_RECT { rect: carte, radiusX: 14.0, radiusY: 14.0 };
+        let arrondi = D2D1_ROUNDED_RECT { rect: carte, radiusX: RAYON_GRAND, radiusY: RAYON_GRAND };
         self.couleur(c, &CHAMP_FOND);
         rt.FillRoundedRectangle(&arrondi, &c.pinceau);
         self.trame_arrondie(c, &arrondi);
@@ -6048,8 +7336,9 @@ impl Rendu {
             if k == page::F_GENRE {
                 if focus || survole {
                     self.couleur(c, if focus { &SURVOL_FORT } else { &SURVOL });
-                    rt.FillRoundedRectangle(&D2D1_ROUNDED_RECT { rect: champ, radiusX: 7.0, radiusY: 7.0 }, &c.pinceau);
+                    rt.FillRoundedRectangle(&D2D1_ROUNDED_RECT { rect: champ, radiusX: RAYON_PETIT, radiusY: RAYON_PETIT }, &c.pinceau);
                 }
+                self.reflet_sous_contenu(c, vue, Cible::Champ(k));
                 self.couleur(c, &BLANC);
                 self.texte(c, &f.liste, &format!("‹  {}  ›", fo.sorte.libelle()), rect(champ.left + 10.0, champ.top, champ.right - champ.left - 20.0, champ.bottom - champ.top));
                 continue;
@@ -6071,7 +7360,7 @@ impl Rendu {
             if focus {
                 self.champ(c, ed, rect(champ.left + 10.0, champ.top, champ.right - champ.left - 10.0, champ.bottom - champ.top));
             } else {
-                let cadre = D2D1_ROUNDED_RECT { rect: champ, radiusX: 5.0, radiusY: 5.0 };
+                let cadre = D2D1_ROUNDED_RECT { rect: champ, radiusX: RAYON_PETIT, radiusY: RAYON_PETIT };
                 self.couleur(c, if survole { &BLANC_DOUX } else { &BLANC_TRES_FAIBLE });
                 rt.DrawRoundedRectangle(&cadre, &c.pinceau, 1.0, None);
                 let zone_texte = rect(champ.left + 10.0, champ.top, champ.right - champ.left - 20.0, champ.bottom - champ.top);
@@ -6114,7 +7403,7 @@ impl Rendu {
         for (k, b) in boutons {
             let focus = fo.focus == k;
             let survole = app.survol == Cible::Champ(k);
-            let rb = D2D1_ROUNDED_RECT { rect: b, radiusX: 19.0, radiusY: 19.0 };
+            let rb = D2D1_ROUNDED_RECT { rect: b, radiusX: rayon_pilule(&b), radiusY: rayon_pilule(&b) };
             let ajouter = k == page::F_AJOUTER;
             let texte = if !ajouter {
                 "Annuler"
@@ -6132,6 +7421,7 @@ impl Rendu {
                 self.couleur(c, if ajouter { &ACCENT } else if focus || survole { &BLANC } else { &BLANC_DOUX });
                 rt.DrawRoundedRectangle(&rb, &c.pinceau, if focus { 2.0 } else { 1.2 }, None);
             }
+            self.reflet_sous_contenu(c, vue, Cible::Champ(k));
             self.couleur(c, if ajouter && (focus || survole) { &ENCRE_SUR_ACCENT } else { &BLANC });
             self.texte(c, &f.petit_centre, texte, b);
         }
@@ -6141,6 +7431,283 @@ impl Rendu {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Une appli dont chaque section du milieu a des éléments : de quoi forcer le repli automatique
+    fn app_du_volet() -> App {
+        let mut app = App::nouveau(Emplacement::CePC);
+        let fav = |n: &str| crate::app::Favori { nom: n.into(), emplacement: Emplacement::dossier("C:\\x"), icone: crate::icones::Icone::Dossier };
+        let lieu = |n: &str| crate::stockages::Lieu { nom: n.into(), emplacement: Emplacement::dossier("C:\\x"), icone: crate::icones::Icone::Nuage, ajoute: None, detail: "C:\\x".into() };
+        app.favoris = vec![fav("A"), fav("B"), fav("C")];
+        app.epingles = vec![fav("D"), fav("E")];
+        app.groupes = vec![crate::groupes::Groupe { nom: "G".into(), couleur: 'a', nombre: 1 }; 2];
+        app.nuages = vec![lieu("N"), lieu("O")];
+        app.serveurs = vec![lieu("S"), lieu("T")];
+        app.volet_force = 0;
+        app.volet_ouv = [f32::NAN; 7];
+        app.volet_defilement = 0.0;
+        app
+    }
+
+    /// Fenêtre haute : rien ne se replie, rien ne défile.
+    #[test]
+    fn le_volet_haut_garde_toutes_ses_sections_ouvertes() {
+        let mut app = app_du_volet();
+        app.volet_bas = 5000.0;
+        let d = dispo_volet(&app);
+        assert_eq!(d.ouverture_cible, [1.0; 7], "{:?}", d.titres);
+        assert_eq!(d.defilement_max, 0.0);
+        assert!(d.separateur.is_none());
+    }
+
+    /// Fenêtre qui rétrécit : les sections se replient dans l'ordre SERVEURS, CLOUD, GROUPES, ÉPINGLES, FAVORIS (jamais une plus
+    /// utile avant une moins utile), DISQUES reste ouverte et entière, ses cartes ne passent jamais sous le bas du volet, et les
+    /// réglages de l'auteur ne bougent pas.
+    #[test]
+    fn le_volet_se_replie_dans_l_ordre_et_garde_les_disques() {
+        use std::sync::atomic::Ordering::Relaxed;
+        let mut app = app_du_volet();
+        let (replie_avant, masque_avant) = (crate::reglages::VOLET_REPLIE.load(Relaxed), crate::reglages::VOLET_MASQUE.load(Relaxed));
+        let mut vu_replie = false;
+        for bas in (150..1500).rev().step_by(10) {
+            app.volet_bas = bas as f32;
+            let d = dispo_volet(&app);
+            let repliees: Vec<usize> = (0..5).filter(|&k| d.ouverture_cible[k] < 0.5).collect();
+            // Le repli suit l'ordre de priorité : si une section l'est, toutes celles qui passent avant elle aussi
+            for (i, &k) in ORDRE_REPLI_AUTO.iter().enumerate() {
+                if repliees.contains(&k) {
+                    assert!(ORDRE_REPLI_AUTO[..i].iter().all(|j| repliees.contains(j)), "bas {bas} : {repliees:?}");
+                    vu_replie = true;
+                }
+            }
+            assert_eq!(d.ouverture_cible[5], 1.0, "DISQUES reste ouverte (bas {bas})");
+            // Les disques sont posés dans le volet quand il a la place de les montrer
+            let (_, y_disques, _, _, _) = d.titres.iter().find(|t| t.0 == "DISQUES").copied().expect("titre DISQUES");
+            let hauteur = VOLET_ENTETE + app.disques.len() as f32 * volet_disque();
+            if (bas as f32) >= VOLET_Y + 2.0 * volet_ligne() + 8.0 + hauteur {
+                assert!(y_disques + hauteur <= bas as f32 + 0.5, "bas {bas} : disques à {y_disques}, hauteur {hauteur}");
+            }
+            // Aucune zone cliquable ne dépasse sa bande
+            for (_, r) in zones_volet(&app) {
+                assert!(r.bottom <= bas as f32 + 0.5 && r.top >= HAUTEUR_TITRE, "bas {bas} : {r:?}");
+            }
+        }
+        assert!(vu_replie, "le repli automatique doit avoir joué sur la plage testée");
+        assert_eq!((replie_avant, masque_avant), (crate::reglages::VOLET_REPLIE.load(Relaxed), crate::reglages::VOLET_MASQUE.load(Relaxed)), "les réglages ne changent pas");
+    }
+
+    /// Quand tout replié ne suffit pas (fenêtre minuscule), le milieu défile et la molette peut aller jusqu'au bout ; une section
+    /// rouverte à la main (`volet_force`) n'est plus repliée d'office.
+    #[test]
+    fn le_milieu_defile_quand_le_repli_ne_suffit_pas_et_le_clic_force_rouvre() {
+        let mut app = app_du_volet();
+        app.volet_bas = 330.0;
+        let d = dispo_volet(&app);
+        assert!(d.defilement_max > 0.5 || d.ouverture_cible[..5].iter().any(|&o| o < 0.5), "{:?}", d.ouverture_cible);
+        // Fenêtre très basse : tout est replié, il reste de quoi défiler ou rien à montrer, jamais de zone hors bande
+        app.volet_bas = 200.0;
+        let d = dispo_volet(&app);
+        assert!(d.ouverture_cible[..5].iter().all(|&o| o < 0.5), "{:?}", d.ouverture_cible);
+        // Un clic force FAVORIS ouverte : elle n'est plus repliée et le milieu doit défiler pour la montrer
+        app.volet_force = 1;
+        let d = dispo_volet(&app);
+        assert_eq!(d.ouverture_cible[0], 1.0);
+        assert!(d.defilement_max > 0.5, "le milieu doit défiler : {}", d.defilement_max);
+        assert!(volet_defilable(&app));
+        assert!(d.separateur.is_some());
+    }
+
+    /// Lot 3 de l'audit UX : la carte de la Corbeille se calcule depuis son contenu (matrice de 100 points, titre, jusqu'à quatre
+    /// lignes de texte), avec la même marge des quatre côtés, et reste dans son bloc. Avant : 340 × 146 posés à la main, la matrice
+    /// dépassait de 2 DIP en bas et le texte de 16 DIP à droite.
+    #[test]
+    fn la_carte_de_la_corbeille_contient_son_contenu() {
+        let (bx, by) = (100.0_f32, 50.0_f32);
+        // Largeurs de texte : courte, moyenne, absurde (plus grande que le bloc). La colonne n'est jamais vide : « CLIC : OUVRIR »
+        for largeur in [60.0_f32, 130.5, 1000.0] {
+            let g = geometrie_corbeille(bx, by, largeur);
+            // Contenu dessiné, relu des constantes du dessin
+            let (gx, gy) = (bx + MATRICE_DX, by + MATRICE_DY);
+            let matrice = D2D_RECT_F {
+                left: gx - MATRICE_RAYON_POINT,
+                top: gy - MATRICE_RAYON_POINT,
+                right: gx + 9.0 * MATRICE_PAS + MATRICE_RAYON_POINT,
+                bottom: gy + 9.0 * MATRICE_PAS + MATRICE_RAYON_POINT,
+            };
+            // Titre : on prend le haut visible des lettres, pas celui du rectangle de texte
+            let titre = D2D_RECT_F { left: bx, top: by + CORBEILLE_TITRE_DECALAGE, right: bx + 80.0, bottom: by + CORBEILLE_LIGNE_H };
+            let texte = D2D_RECT_F { left: g.texte_x, top: by + 26.0, right: g.texte_x + g.texte_l, bottom: by + 26.0 + 3.0 * CORBEILLE_PAS_LIGNES + CORBEILLE_LIGNE_H };
+            for (nom, r) in [("matrice", matrice), ("titre", titre), ("texte", texte)] {
+                assert!(
+                    r.left >= g.carte.left && r.top >= g.carte.top && r.right <= g.carte.right && r.bottom <= g.carte.bottom,
+                    "largeur {largeur} : {nom} {r:?} dépasse la carte {:?}",
+                    g.carte
+                );
+            }
+            // Marges égales : le bord le plus proche du contenu est à CORBEILLE_MARGE sur les quatre côtés
+            let contenu_g = titre.left.min(matrice.left);
+            let contenu_h = titre.top.min(matrice.top);
+            let contenu_b = matrice.bottom.max(texte.bottom);
+            let contenu_d = matrice.right.max(texte.right);
+            assert!((contenu_g - g.carte.left - CORBEILLE_MARGE).abs() < 0.01, "marge gauche, largeur {largeur}");
+            assert!((contenu_h - g.carte.top - CORBEILLE_MARGE).abs() < 0.01, "marge haute, largeur {largeur}");
+            assert!((g.carte.right - contenu_d - CORBEILLE_MARGE).abs() < 0.01, "marge droite, largeur {largeur}");
+            // Bas : la matrice est plus basse que le texte (4 lignes) ; la marge se prend sur elle
+            assert!(matrice.bottom >= texte.bottom, "le texte descend plus bas que la matrice");
+            assert!((g.carte.bottom - contenu_b - CORBEILLE_MARGE).abs() < 0.01, "marge basse, largeur {largeur}");
+            // La carte reste dans son bloc : pas de recouvrement du bloc voisin ni de la ligne de stockages
+            assert!(g.carte.left >= bx - CORBEILLE_MARGE && g.carte.right <= bx + CARTE_BLOC_L, "largeur {largeur} : déborde du bloc à droite");
+            assert!(g.carte.bottom <= by + CARTE_BLOC_H, "largeur {largeur} : déborde du bloc en bas");
+        }
+        // La carte suit le texte : plus il est long, plus elle est large (jusqu'au bloc)
+        let (court, long) = (geometrie_corbeille(0.0, 0.0, 50.0), geometrie_corbeille(0.0, 0.0, 150.0));
+        assert!(long.carte.right > court.carte.right);
+    }
+
+    /// La légende d'une carte de disque finit assez loin de la carte de la Corbeille (bloc suivant) : 16 DIP, pas 2 comme avant
+    #[test]
+    fn la_legende_ne_colle_pas_a_la_carte_voisine() {
+        let lx_rel = MATRICE_DX + 10.0 * MATRICE_PAS + 8.0;
+        let fin_legende = lx_rel + 16.0 + place_legende(lx_rel);
+        // Bord gauche de la carte voisine, depuis le coin du bloc de la légende
+        let carte_voisine = CARTE_BLOC_L + geometrie_corbeille(0.0, 0.0, 100.0).carte.left;
+        let ecart = carte_voisine - fin_legende;
+        assert!(ecart >= 16.0 - 0.01, "écart {ecart} DIP entre la légende et la carte voisine");
+        // Assez de place pour « SYSTEME, NON INDEXE » et sa taille : le nom ne doit pas perdre de mots
+        assert!(place_legende(lx_rel) >= 180.0, "légende trop étroite : {}", place_legende(lx_rel));
+    }
+
+    /// Lot 2 de l'audit UX : le reflet éclaire la forme que le dessin trace. Le rayon de chaque cible vient d'une table unique
+    /// (`rayon_cible`) ; ici : chaque rayon est un jeton de l'échelle (aucun 10 ou 18 isolé), et `cible_du_reflet` n'écrit aucun
+    /// rayon en dur (sinon le reflet redevient différent du fond, comme les onglets à 8 contre 12 avant ce lot).
+    #[test]
+    fn le_reflet_lit_le_rayon_du_dessin() {
+        let echelle = [RAYON_PETIT, RAYON_MOYEN, RAYON_GRAND, REGLAGE_CARTE_RAYON, REGLAGE_SEG_RAYON];
+        let cibles = [
+            Cible::Onglet(0), Cible::FermerOnglet(0), Cible::NouvelOnglet, Cible::CePc, Cible::Favori(0), Cible::Epingle(0), Cible::Disque(0),
+            Cible::Nuage(0), Cible::Serveur(0), Cible::Groupe(0), Cible::Arbre(0), Cible::Reglages, Cible::ReglagesFermer, Cible::ReglagesNav(0),
+            Cible::Reglage(0), Cible::EssentielHaut, Cible::Terminal, Cible::TerminalFermer, Cible::TerminalExterne, Cible::TerminalOnglet(0), Cible::TerminalOngletFermer(0), Cible::TerminalNouveau, Cible::TerminalJournal,
+            Cible::Precedent, Cible::Suivant, Cible::Parent, Cible::Note, Cible::Corbeille, Cible::StockageCePc(0), Cible::AjouterStockage, Cible::OuvrirEspace, Cible::OuvrirNettoyage, Cible::EspaceVolet,
+            Cible::EspaceFermer, Cible::EspaceNav(0), Cible::EspaceLigne(0), Cible::EspaceVue(0), Cible::EspaceCellule(0), Cible::EspaceChemin(0), Cible::Puce(0),
+            Cible::NettoyageLigne(0), Cible::NettoyageCase(0), Cible::NettoyageBouton(0),
+        ];
+        for c in cibles {
+            let r = rayon_cible(c).unwrap_or_else(|| panic!("{c:?} sans rayon dans la table"));
+            assert!(echelle.contains(&r), "{c:?} : rayon {r} hors de l'échelle {echelle:?}");
+        }
+        // Les formes à rayon variable n'ont pas d'entrée : leur rayon se lit sur le rectangle (pilules) ou sur l'outil
+        assert_eq!(rayon_cible(Cible::Outil(crate::barre::Outil::Nouveau)), None);
+        // Toutes les lignes d'un même volet, disque compris, partagent un seul rayon : le petit (lot 5, D-5)
+        assert_eq!(rayon_cible(Cible::CePc), rayon_cible(Cible::Favori(3)));
+        assert_eq!(rayon_cible(Cible::Disque(0)), rayon_cible(Cible::CePc));
+        assert_eq!(rayon_cible(Cible::Disque(0)), Some(RAYON_PETIT));
+
+        let source = include_str!("rendu.rs");
+        let debut = source.find("fn cible_du_reflet").expect("cible_du_reflet");
+        let fin = debut + source[debut..].find("unsafe fn dessiner_reflet").expect("dessiner_reflet");
+        let mut fautes = Vec::new();
+        for ligne in source[debut..fin].lines().filter(|l| l.contains("libre(") || l.contains("coin: ")) {
+            for jeton in ligne.split([',', ')']) {
+                let jeton = jeton.trim().trim_start_matches("coin: ");
+                if jeton.parse::<f32>().is_ok_and(|v| v >= 5.0) {
+                    fautes.push(ligne.trim().to_string());
+                }
+            }
+        }
+        assert!(fautes.is_empty(), "rayon écrit en dur dans cible_du_reflet : {fautes:?}");
+    }
+
+    /// Reflet sous le texte : chaque cible que `cible_du_reflet` accepte est soit réclamée par son élément (`reflet_sous` après son
+    /// fond, avant son texte), soit déclarée « dernière passe » ici (zone connue seulement pendant le dessin). Une cible ajoutée
+    /// à `cible_du_reflet` sans l'un ni l'autre fait échouer ce test : son reflet repasserait en silence par-dessus le texte.
+    #[test]
+    fn chaque_cible_du_reflet_est_reclamee() {
+        // Réclamées avec leur nom écrit dans l'appel `reflet_sous…(…, Cible::Nom…)`
+        const EXPLICITES: [&str; 15] = [
+            "Terminal", "TerminalFermer", "TerminalExterne", "TerminalOnglet", "TerminalOngletFermer", "TerminalNouveau", "TerminalJournal", "Note", "Corbeille", "ReglagesNav", "Reglage", "ReglagesFermer", "Champ",
+            "Outil", "Puce",
+        ];
+        // Réclamées par une boucle qui passe la cible dans la variable `quoi` (onglets, volet, boutons du haut, navigation, arbre,
+        // stockages de Ce PC)
+        const PAR_BOUCLE: [&str; 19] = [
+            "Onglet", "FermerOnglet", "NouvelOnglet", "CePc", "EspaceVolet", "Favori", "Epingle", "Disque", "Nuage", "Serveur", "Groupe", "Arbre",
+            "Reglages", "EssentielHaut", "Precedent", "StockageCePc", "AjouterStockage", "OuvrirEspace", "OuvrirNettoyage",
+        ];
+        // Les deux dernières de la navigation partagent la boucle de `Precedent` ; les pastilles et le menu : zones posées en cours de dessin
+        const VOISINES: [&str; 2] = ["Suivant", "Parent"];
+        const DERNIERE_PASSE: [&str; 3] = ["Pastille", "BoutonPastille", "PlusPastilles"];
+
+        let source = include_str!("rendu.rs");
+        let code = &source[..source.find("\n#[cfg(test)]\nmod tests").expect("module de tests")];
+        let debut = code.find("fn cible_du_reflet").expect("cible_du_reflet");
+        let fin = debut + code[debut..].find("unsafe fn dessiner_reflet").expect("dessiner_reflet");
+        // Les variantes que `cible_du_reflet` accepte : celles de la tête de chaque bras du `match app.survol`
+        let corps = &code[debut..fin];
+        let match_survol = corps.find("match app.survol {").expect("match app.survol");
+        let mut acceptees: Vec<&str> = Vec::new();
+        for ligne in corps[match_survol..].lines().skip(1) {
+            let tete = ligne.trim();
+            if !tete.starts_with("Cible::") {
+                continue;
+            }
+            let Some(avant_fleche) = tete.split("=>").next().filter(|_| tete.contains("=>")) else { continue };
+            for morceau in avant_fleche.split('|') {
+                if let Some(nom) = morceau.trim().strip_prefix("Cible::") {
+                    let nom = nom.split(['(', ' ', ',']).next().unwrap_or("");
+                    if !nom.is_empty() && !acceptees.contains(&nom) {
+                        acceptees.push(nom);
+                    }
+                }
+            }
+        }
+        assert!(acceptees.len() >= 25, "le balayage de cible_du_reflet n'a trouvé que {acceptees:?}");
+        let connues: Vec<&str> = EXPLICITES.iter().chain(&PAR_BOUCLE).chain(&VOISINES).chain(&DERNIERE_PASSE).copied().collect();
+        let inconnues: Vec<&&str> = acceptees.iter().filter(|n| !connues.contains(n)).collect();
+        assert!(inconnues.is_empty(), "cibles du reflet ni réclamées ni déclarées en dernière passe : {inconnues:?}");
+
+        // Chaque cible « explicite » apparaît dans un appel de réclamation
+        let appels: Vec<&str> = code.lines().filter(|l| l.contains("self.reflet_sous")).collect();
+        for nom in EXPLICITES {
+            let motif = format!("Cible::{nom}");
+            assert!(appels.iter().any(|l| l.contains(&motif)), "{nom} : aucun appel reflet_sous… ne la réclame");
+        }
+        // Les boucles passent leur cible dans `quoi`, ou la reçoivent en paramètre : au moins un appel de chaque forme existe
+        assert!(appels.iter().any(|l| l.contains("reflet_sous(c, quoi)")), "aucune boucle ne réclame par `quoi`");
+        assert!(appels.iter().any(|l| l.contains("reflet_sous_contenu(c, vue, quoi)")), "aucune boucle de contenu ne réclame par `quoi`");
+    }
+
+    /// Reflet sous le texte : un élément ne prend que son reflet, une seule fois ; la passe finale ramasse le reste, jamais deux fois.
+    #[test]
+    fn reflets_reclames_une_seule_fois() {
+        let plan = |zone: D2D_RECT_F, cible: Option<Cible>| reflet::planifier(zone, 8.0, false, Some((zone.left + 5.0, zone.top + 5.0)), true).map(|p| reflet::Plan { cible, ..p }).expect("plan");
+        let mut attente: Vec<ReflexAttente> = vec![
+            (plan(rect(10.0, 10.0, 80.0, 30.0), Some(Cible::Onglet(1))), None, 1.0, false),
+            (plan(rect(100.0, 10.0, 80.0, 30.0), Some(Cible::Onglet(2))), None, 0.4, false),
+            (plan(rect(200.0, 10.0, 80.0, 30.0), None), None, 1.0, false),
+        ];
+        // L'onglet 1 prend le sien, pas celui de l'onglet 2 ni le reflet sans étiquette
+        let pris = reclamer_reflets(&mut attente, Some(Cible::Onglet(1)));
+        assert_eq!(pris.len(), 1);
+        assert_eq!(pris[0].2, 1.0);
+        // Une deuxième demande de l'onglet 1 ne rend plus rien : pas de reflet doublé dans l'image
+        assert!(reclamer_reflets(&mut attente, Some(Cible::Onglet(1))).is_empty());
+        // Un élément sans reflet (autre cible) ne prend rien
+        assert!(reclamer_reflets(&mut attente, Some(Cible::NouvelOnglet)).is_empty());
+        // La passe finale ramasse le reflet qui s'éteint (onglet 2) et celui sans étiquette, une seule fois
+        assert_eq!(reclamer_reflets(&mut attente, None).len(), 2);
+        assert!(reclamer_reflets(&mut attente, None).is_empty());
+    }
+
+    /// La croix d'un onglet est éclairée comme l'onglet entier : l'étiquette du reflet est celle de l'onglet, que la boucle des
+    /// onglets réclame, et `decale()` ne la perd pas (sinon le reflet repasserait par-dessus le texte).
+    #[test]
+    fn reflet_decale_garde_son_etiquette() {
+        let p = reflet::planifier(rect(10.0, 10.0, 80.0, 30.0), 12.0, false, Some((20.0, 20.0)), true).expect("plan");
+        let p = reflet::Plan { decalage: -2.0, cible: Some(Cible::Onglet(3)), ..p };
+        let d = p.decale();
+        assert_eq!(d.cible, Some(Cible::Onglet(3)));
+        assert_eq!(d.zone.top, p.zone.top - 2.0);
+        assert_eq!(d.decalage, 0.0);
+    }
 
     /// Doto est dans l'exe : la collection privée existe, contient la famille « Doto » et ses graisses nommées, sans dépendre de la
     /// police installée dans Windows (sans cela, un autre PC afficherait les titres en police ordinaire).

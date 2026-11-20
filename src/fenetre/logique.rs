@@ -24,6 +24,18 @@ pub(super) fn crans_molette(wparam: usize) -> f32 {
     ((wparam >> 16) & 0xFFFF) as i16 as f32 / 120.0
 }
 
+/// Crans entiers à envoyer à un programme du terminal : un pavé tactile envoie des fractions de cran (8 à 30 sur 120),
+/// qu'on cumule dans `reste` jusqu'à un cran entier ; un changement de sens repart de zéro. Positif = vers le haut.
+pub(super) fn crans_entiers(reste: &mut f32, crans: f32) -> isize {
+    if *reste * crans < 0.0 {
+        *reste = 0.0;
+    }
+    *reste += crans;
+    let entier = reste.trunc();
+    *reste -= entier;
+    entier as isize
+}
+
 /// La touche Ctrl est-elle tenue (`MK_CONTROL`) dans le `wParam` d'un message de souris
 pub(super) fn ctrl_tenue(wparam: usize) -> bool {
     wparam & 0x0008 != 0
@@ -47,6 +59,21 @@ pub(super) fn defilement_lot(actuel: usize, crans: f32, noms: usize) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn crans_entiers_cumule_les_fractions_et_garde_le_sens() {
+        let mut reste = 0.0;
+        // Souris à molette : un cran par message, dans les deux sens (le bas ne doit pas valoir un seul cran de trop)
+        assert_eq!(crans_entiers(&mut reste, 1.0), 1);
+        assert_eq!(crans_entiers(&mut reste, -3.0), -3);
+        // Pavé tactile : 0,25 par message, un cran toutes les quatre fois
+        let sorties: Vec<isize> = (0..8).map(|_| crans_entiers(&mut reste, 0.25)).collect();
+        assert_eq!(sorties, vec![0, 0, 0, 1, 0, 0, 0, 1]);
+        // Changement de sens : le reste de l'autre sens est oublié
+        assert_eq!(crans_entiers(&mut reste, 0.5), 0);
+        assert_eq!(crans_entiers(&mut reste, -0.5), 0);
+        assert_eq!(crans_entiers(&mut reste, -0.5), -1);
+    }
 
     #[test]
     fn les_coins_l_emportent_sur_les_cotes() {

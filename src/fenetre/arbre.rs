@@ -12,20 +12,17 @@ pub(crate) fn basculer_arbre(f: &mut Fenetre) {
     }
 }
 
-/// Fait défiler le volet (arbre) de `delta` DIP, sans dépasser le contenu
-pub(crate) unsafe fn defiler_volet(hwnd: HWND, f: &mut Fenetre, delta: f32) {
-    let (_, hp) = taille_client(hwnd);
-    let bas = f.dip(hp as i32) - 52.0;
-    let contenu = zones_volet(&f.app).iter().map(|z| z.1.bottom).fold(0.0, f32::max) + f.app.volet_defilement;
-    let max = (contenu - bas).max(0.0);
+/// Fait défiler le milieu du volet (sections et arbre, sous Ce PC et au-dessus des disques) de `delta` DIP, sans dépasser le contenu
+pub(crate) unsafe fn defiler_volet(_hwnd: HWND, f: &mut Fenetre, delta: f32) {
+    let max = dispo_volet(&f.app).defilement_max;
     f.app.volet_defilement = (f.app.volet_defilement + delta).clamp(0.0, max);
 }
 
 /// Fait défiler le volet pour que la ligne `j` de l'arbre soit dans sa partie visible
 pub(crate) unsafe fn montrer_ligne_arbre(hwnd: HWND, f: &mut Fenetre, j: usize) {
-    let (_, hp) = taille_client(hwnd);
-    let (haut, bas) = (HAUTEUR_TITRE + 4.0, f.dip(hp as i32) - 52.0);
-    if let Some((_, r)) = zones_volet(&f.app).into_iter().find(|(q, _)| *q == Cible::Arbre(j)) {
+    let d = dispo_volet(&f.app);
+    let (haut, bas) = d.region;
+    if let Some((_, r)) = d.zones.into_iter().find(|(q, _)| *q == Cible::Arbre(j)) {
         if r.top < haut {
             defiler_volet(hwnd, f, r.top - haut);
         } else if r.bottom > bas {

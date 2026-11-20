@@ -37,6 +37,8 @@ pub enum Emplacement {
     Sftp { hote: String, chemin: String },
     /// Fichiers identiques sous ce dossier (doublons.rs), en sections par lot
     Doublons(String),
+    /// Page ESPACE (espace/) : où est passé l'espace disque, lu dans l'index enregistré
+    Espace,
 }
 
 /// Recherche en cours : une recherche plus récente arrête les précédentes
@@ -90,9 +92,15 @@ impl Emplacement {
         Emplacement::Dossier(c)
     }
 
+    /// Une page pleine fenêtre (Réglages, ESPACE) : ni liste, ni terminal, ni aperçu, ni barre d'actions
+    pub fn est_page(&self) -> bool {
+        matches!(self, Emplacement::Reglages | Emplacement::Espace)
+    }
+
     pub fn parent(&self) -> Option<Emplacement> {
         match self {
             Emplacement::CePC | Emplacement::Reglages => None,
+            Emplacement::Espace => Some(Emplacement::CePC),
             Emplacement::Globale { .. } => Some(Emplacement::CePC),
             Emplacement::Groupe(_) | Emplacement::Recents | Emplacement::Corbeille | Emplacement::Panneau => None,
             Emplacement::Doublons(r) => Some(Emplacement::dossier(r)),
@@ -134,6 +142,7 @@ impl Emplacement {
         match self {
             Emplacement::CePC => "CE PC".into(),
             Emplacement::Reglages => "RÉGLAGES".into(),
+            Emplacement::Espace => "ESPACE DISQUE".into(),
             Emplacement::Serveur(h) => nom_hote(h),
             Emplacement::Recherche { motif, .. } => format!("« {} »", motif.to_uppercase()),
             Emplacement::Globale { motif } => format!("PC « {} »", motif.to_uppercase()),
@@ -173,6 +182,7 @@ impl Emplacement {
             Emplacement::Recherche { racine, .. } => Some(racine),
             Emplacement::Serveur(h) => return vec![(nom_hote(h), self.clone())],
             Emplacement::Reglages => return vec![("RÉGLAGES".into(), Emplacement::Reglages)],
+            Emplacement::Espace => return vec![("ESPACE DISQUE".into(), Emplacement::Espace)],
             Emplacement::Groupe(n) => return vec![("GROUPES".into(), self.clone()), (n.clone(), self.clone())],
             Emplacement::Recents => return vec![("RÉCENTS".into(), self.clone())],
             Emplacement::Corbeille => return vec![("CORBEILLE".into(), self.clone())],
@@ -569,7 +579,7 @@ pub fn lire(emp: &Emplacement, caches: bool) -> Result<Vec<Entree>, String> {
         }
         Emplacement::Recherche { racine, motif } => Ok(rechercher(racine, motif, caches)),
         Emplacement::Serveur(h) => crate::stockages::partages(h),
-        Emplacement::Reglages => Ok(Vec::new()),
+        Emplacement::Reglages | Emplacement::Espace => Ok(Vec::new()),
         Emplacement::Archive { fichier, interne } => crate::archive::lire(fichier, interne),
         Emplacement::Globale { motif } => crate::index::chercher_en_attendant(motif),
         Emplacement::Groupe(n) => Ok(crate::groupes::lire(n)),
@@ -686,6 +696,31 @@ pub fn nom_affiche(d: &str) -> String {
     }
     let t = d.trim_end_matches('\\');
     t.rsplit('\\').next().unwrap_or(t).trim_end_matches(':').to_string()
+}
+
+/// Nom d'un lieu du volet en casse de phrase (lot 7, D-3 : le contenu se lit en Segoe, les capitales sont réservées aux repères).
+/// Les lieux système sont stockés en capitales (`PERSONNEL`, `DISQUE LOCAL (C:)`) : seul un nom entièrement en capitales et d'au moins
+/// 5 lettres est converti, un nom tapé par l'auteur (`NAS`, `Photos`) reste tel quel. La lettre d'un lecteur, `(C:)`, reste en majuscule.
+pub fn casse_phrase(nom: &str) -> String {
+    let lettres = nom.chars().filter(|c| c.is_alphabetic()).count();
+    if lettres < 5 || nom.chars().any(|c| c.is_lowercase()) {
+        return nom.to_string();
+    }
+    let tab: Vec<char> = nom.chars().collect();
+    let mut sortie = String::with_capacity(nom.len());
+    let mut debut = true;
+    for (i, &c) in tab.iter().enumerate() {
+        let lecteur = c.is_alphabetic() && i > 0 && tab[i - 1] == '(' && tab.get(i + 1) == Some(&':');
+        if lecteur {
+            sortie.extend(c.to_uppercase());
+        } else if debut && c.is_alphabetic() {
+            sortie.extend(c.to_uppercase());
+            debut = false;
+        } else {
+            sortie.extend(c.to_lowercase());
+        }
+    }
+    sortie
 }
 
 /// Taille de tout ce que contient un dossier (vue « tailles »). S'arrête dès que `continuer` devient faux.
@@ -1112,6 +1147,16 @@ pub fn trier(v: &mut [Entree], col: Colonne, croissant: bool, melange: bool) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn casse_phrase_ne_touche_que_les_noms_systeme_en_capitales() {
+        assert_eq!(casse_phrase("PERSONNEL"), "Personnel");
+        assert_eq!(casse_phrase("TÉLÉCHARGEMENTS"), "Téléchargements");
+        assert_eq!(casse_phrase("DISQUE LOCAL (C:)"), "Disque local (C:)");
+        assert_eq!(casse_phrase("NAS"), "NAS", "sigle court : inchangé");
+        assert_eq!(casse_phrase("Mes photos"), "Mes photos", "nom tapé par l'auteur : inchangé");
+        assert_eq!(casse_phrase("iPhone de Léa"), "iPhone de Léa");
+    }
 
     #[test]
     fn disque_presque_plein_dit_les_go_libres_en_casse_normale() {

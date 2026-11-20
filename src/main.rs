@@ -77,6 +77,8 @@ mod theme;
 mod commandes;
 mod fenetre;
 mod minuteries;
+mod espace;
+mod terminal;
 
 use std::ffi::c_void;
 use std::sync::atomic::Ordering;
@@ -103,7 +105,7 @@ use palette::{Commande, Palette};
 use operations::{Bilan, WM_OPERATION_FINIE, WM_PROGRES};
 use page::{Element, Formulaire, Page};
 use reglages::{Depart, Stockage};
-use rendu::{boutons_nav, case_grille, grille_x0, dedans, zone_essentiel_haut, zone_recherche_haut, zone_reglages_haut, zone_terminal, zones_onglets, zones_volet, Rendu, Vue, VuePage};
+use rendu::{boutons_nav, case_grille, grille_x0, dedans, zone_essentiel_haut, zone_reglages_haut, zone_terminal, zone_terminal_grille, zones_onglets, zones_volet, dispo_volet, volet_defilable, Rendu, Vue, VuePage};
 use stockages::Lieu;
 use surveillance::WM_CHANGEMENT;
 use theme::*;
@@ -192,10 +194,21 @@ fn main() -> Result<()> {
             apercu_demande: None,
             apercu_numero: 0,
             apercu_attente: None,
-            terminal_visible: false,
-            terminal_lignes: Vec::new(),
+            terminaux: Vec::new(),
+            terminal_actif: 0,
+            terminal_dossier_liste: None,
+            terminal_journal: false,
+            terminal_operations: Vec::new(),
+            terminal_operations_version: usize::MAX,
+            historique_terminal: Default::default(),
+            historique_terminal_charge: false,
+            terminal_focus: false,
+            terminal_glisse: false,
+            terminal_glisse_appli: false,
+            terminal_molette_reste: 0.0,
             par_defaut: defaut::est_actif(),
             page: Page::nouvelle(),
+            espace: espace::Etat::nouveau(),
             detectes: Vec::new(),
             etats: Default::default(),
             etats_en_cours: false,
@@ -320,8 +333,17 @@ fn main() -> Result<()> {
                 animer(hwnd, f);
             }
         }
+        // `--terminal` : le panneau s'ouvre dans le dossier affiché (pour les captures, sans clic)
+        if terminal_demande() {
+            if let Some(f) = etat_de(hwnd) {
+                basculer_terminal(hwnd, f);
+                let _ = InvalidateRect(hwnd, None, false);
+            }
+        }
         // Téléchargements du navigateur : un seul abonnement au dossier Téléchargements pour tout le processus (si le réglage le veut)
         navigateur::regler(hwnd);
+        // Analyse automatique de l'espace récupérable (E4c) : en fond, seulement si la dernière a plus de 24 h
+        espace::instantane::lancer_si_ancienne();
 
         let mut msg = MSG::default();
         while GetMessageW(&mut msg, None, 0, 0).into() {

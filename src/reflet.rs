@@ -1,7 +1,9 @@
 // Reflet qui suit le curseur (phase 7, lot C3) : logique pure, sans Direct2D. Un élément cliquable survolé reçoit deux calques,
-// un halo radial dans son fond (rayon 120 DIP, 9 % au centre) et une lueur sur son contour (rayon 90 DIP, 55 % au centre).
+// un halo radial dans son fond (rayon 120 DIP, 9 % au centre) et une arête claire en haut (rayon 90 DIP, 30 % au centre ;
+// lot 2 de l'audit UX : elle remplace la lueur de tout le contour à 55 %).
 // Ce fichier décide SI un élément est éclairé et avec quoi (centre, rayons, alphas) ; le dessin est dans `rendu.rs`
-// (`Rendu::dessiner_reflet`, un seul pinceau radial réutilisé), la position du pointeur dans `fenetre/procedure.rs`.
+// (`Rendu::peindre_reflet`, appelé sous le texte de chaque élément par `reflet_sous`, sinon en fin d'image par `dessiner_reflet` ;
+// un seul pinceau radial réutilisé), la position du pointeur dans `fenetre/procedure.rs`.
 // Les couleurs ne sont pas ici : le halo est le blanc des jetons `REFLET_FOND` et `REFLET_TRAIT` de `theme.rs`, qui passent
 // par `contraste()` comme tout (encre en thème clair).
 
@@ -9,12 +11,14 @@ use windows::Win32::Graphics::Direct2D::Common::D2D_RECT_F;
 
 /// Rayon du halo de fond (DIP)
 pub const RAYON_HALO: f32 = 120.0;
-/// Rayon de la lueur du contour (DIP)
+/// Rayon de la lueur de l'arête haute (DIP)
 pub const RAYON_LUEUR: f32 = 90.0;
 /// Alpha au centre du halo (blanc, avant `contraste()`)
 pub const ALPHA_HALO: f32 = 0.09;
-/// Alpha au centre de la lueur du contour (blanc, avant `contraste()`)
-pub const ALPHA_LUEUR: f32 = 0.55;
+/// Alpha de l'arête haute au plus près du curseur (blanc, avant `contraste()` ; en thème clair, l'encre à 0,18 : `theme::alpha_encre`).
+/// Lot 2 de l'audit UX : la lueur de 1 px sur tout le contour (0,55) se lisait comme un trait isolé ; une arête claire en haut,
+/// plus douce, donne le bord de verre sans cerner l'élément.
+pub const ALPHA_LUEUR: f32 = 0.30;
 /// Au-delà de cette taille, pas de reflet : un rayon de 120 DIP sur une grande zone ferait une lampe de poche
 pub const LARGEUR_MAX: f32 = 480.0;
 pub const HAUTEUR_MAX: f32 = 160.0;
@@ -42,7 +46,9 @@ pub fn contient(r: &D2D_RECT_F, x: f32, y: f32) -> bool {
 }
 
 /// Distance du point au contour du rectangle (0 sur le trait, y compris pour un point dedans au bord ; un point dedans est
-/// mesuré au bord le plus proche, un point dehors à ce même bord)
+/// mesuré au bord le plus proche, un point dehors à ce même bord). Plus utilisée au dessin depuis que l'arête ne suit que le
+/// bord haut (`Plan::alpha_trait_maximal`) : gardée pour les tests, qui comparent l'arête au contour complet d'avant.
+#[cfg(test)]
 pub fn distance_au_bord(r: &D2D_RECT_F, x: f32, y: f32) -> f32 {
     let dx = (r.left - x).max(x - r.right).max(0.0);
     let dy = (r.top - y).max(y - r.bottom).max(0.0);
@@ -71,12 +77,32 @@ pub struct Plan {
     pub alpha_halo: f32,
     pub rayon_lueur: f32,
     pub alpha_lueur: f32,
+    /// Soulèvement vertical du fond au survol (DIP, 0 par défaut) : `zone` reste la zone au repos, qui identifie le reflet d'une
+    /// image à l'autre ; seul le dessin applique le décalage (`decale`)
+    pub decalage: f32,
+    /// Élément éclairé, quand son dessin peut peindre lui-même le reflet entre son fond et son texte (`reflet_sous`) ; `None` :
+    /// le reflet est peint par-dessus l'image entière, en dernière passe
+    pub cible: Option<crate::app::Cible>,
 }
 
 impl Plan {
-    /// Alpha de la lueur au point du contour le plus proche du curseur : le maximum que le trait recevra
+    /// Le plan tel qu'il se dessine : la zone suit le soulèvement du fond
+    pub fn decale(&self) -> Plan {
+        Plan { zone: D2D_RECT_F { top: self.zone.top + self.decalage, bottom: self.zone.bottom + self.decalage, ..self.zone }, decalage: 0.0, ..*self }
+    }
+
+    /// Alpha de l'arête haute au point de ce bord le plus proche du curseur (`centre` est dans la zone : sa distance au bord
+    /// haut est son ordonnée relative) : le maximum que l'arête recevra
     pub fn alpha_trait_maximal(&self) -> f32 {
-        alpha_a_distance(distance_au_bord(&self.zone, self.centre.0, self.centre.1), self.rayon_lueur, self.alpha_lueur)
+        alpha_a_distance((self.centre.1 - self.zone.top).max(0.0), self.rayon_lueur, self.alpha_lueur)
+    }
+
+    /// Bande du haut où l'arête est tracée : la zone sur toute sa largeur, haute du rayon de coin (le trait de 1 px et ses deux
+    /// arcs de coin, jamais les côtés), bornée à la moitié de la hauteur et à 1 DIP au moins. Toujours dans la zone.
+    pub fn bande_arete(&self) -> D2D_RECT_F {
+        let haut = self.zone.bottom - self.zone.top;
+        let h = self.rayon_coin.min(haut / 2.0).max(1.0).min(haut);
+        D2D_RECT_F { left: self.zone.left, top: self.zone.top, right: self.zone.right, bottom: self.zone.top + h }
     }
 }
 
@@ -90,7 +116,7 @@ pub fn planifier(zone: D2D_RECT_F, rayon_coin: f32, desactive: bool, pointeur: O
     if !contient(&zone, x, y) {
         return None;
     }
-    Some(Plan { zone, rayon_coin, centre: (x, y), rayon_halo: RAYON_HALO, alpha_halo: ALPHA_HALO, rayon_lueur: RAYON_LUEUR, alpha_lueur: ALPHA_LUEUR })
+    Some(Plan { zone, rayon_coin, centre: (x, y), rayon_halo: RAYON_HALO, alpha_halo: ALPHA_HALO, rayon_lueur: RAYON_LUEUR, alpha_lueur: ALPHA_LUEUR, decalage: 0.0, cible: None })
 }
 
 /// Position du pointeur imposée pour une capture sans souris : `SPACEFILES_REFLET=x,y` (DIP, coordonnées de la fenêtre).
@@ -165,9 +191,25 @@ mod tests {
     fn curseur_au_bord_eclaire_et_la_lueur_est_au_maximum() {
         let p = planifier(bouton(), 8.0, false, Some((100.0, 118.0)), true).expect("pile sur le bord gauche");
         assert_eq!(distance_au_bord(&p.zone, 100.0, 118.0), 0.0);
-        assert!((p.alpha_trait_maximal() - ALPHA_LUEUR).abs() < 1e-6);
-        let coin = planifier(bouton(), 8.0, false, Some((220.0, 136.0)), true).expect("pile sur le coin");
+        // L'arête est en haut : à 18 DIP du bord haut, elle n'est pas au maximum même pile sur le bord gauche
+        assert!(p.alpha_trait_maximal() < ALPHA_LUEUR);
+        let haut = planifier(bouton(), 8.0, false, Some((150.0, 100.0)), true).expect("pile sur le bord haut");
+        assert!((haut.alpha_trait_maximal() - ALPHA_LUEUR).abs() < 1e-6);
+        let coin = planifier(bouton(), 8.0, false, Some((220.0, 100.0)), true).expect("pile sur le coin haut");
         assert!((coin.alpha_trait_maximal() - ALPHA_LUEUR).abs() < 1e-6);
+    }
+
+    #[test]
+    fn la_bande_de_l_arete_reste_dans_la_zone_et_suit_le_rayon_de_coin() {
+        for (h, coin) in [(36.0, 12.0), (36.0, 8.0), (20.0, 12.0), (4.0, 16.0), (160.0, 16.0)] {
+            let z = rect(100.0, 100.0, 120.0, h);
+            let p = planifier(z, coin, false, Some((150.0, 100.0 + h / 2.0)), true).unwrap();
+            let b = p.bande_arete();
+            assert_eq!((b.left, b.right, b.top), (z.left, z.right, z.top), "pleine largeur, collée au bord haut");
+            assert!(b.bottom <= z.bottom && b.bottom > b.top, "dans la zone, jamais vide : {b:?}");
+            assert!(b.bottom - b.top <= coin.max(1.0) + 1e-6, "pas plus haute que le rayon de coin : {b:?}");
+            assert!(b.bottom - b.top <= h / 2.0 + 1e-6 || h < 2.0, "pas plus que la moitié de la zone : {b:?}");
+        }
     }
 
     #[test]
@@ -204,7 +246,7 @@ mod tests {
     #[test]
     fn plan_porte_les_valeurs_de_la_decision() {
         let p = planifier(bouton(), 8.0, false, Some((150.0, 110.0)), true).unwrap();
-        assert_eq!((p.rayon_halo, p.alpha_halo, p.rayon_lueur, p.alpha_lueur), (120.0, 0.09, 90.0, 0.55));
+        assert_eq!((p.rayon_halo, p.alpha_halo, p.rayon_lueur, p.alpha_lueur), (120.0, 0.09, 90.0, 0.30));
         assert_eq!(p.centre, (150.0, 110.0));
         assert_eq!(p.rayon_coin, 8.0);
     }
@@ -219,8 +261,10 @@ mod tests {
         assert!(sombre.r > 0.99);
         assert!(clair.r < 0.1 && clair.a < sombre.a, "clair : de l'encre, un peu plus faible ({} contre {})", clair.a, sombre.a);
         let lueur = rgba(255, 255, 255, ALPHA_LUEUR);
-        assert!(transformer(&lueur, true, false, false).r < 0.1, "la lueur claire est de l'encre aussi");
-        assert!(transformer(&lueur, true, false, false).a > 0.0);
+        let (arete_sombre, arete_claire) = (transformer(&lueur, false, false, false), transformer(&lueur, true, false, false));
+        assert!(arete_claire.r < 0.1, "l'arête claire est de l'encre aussi");
+        // Alphas séparés : en clair l'encre est plus douce que le blanc du sombre (0,18 contre 0,30)
+        assert!((arete_sombre.a - ALPHA_LUEUR).abs() < 1e-6 && (arete_claire.a - 0.18).abs() < 1e-6, "sombre {} / clair {}", arete_sombre.a, arete_claire.a);
     }
 
     #[test]

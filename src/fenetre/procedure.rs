@@ -1,5 +1,6 @@
 // Procédure de la fenêtre (WndProc) : un gros match sur les messages Win32.
 
+use crate::terminal::souris::{Bouton, Evenement};
 use crate::*;
 pub(crate) extern "system" fn procedure(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     unsafe {
@@ -89,6 +90,39 @@ pub(crate) extern "system" fn procedure(hwnd: HWND, msg: u32, wparam: WPARAM, lp
                     f.recevoir_etats(*m);
                     let _ = InvalidateRect(hwnd, None, false);
                 }
+                LRESULT(0)
+            }
+
+            // Résultat de la mesure du nettoyage (fil de fond) ; ignoré si la page n'est plus affichée
+            espace::nettoyage::WM_NETTOYAGE => {
+                if let Some(f) = etat_de(hwnd) {
+                    // Toujours livré, même si la page n'est plus affichée : jeter le résultat laisserait le drapeau
+                    // « en cours » levé et « Mesure en cours… » à l'écran pour toujours au retour (Alt+Gauche).
+                    if let Some(res) = espace::nettoyage::prendre() {
+                        f.espace.recevoir_nettoyage(res);
+                    }
+                    let _ = InvalidateRect(hwnd, None, false);
+                }
+                LRESULT(0)
+            }
+
+            // Un élément de plus est parti à la Corbeille : la page redessine son compteur
+            espace::nettoyage::WM_NETTOYAGE_PROGRES => {
+                let _ = InvalidateRect(hwnd, None, false);
+                LRESULT(0)
+            }
+
+            // Fin de la suppression (fil de fond) : bilan au journal et dans l'historique, résultat sous la liste, puis
+            // nouvelle mesure. Livré même si la page n'est plus affichée : le bilan ne doit jamais se perdre.
+            espace::nettoyage::WM_NETTOYAGE_FINI => {
+                if let Some(bilan) = espace::nettoyage::prendre_bilan() {
+                    espace::nettoyage::journaliser(&bilan);
+                    if let Some(f) = etat_de(hwnd) {
+                        f.espace.finir_suppression(bilan.message());
+                        lancer_nettoyage(hwnd, f);
+                    }
+                }
+                let _ = InvalidateRect(hwnd, None, false);
                 LRESULT(0)
             }
 
@@ -332,6 +366,33 @@ pub(crate) extern "system" fn procedure(hwnd: HWND, msg: u32, wparam: WPARAM, lp
                 LRESULT(0)
             }
 
+            // La session du terminal a écrit ou s'est terminée : on vide ce qu'elle a produit et on redessine seulement si
+            // la grille a changé
+            WM_TERMINAL => {
+                if let Some(f) = etat_de(hwnd) {
+                    // Tous les onglets : un shell en arrière-plan qui écrit doit être vidé aussi (sinon son tube se remplit
+                    // et il se bloque) ; `fold` plutôt que `any`, qui s'arrêterait au premier changement
+                    // On ne repeint que si l'onglet affiché a changé, ou si l'étiquette d'un onglet caché a changé (dossier
+                    // annoncé, shell terminé) : un `cargo build` caché ne doit pas redessiner toute la fenêtre à chaque ligne
+                    let actif = f.terminal_actif;
+                    let mut change = false;
+                    for (i, p) in f.terminaux.iter_mut().enumerate() {
+                        let avant = (i != actif).then(|| (p.dossier().to_owned(), p.terminal().dossier().map(str::to_owned), p.fini()));
+                        let a_change = p.pomper();
+                        change |= match avant {
+                            None => a_change,
+                            Some(a) => a_change && a != (p.dossier().to_owned(), p.terminal().dossier().map(str::to_owned), p.fini()),
+                        };
+                    }
+                    // T4b : un dossier annoncé par un shell, ou un nouveau dossier de la liste (`charger` poste aussi ce message)
+                    f.synchroniser_terminal(hwnd);
+                    if change {
+                        let _ = InvalidateRect(hwnd, None, false);
+                    }
+                }
+                LRESULT(0)
+            }
+
             WM_APERCU => {
                 let a = Box::from_raw(lparam.0 as *mut Apercu);
                 if let Some(f) = etat_de(hwnd) {
@@ -382,6 +443,53 @@ pub(crate) extern "system" fn procedure(hwnd: HWND, msg: u32, wparam: WPARAM, lp
                             return LRESULT(0);
                         }
                         if efface_survol(f) {
+                            let _ = InvalidateRect(hwnd, None, false);
+                        }
+                        return LRESULT(0);
+                    }
+                    // T3 : glissement bouton gauche tenu dans un programme plein écran : il reçoit la case sous le pointeur
+                    if f.terminal_glisse_appli {
+                        let ctrl = wparam.0 & 0x0008 != 0; // MK_CONTROL
+                        let alt = touche(VK_MENU);
+                        if wparam.0 & 0x0001 == 0 {
+                            // Bouton déjà relâché sans que le relâchement nous soit parvenu : le programme le reçoit maintenant
+                            f.finir_glisse_appli(hwnd, x, y, ctrl, alt, true);
+                        } else if let Some((rangee, col)) = f.case_terminal_sous(hwnd, x, y, true) {
+                            if let Some(p) = f.terminal_mut() {
+                                p.envoyer_souris(Evenement::Mouvement(Some(Bouton::Gauche)), col, rangee, ctrl, alt);
+                            }
+                        }
+                        return LRESULT(0);
+                    }
+                    // T3 : survol sans bouton au-dessus d'un programme qui suit tous les mouvements (?1003, ce que ConPTY demande
+                    // pour une application console qui lit la souris) ; le reste du traitement du survol continue ensuite.
+                    // Seulement quand rien ne recouvre la grille (palette, tiroir, coup d'œil : la souris est à eux)
+                    if f.terminal_affiche() && wparam.0 & 0x0001 == 0 && destinataire(f, x, y) == DestSouris::Explorateur {
+                        // MK_LBUTTON absent
+                        let ctrl = wparam.0 & 0x0008 != 0; // MK_CONTROL
+                        let alt = touche(VK_MENU);
+                        match f.case_terminal_sous(hwnd, x, y, false) {
+                            Some((rangee, col)) => {
+                                if let Some(p) = f.terminal_mut() {
+                                    if p.souris_capturee() {
+                                        p.envoyer_souris(Evenement::Mouvement(None), col, rangee, ctrl, alt);
+                                    }
+                                }
+                            }
+                            // Pointeur hors de la grille : la prochaine entrée doit renvoyer sa case même si c'est la même
+                            None => {
+                                if let Some(p) = f.terminal_mut() {
+                                    p.oublier_case_souris();
+                                }
+                            }
+                        }
+                    }
+                    // Glissement dans la grille du terminal : la sélection suit le pointeur, bornée au bord de la grille
+                    if f.terminal_glisse {
+                        if let Some((rangee, col)) = f.case_terminal_sous(hwnd, x, y, true) {
+                            if let Some(p) = f.terminal_mut() {
+                                p.etendre_selection(rangee, col);
+                            }
                             let _ = InvalidateRect(hwnd, None, false);
                         }
                         return LRESULT(0);
@@ -479,6 +587,10 @@ pub(crate) extern "system" fn procedure(hwnd: HWND, msg: u32, wparam: WPARAM, lp
                     f.pointeur = None;
                     f.suivre_regard(hwnd);
                     f.survol_appui = false;
+                    // T3 : le pointeur quitte la fenêtre, la case mémorisée n'est plus la sienne
+                    if let Some(p) = f.terminal_mut() {
+                        p.oublier_case_souris();
+                    }
                     // `efface_survol` retire aussi la bulle d'étiquette : sinon elle reste peinte après la sortie du pointeur
                     if efface_survol(f) {
                         let _ = InvalidateRect(hwnd, None, false);
@@ -599,6 +711,39 @@ pub(crate) extern "system" fn procedure(hwnd: HWND, msg: u32, wparam: WPARAM, lp
                     if cible == Cible::AutrePanneau {
                         f.basculer_panneau();
                         cible = cible_sous(hwnd, f, x_lparam(lparam), y_lparam(lparam));
+                    }
+                    // Panneau terminal : un clic dans la grille lui donne le clavier et commence une sélection ; n'importe où
+                    // ailleurs (hors croix et bouton externe) le clavier revient à l'explorateur
+                    if f.terminal_affiche() {
+                        let (x, y) = (f.dip(x_lparam(lparam)), f.dip(y_lparam(lparam)));
+                        // Le journal est en lecture seule : un clic dessus ne donne le clavier à personne et ne sélectionne rien
+                        if cible == Cible::TerminalPanneau && f.terminal_journal {
+                            return LRESULT(0);
+                        }
+                        if cible == Cible::TerminalPanneau {
+                            f.terminal_focus = true;
+                            // T3 : un programme qui a demandé la souris reçoit le clic ; Maj garde la sélection de texte
+                            let (maj, ctrl) = (wparam.0 & 0x0004 != 0, wparam.0 & 0x0008 != 0); // MK_SHIFT, MK_CONTROL
+                            if f.appui_vers_programme(hwnd, x, y, maj, ctrl, touche(VK_MENU)) {
+                                let _ = InvalidateRect(hwnd, None, false);
+                                return LRESULT(0);
+                            }
+                            if let Some((rangee, col)) = f.case_terminal_sous(hwnd, x, y, false) {
+                                if let Some(p) = f.terminal_mut() {
+                                    p.commencer_selection(rangee, col);
+                                }
+                                f.terminal_glisse = true;
+                                SetCapture(hwnd);
+                            }
+                            let _ = InvalidateRect(hwnd, None, false);
+                            return LRESULT(0);
+                        }
+                        if !matches!(cible, Cible::TerminalFermer | Cible::TerminalExterne | Cible::TerminalOnglet(_) | Cible::TerminalOngletFermer(_) | Cible::TerminalNouveau | Cible::TerminalJournal)
+                            && f.terminal_focus
+                        {
+                            f.terminal_focus = false;
+                            let _ = InvalidateRect(hwnd, None, false);
+                        }
                     }
                     // Un clic ailleurs que sur la ligne en cours de renommage valide le nouveau nom
                     if let Some(ed) = &f.app.edition {
@@ -806,8 +951,36 @@ pub(crate) extern "system" fn procedure(hwnd: HWND, msg: u32, wparam: WPARAM, lp
                     if !souris_pour_explorateur(f, lparam) {
                         return LRESULT(0);
                     }
+                    // T3 : le second appui d'un double-clic arrive ici (CS_DBLCLKS) : le programme plein écran le reçoit comme un
+                    // appui de plus, sans quoi un double-clic dans vim ou htop perdrait son deuxième clic
+                    if f.terminal_affiche() && cible_sous(hwnd, f, x_lparam(lparam), y_lparam(lparam)) == Cible::TerminalPanneau {
+                        let (x, y) = (f.dip(x_lparam(lparam)), f.dip(y_lparam(lparam)));
+                        let (maj, ctrl) = (wparam.0 & 0x0004 != 0, wparam.0 & 0x0008 != 0); // MK_SHIFT, MK_CONTROL
+                        if f.appui_vers_programme(hwnd, x, y, maj, ctrl, touche(VK_MENU)) {
+                            let _ = InvalidateRect(hwnd, None, false);
+                            return LRESULT(0);
+                        }
+                    }
                     match cible_sous(hwnd, f, x_lparam(lparam), y_lparam(lparam)) {
                         Cible::Ligne(i) => f.app.ouvrir(hwnd, i),
+                        // Page ESPACE : le double-clic sur un dossier l'ouvre (le relâchement qui suit ne doit rien faire de plus)
+                        Cible::EspaceLigne(i) => {
+                            // (dans un bilan : le dossier qui contient le gros fichier)
+                            if let Some(c) = f.espace.chemin_a_ouvrir(i) {
+                                f.avaler_clic = true;
+                                f.app.naviguer(hwnd, Emplacement::Dossier(c));
+                            }
+                        }
+                        // Carte : un seul clic descend déjà (au relâchement du premier). Le second appui d'un double-clic tombe
+                        // alors sur le contenu du dossier ouvert : son relâchement ne doit pas descendre une fois de plus.
+                        Cible::EspaceCellule(_) | Cible::EspaceChemin(_) => f.avaler_clic = true,
+                        // NETTOYAGE : le premier clic a déjà choisi la ligne (ou coché la case) ; le double-clic sur la ligne la
+                        // coche, comme la case. Le second relâchement ne doit pas recommencer.
+                        Cible::NettoyageLigne(k) => {
+                            f.avaler_clic = true;
+                            crate::commandes::cliquer_nettoyage(hwnd, f, k, false, true);
+                        }
+                        Cible::NettoyageCase(_) | Cible::NettoyageBouton(_) => f.avaler_clic = true,
                         // Double-clic dans le vide de la barre d'onglets : nouvel onglet
                         Cible::Rien if f.dip(y_lparam(lparam)) < HAUTEUR_TITRE => {}
                         _ => {}
@@ -817,9 +990,42 @@ pub(crate) extern "system" fn procedure(hwnd: HWND, msg: u32, wparam: WPARAM, lp
                 LRESULT(0)
             }
 
+            // T3 : la capture nous est retirée en plein glissement (fenêtre qui prend le focus, menu, Alt+Tab) : le relâchement ne
+            // viendra pas. Le programme le reçoit ici, sinon il croirait le bouton tenu pour toujours. Sans glissement en cours
+            // (notre propre `ReleaseCapture`, drapeau déjà baissé), rien à faire.
+            WM_CAPTURECHANGED => {
+                if let Some(f) = etat_de(hwnd) {
+                    if lparam.0 != hwnd.0 as isize {
+                        f.terminal_glisse = false;
+                        if f.terminal_glisse_appli {
+                            let mut p = POINT::default();
+                            let (x, y) = if GetCursorPos(&mut p).is_ok() && ScreenToClient(hwnd, &mut p).as_bool() {
+                                (f.dip(p.x), f.dip(p.y))
+                            } else {
+                                (0.0, 0.0)
+                            };
+                            f.finir_glisse_appli(hwnd, x, y, false, touche(VK_MENU), false);
+                        }
+                    }
+                }
+                LRESULT(0)
+            }
+
             WM_LBUTTONUP => {
                 if let Some(f) = etat_de(hwnd) {
                     f.survol_appui = false;
+                    if f.terminal_glisse_appli {
+                        // Le programme reçoit le relâchement même si le pointeur est sorti de la grille (case bornée)
+                        let (x, y) = (f.dip(x_lparam(lparam)), f.dip(y_lparam(lparam)));
+                        let ctrl = wparam.0 & 0x0008 != 0; // MK_CONTROL
+                        f.finir_glisse_appli(hwnd, x, y, ctrl, touche(VK_MENU), true);
+                        return LRESULT(0);
+                    }
+                    if std::mem::take(&mut f.terminal_glisse) {
+                        let _ = ReleaseCapture();
+                        let _ = InvalidateRect(hwnd, None, false);
+                        return LRESULT(0);
+                    }
                     if f.galerie_glisse.take().is_some() {
                         let _ = ReleaseCapture();
                         return LRESULT(0);
@@ -873,19 +1079,68 @@ pub(crate) extern "system" fn procedure(hwnd: HWND, msg: u32, wparam: WPARAM, lp
                             let c = cible_sous(hwnd, f, x_lparam(lparam), y_lparam(lparam));
                             f.app.ouvrir_lieu(hwnd, c);
                         }
-                        Cible::Reglages => ouvrir_reglages(hwnd, f),
+                        // Le bouton bascule : sur la page des réglages, un second appui la referme (comme la croix)
+                        Cible::Reglages => {
+                            if f.app.emplacement == Emplacement::Reglages {
+                                quitter_reglages(hwnd, f)
+                            } else {
+                                ouvrir_reglages(hwnd, f)
+                            }
+                        }
                         Cible::ReglagesFermer => quitter_reglages(hwnd, f),
                         // Un clic sur le rail affiche la page de la catégorie (il ne fait plus défiler)
                         Cible::ReglagesNav(k) => {
                             let lignes = f.lignes();
                             f.page.aller_categorie(&lignes, k);
                         }
+                        Cible::EspaceFermer => crate::commandes::quitter_espace(hwnd, f),
+                        Cible::EspaceNav(k) => {
+                            f.espace.choisir_page(k);
+                            crate::commandes::lancer_nettoyage(hwnd, f);
+                        }
+                        // Le rang du segment est celui de `espace::VUES`
+                        Cible::EspaceVue(k) => {
+                            if let Some(v) = espace::Vue::depuis_rang(k) {
+                                f.espace.choisir_vue(v);
+                            }
+                            centrer_espace(hwnd, f);
+                        }
+                        // Un clic sur un dossier de la carte y descend ; sur un fichier ou « autres », il le choisit seulement
+                        Cible::EspaceCellule(i) => {
+                            f.espace.cliquer_cellule(i);
+                            f.espace.descendre(i);
+                        }
+                        // Fil d'Ariane : remonte au dossier cliqué
+                        Cible::EspaceChemin(n) => {
+                            f.espace.aller_niveau(n);
+                        }
+                        // NETTOYAGE : la ligne se choisit, sa case se coche, un bouton fait ce que sa touche fait (avec la
+                        // même confirmation avant d'effacer quoi que ce soit)
+                        Cible::NettoyageLigne(k) => crate::commandes::cliquer_nettoyage(hwnd, f, k, false, false),
+                        Cible::NettoyageCase(k) => crate::commandes::cliquer_nettoyage(hwnd, f, k, true, false),
+                        Cible::NettoyageBouton(k) => crate::commandes::bouton_nettoyage(hwnd, f, k),
+                        // Un clic choisit la ligne ; sur sa flèche, il ouvre ou ferme le dossier
+                        Cible::EspaceLigne(i) => {
+                            let x = f.dip(x_lparam(lparam));
+                            let niveau = f.espace.lignes().get(i).map_or(0, |l| l.niveau);
+                            let x_nom = page::gauche() + niveau as f32 * 18.0;
+                            f.espace.cliquer_ligne(i, x >= x_nom - 4.0 && x < x_nom + 22.0);
+                            let (pas, hauteur) = (pas_espace(), crate::commandes::hauteur_espace(hwnd, f));
+                            f.espace.montrer(pas, hauteur);
+                        }
                         Cible::CePc => f.app.naviguer(hwnd, Emplacement::CePC),
-                        Cible::RechercheHaut => executer(hwnd, f, Commande::RechercheGlobale),
+                        Cible::EspaceVolet => crate::commandes::ouvrir_espace(hwnd, f),
                         Cible::EssentielHaut => executer(hwnd, f, Commande::Essentiel),
                         Cible::Terminal => executer(hwnd, f, Commande::Terminal),
-                        Cible::TerminalFermer => f.terminal_visible = false,
+                        Cible::TerminalFermer => f.fermer_terminal(),
                         Cible::TerminalExterne => crate::commandes::terminal_externe(f),
+                        Cible::TerminalOnglet(i) => {
+                            f.choisir_onglet_terminal(i);
+                            f.terminal_focus = true;
+                        }
+                        Cible::TerminalOngletFermer(i) => f.fermer_onglet_terminal(i),
+                        Cible::TerminalNouveau => crate::commandes::nouvel_onglet_terminal(hwnd, f),
+                        Cible::TerminalJournal => f.basculer_journal_terminal(),
                         Cible::TerminalPanneau => {},
                         Cible::Groupe(k) => {
                             if let Some(g) = f.app.groupes.get(k).map(|g| g.nom.clone()) {
@@ -897,7 +1152,21 @@ pub(crate) extern "system" fn procedure(hwnd: HWND, msg: u32, wparam: WPARAM, lp
                         Cible::PlusPastilles => {}
                         Cible::Chemin => f.app.commencer_saisie_chemin(),
                         Cible::Section(_) => {}
-                        Cible::TitreVolet(k) => reglages::modifier(|r| r.volet_replie ^= 1 << k),
+                        Cible::TitreVolet(k) => {
+                            // Section repliée d'office par la fenêtre (pas par l'auteur) : un clic la rouvre et le milieu défile
+                            // à sa place ; sinon, un clic la replie ou la rouvre dans les réglages
+                            let bit = 1u32 << k;
+                            let repliee = dispo_volet(&f.app).ouverture_cible[k as usize] < 0.5;
+                            let choisie = reglages::VOLET_REPLIE.load(Ordering::Relaxed) & bit != 0;
+                            f.app.volet_force &= !bit;
+                            if repliee && !choisie {
+                                f.app.volet_force |= bit;
+                            } else if repliee {
+                                reglages::modifier(|r| r.volet_replie &= !bit);
+                            } else {
+                                reglages::modifier(|r| r.volet_replie |= bit);
+                            }
+                        }
                         Cible::Arbre(i) => clic_arbre(hwnd, f, i, f.dip(x_lparam(lparam))),
                         Cible::Jour(j) => f.app.choisir_jour(j),
                         Cible::Note => ouvrir_note(f),
@@ -910,6 +1179,8 @@ pub(crate) extern "system" fn procedure(hwnd: HWND, msg: u32, wparam: WPARAM, lp
                             }
                         }
                         Cible::AjouterStockage => crate::commandes::formulaire_stockage(hwnd, f),
+                        Cible::OuvrirEspace => crate::commandes::ouvrir_espace(hwnd, f),
+                        Cible::OuvrirNettoyage => crate::commandes::ouvrir_nettoyage(hwnd, f),
                         Cible::Statut => {
                             menu_statut(hwnd, f, f.dip(x_lparam(lparam)), f.dip(y_lparam(lparam)));
                             return LRESULT(0);
@@ -964,6 +1235,8 @@ pub(crate) extern "system" fn procedure(hwnd: HWND, msg: u32, wparam: WPARAM, lp
                     }
                     match cible_sous(hwnd, f, x_lparam(lparam), y_lparam(lparam)) {
                         Cible::Onglet(k) | Cible::FermerOnglet(k) => f.fermer_onglet(hwnd, k),
+                        // T4a : clic du milieu sur un onglet du terminal = le fermer (le dernier ferme le panneau)
+                        Cible::TerminalOnglet(k) => f.fermer_onglet_terminal(k),
                         c @ (Cible::Ligne(_) | Cible::Favori(_) | Cible::Epingle(_) | Cible::Disque(_) | Cible::Segment(_) | Cible::Nuage(_) | Cible::Serveur(_) | Cible::Groupe(_) | Cible::CePc | Cible::Arbre(_)) => {
                             let emp = match c {
                                 Cible::Groupe(k) => f.app.groupes.get(k).map(|g| Emplacement::Groupe(g.nom.clone())),
@@ -1029,12 +1302,32 @@ pub(crate) extern "system" fn procedure(hwnd: HWND, msg: u32, wparam: WPARAM, lp
                         let max = rendu::historique_defilement_max(entrees.len(), &zone, entrees.iter().any(|e| e.id == 0));
                         f.historique_defilement = (f.historique_defilement - crans * rendu::HIST_RANG).clamp(0.0, max);
                         let _ = InvalidateRect(hwnd, None, false);
+                    } else if f.terminal_affiche() && {
+                        let mut p = POINT { x: x_lparam(lparam), y: y_lparam(lparam) };
+                        let _ = ScreenToClient(hwnd, &mut p);
+                        matches!(cible_sous(hwnd, f, p.x, p.y), Cible::TerminalPanneau | Cible::TerminalFermer | Cible::TerminalExterne | Cible::TerminalOnglet(_) | Cible::TerminalOngletFermer(_) | Cible::TerminalNouveau | Cible::TerminalJournal)
+                    } {
+                        // T3 : un programme plein écran reçoit la molette (boutons 64/65 s'il suit la souris, sinon des
+                        // flèches sur l'écran alterné) ; sur l'écran principal, trois lignes par cran dans l'historique du shell
+                        let mut pt = POINT { x: x_lparam(lparam), y: y_lparam(lparam) };
+                        let _ = ScreenToClient(hwnd, &mut pt);
+                        let (rangee, col) = f.case_terminal_sous(hwnd, f.dip(pt.x), f.dip(pt.y), true).unwrap_or((0, 0));
+                        // Un pavé tactile envoie des fractions de cran : on les cumule jusqu'à un cran entier
+                        let entier = super::logique::crans_entiers(&mut f.terminal_molette_reste, crans);
+                        let alt = touche(VK_MENU);
+                        // Maj + molette : l'historique du shell défile quoi que demande le programme (comme Maj garde la sélection)
+                        let maj = wparam.0 & 0x0004 != 0; // MK_SHIFT
+                        let consommee = f.terminal_journal
+                            || (!maj && f.terminal_mut().is_some_and(|p| p.molette_vers_programme(entier, col, rangee, ctrl, alt)));
+                        if !consommee && f.terminal_mut().is_some_and(|p| p.defiler((crans * 3.0) as isize)) {
+                            let _ = InvalidateRect(hwnd, None, false);
+                        }
                     } else if ctrl && f.app.affichage == Affichage::Grille {
                         // Ctrl+molette : taille des vignettes
                         f.app.zoomer(crans);
                     } else if ctrl && f.app.affichage == Affichage::Liste {
                         f.app.choisir_vue(hwnd, Affichage::Grille);
-                    } else if reglages::ARBRE.load(Ordering::Relaxed) && {
+                    } else if (reglages::ARBRE.load(Ordering::Relaxed) || volet_defilable(&f.app)) && {
                         let mut p = POINT { x: x_lparam(lparam), y: y_lparam(lparam) };
                         let _ = ScreenToClient(hwnd, &mut p);
                         f.dip(p.x) < largeur_volet() && f.dip(p.y) > HAUTEUR_TITRE
@@ -1043,6 +1336,8 @@ pub(crate) extern "system" fn procedure(hwnd: HWND, msg: u32, wparam: WPARAM, lp
                     } else if f.app.emplacement == Emplacement::Reglages {
                         let (lignes, hauteur) = (f.lignes(), hauteur_page(hwnd, f));
                         f.page.defiler(&lignes, -crans * 2.0 * page::LIGNE_H, hauteur);
+                    } else if f.app.emplacement == Emplacement::Espace {
+                        molette_espace(hwnd, f, crans);
                     } else {
                         f.app.defiler(-crans * 3.0 * hauteur_ligne());
                     }
@@ -1117,7 +1412,8 @@ pub(crate) extern "system" fn procedure(hwnd: HWND, msg: u32, wparam: WPARAM, lp
                     let _ = InvalidateRect(hwnd, None, false);
                 }
                 let vk = VIRTUAL_KEY(wparam.0 as u16);
-                let alt = msg == WM_SYSKEYDOWN || touche(VK_MENU);
+                // F10 arrive par WM_SYSKEYDOWN sans Alt : le bit 29 du lparam dit si Alt est vraiment enfoncé
+                let alt = (msg == WM_SYSKEYDOWN && (lparam.0 >> 29) & 1 == 1) || touche(VK_MENU);
                 let ctrl = touche(VK_CONTROL);
                 let maj = touche(VK_SHIFT);
 
@@ -1186,6 +1482,18 @@ pub(crate) extern "system" fn procedure(hwnd: HWND, msg: u32, wparam: WPARAM, lp
                     animer(hwnd, f);
                     return LRESULT(0);
                 }
+                // Panneau terminal avec le focus : le clavier va au shell (sauf Ctrl+K, Ctrl+Alt+T, Alt+F4)
+                if f.terminal_a_le_clavier() {
+                    match touche_terminal(hwnd, f, vk, ctrl, alt, maj) {
+                        SuiteTouche::Explorateur => {}
+                        suite => {
+                            // Une touche traduite ici ne doit pas être renvoyée une seconde fois par son WM_CHAR
+                            f.avaler_caractere = suite == SuiteTouche::Pris;
+                            animer(hwnd, f);
+                            return LRESULT(0);
+                        }
+                    }
+                }
                 // Panneau Historique (lot 15B) : Échap rentre le tiroir avant tout autre geste, sauf pendant une saisie ou une fenêtre modale
                 // (déjà traitées plus haut)
                 if vk == VK_ESCAPE && f.historique && !f.modale() && f.app.edition.is_none() && f.page.formulaire.is_none() {
@@ -1194,15 +1502,17 @@ pub(crate) extern "system" fn procedure(hwnd: HWND, msg: u32, wparam: WPARAM, lp
                     animer(hwnd, f);
                     return LRESULT(0);
                 }
-                // Le panneau terminal est une couche de la liste : Échap le ferme avant les autres gestes.
+                // Le panneau terminal est une couche de la liste : sans le focus, Échap le ferme avant les autres gestes
+                // (avec le focus, Échap va au shell, plus haut). Un shell encore actif n'est jamais tué par un Échap perdu
+                // (vider le filtre de la liste, par exemple) : il se ferme par Ctrl+Alt+T ou le bouton du panneau.
                 if vk == VK_ESCAPE
-                    && f.terminal_visible
-                    && f.app.emplacement != Emplacement::Reglages
+                    && f.terminal_affiche()
+                    && !f.terminal_ref().is_some_and(|p| p.actif())
                     && !f.modale()
                     && f.app.edition.is_none()
                     && f.page.formulaire.is_none()
                 {
-                    f.terminal_visible = false;
+                    f.fermer_terminal();
                     let _ = InvalidateRect(hwnd, None, false);
                     animer(hwnd, f);
                     return LRESULT(0);
@@ -1245,7 +1555,7 @@ pub(crate) extern "system" fn procedure(hwnd: HWND, msg: u32, wparam: WPARAM, lp
                         return LRESULT(0);
                     }
                     // Dans les réglages, Tab change de catégorie (touche_page) : il ne bascule pas le double panneau
-                    VK_TAB if !ctrl && f.second.is_some() && reglages::touche_de_commande("BASCULERPANNEAU").is_none() && f.app.edition.is_none() && f.page.formulaire.is_none() && f.app.emplacement != Emplacement::Reglages => {
+                    VK_TAB if !ctrl && f.second.is_some() && reglages::touche_de_commande("BASCULERPANNEAU").is_none() && f.app.edition.is_none() && f.page.formulaire.is_none() && !f.app.emplacement.est_page() => {
                         f.basculer_panneau();
                         animer(hwnd, f);
                         return LRESULT(0);
@@ -1325,6 +1635,54 @@ pub(crate) extern "system" fn procedure(hwnd: HWND, msg: u32, wparam: WPARAM, lp
                         return LRESULT(0);
                     }
                     return if alt { DefWindowProcW(hwnd, msg, wparam, lparam) } else { LRESULT(0) };
+                }
+
+                // Page ESPACE : flèches, Page haut / bas, Début / Fin, Entrée, Tab, Retour arrière, Échap
+                if f.app.emplacement == Emplacement::Espace {
+                    use espace::Touche;
+                    let t = match vk {
+                        VK_UP => Some(Touche::Haut),
+                        VK_DOWN => Some(Touche::Bas),
+                        VK_RIGHT => Some(Touche::Droite),
+                        VK_LEFT => Some(Touche::Gauche),
+                        VK_RETURN => Some(Touche::Entree),
+                        VK_BACK => Some(Touche::Retour),
+                        VK_HOME => Some(Touche::Debut),
+                        VK_END => Some(Touche::Fin),
+                        VK_PRIOR => Some(Touche::PageHaut),
+                        VK_NEXT => Some(Touche::PageBas),
+                        VK_TAB => Some(Touche::Tab),
+                        VK_SPACE => Some(Touche::Cocher),
+                        VK_V => Some(Touche::Basculer),
+                        VK_O => Some(Touche::Ouvrir),
+                        // 1 à 5 (rangée du haut) : carte, arbre, types, gros fichiers, âge
+                        v if (0x31..=0x35).contains(&v.0) => Some(Touche::Vue((v.0 - 0x31) as usize)),
+                        _ => None,
+                    };
+                    if vk == VK_ESCAPE && !ctrl && !alt {
+                        // Échap annule d'abord une confirmation de nettoyage ; il ne quitte la page qu'ensuite
+                        if !f.espace.echap_nettoyage() {
+                            quitter_espace(hwnd, f);
+                        }
+                        let _ = InvalidateRect(hwnd, None, false);
+                        animer(hwnd, f);
+                        return LRESULT(0);
+                    }
+                    if let (Some(t), false, false) = (t, ctrl, alt) {
+                        f.focus_clavier = true;
+                        touche_espace(hwnd, f, t);
+                        animer(hwnd, f);
+                        return LRESULT(0);
+                    }
+                    return if alt { DefWindowProcW(hwnd, msg, wparam, lparam) } else { LRESULT(0) };
+                }
+
+                // Ctrl+Maj+J : le journal des opérations dans le panneau terminal (T4c), quand le panneau est ouvert. Le terminal
+                // qui a le clavier le réserve de la même façon (`touche_terminal`) ; ici, c'est le cas où le journal est affiché.
+                if ctrl && maj && !alt && vk.0 == 0x4A && f.terminal_affiche() {
+                    f.basculer_journal_terminal();
+                    let _ = InvalidateRect(hwnd, None, false);
+                    return LRESULT(0);
                 }
 
                 // Raccourcis des commandes (E15–E18)
@@ -1513,6 +1871,10 @@ pub(crate) extern "system" fn procedure(hwnd: HWND, msg: u32, wparam: WPARAM, lp
                     if std::mem::take(&mut f.avaler_caractere) {
                         return LRESULT(0);
                     }
+                    // Le panneau terminal avec le focus prend tout, caractères de contrôle compris (Ctrl+C = 0x03)
+                    if f.terminal_a_le_clavier() && caractere_terminal(hwnd, f, wparam.0 as u16) {
+                        return LRESULT(0);
+                    }
                     if let Some(c) = char::from_u32(wparam.0 as u32) {
                         if !c.is_control() && !(touche(VK_CONTROL) && !touche(VK_MENU)) {
                             if f.galerie.is_some() {
@@ -1540,6 +1902,8 @@ pub(crate) extern "system" fn procedure(hwnd: HWND, msg: u32, wparam: WPARAM, lp
                                     }
                                 }
                                 let _ = InvalidateRect(hwnd, None, false);
+                            } else if f.app.emplacement == Emplacement::Espace {
+                                // La page ESPACE n'a ni filtre ni saisie : les lettres ne vont nulle part
                             } else if let Some(ed) = &mut f.app.saisie_chemin {
                                 ed.inserer(c.encode_utf8(&mut [0; 4]));
                                 f.app.completion = None;
@@ -1555,6 +1919,16 @@ pub(crate) extern "system" fn procedure(hwnd: HWND, msg: u32, wparam: WPARAM, lp
                     }
                 }
                 LRESULT(0)
+            }
+
+            // Alt+lettre : le terminal l'a déjà envoyé au shell depuis WM_SYSKEYDOWN ; sans cette ligne le système le prendrait
+            // pour un raccourci de menu et sonnerait
+            WM_SYSCHAR => {
+                let pris = char::from_u32(wparam.0 as u32).is_some_and(|c| c.is_ascii_alphanumeric());
+                if pris && etat_de(hwnd).is_some_and(|f| f.terminal_a_le_clavier()) {
+                    return LRESULT(0);
+                }
+                DefWindowProcW(hwnd, msg, wparam, lparam)
             }
 
             WM_SIZE => {
@@ -1797,6 +2171,9 @@ pub(crate) extern "system" fn procedure(hwnd: HWND, msg: u32, wparam: WPARAM, lp
                     }
                     // Pastilles d'opération et Pixel : calculés avant l'emprunt de la vue (et avant que la carte des conflits
                     // quitte son onglet, car Pixel en dépend)
+                    synchroniser_espace(hwnd, f);
+                    let pas_espace = pas_espace();
+                    let maintenant_s = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs());
                     let pixel = f.vue_pixel(hwnd);
                     let liste_pastilles: Vec<pastilles::Pastille> = f.pastilles().into_iter().map(|(p, _)| p).collect();
                     // Un rang fixé par un clic et devenu périmé (la liste a raccourci) est oublié
@@ -1846,6 +2223,12 @@ pub(crate) extern "system" fn procedure(hwnd: HWND, msg: u32, wparam: WPARAM, lp
                     let hist_visible = f.historique || f.rendu.mouvements.borrow().tiroir_visible(t_maj);
                     let hist_entrees = if hist_visible { journal_historique::instantane() } else { Vec::new() };
                     let hist_maintenant = if hist_visible { journal_historique::maintenant() } else { String::new() };
+                    // La grille du terminal suit la taille du panneau (fenêtre, volet d'aperçu) ; sans changement, rien ne se passe
+                    f.ajuster_terminal(hwnd);
+                    // Dossier de chaque onglet du terminal : celui que le shell annonce (OSC 9;9), sinon celui du lancement
+                    f.actualiser_operations_terminal();
+                    let dossiers_terminal: Vec<String> =
+                        f.terminaux.iter().map(|p| p.terminal().dossier().unwrap_or(p.dossier()).to_string()).collect();
                     let mut vue = Vue {
                         historique: rendu::VueHistorique { ouvert: f.historique, entrees: &hist_entrees, defilement: f.historique_defilement, maintenant: hist_maintenant },
                         pointeur: f.pointeur,
@@ -1855,11 +2238,17 @@ pub(crate) extern "system" fn procedure(hwnd: HWND, msg: u32, wparam: WPARAM, lp
                         page_sortie: page_sortie_voulue.then(|| VuePage { lignes: &lignes_sortie, page: &f.page, focus_clavier: f.focus_clavier }),
                         onglets: &titres,
                         actif: f.rang,
-                        apercu_visible: f.apercu_visible && f.app.emplacement != Emplacement::Reglages,
+                        apercu_visible: f.apercu_visible && !f.app.emplacement.est_page(),
                         apercu: f.apercu.as_ref(),
-                        terminal_visible: f.terminal_visible && f.app.emplacement != Emplacement::Reglages,
-                        terminal_lignes: &f.terminal_lignes,
+                        terminal: f.terminaux.get(f.terminal_actif).filter(|_| !f.app.emplacement.est_page()).map(|p| rendu::VueTerminal { panneau: &**p, focus: f.terminal_focus, onglets: dossiers_terminal, actif: f.terminal_actif, journal: f.terminal_journal.then_some(&f.terminal_operations[..]), ligne: if f.terminal_journal { None } else { p.vue_ligne(&f.historique_terminal) } }),
                         page: (f.app.emplacement == Emplacement::Reglages).then_some(VuePage { lignes: &lignes, page: &f.page, focus_clavier: f.focus_clavier }),
+                        espace: (f.app.emplacement == Emplacement::Espace).then_some(rendu::VueEspace {
+                            etat: &f.espace,
+                            focus_clavier: f.focus_clavier,
+                            pas: pas_espace,
+                            maintenant: maintenant_s,
+                            index_enregistre: index::actuel().is_some() || index::enregistre_existe(),
+                        }),
                         double: f.second.is_some(),
                         focus_droite: f.focus_droite,
                         focus_clavier: f.focus_clavier,
@@ -1961,6 +2350,17 @@ pub(crate) extern "system" fn procedure(hwnd: HWND, msg: u32, wparam: WPARAM, lp
             }
 
             // Fermer en pleine copie tuerait le fil de Windows : fichier tronqué, file et Ctrl+Z perdus
+            // Une suppression du NETTOYAGE court dans un fil de fond : fermer maintenant le tuerait en pleine opération et son
+            // bilan ne serait jamais écrit dans l'historique. Elle dure quelques secondes ; on le dit et on garde la fenêtre.
+            // Un second essai ferme quand même : si Windows attend une réponse à sa question, l'auteur ne reste pas coincé.
+            WM_CLOSE if espace::nettoyage::suppression_en_cours() && !espace::nettoyage::fermeture_deja_refusee() => {
+                if let Some(f) = etat_de(hwnd) {
+                    f.app.annoncer("SUPPRESSION EN COURS · FERMER ENCORE POUR QUITTER QUAND MÊME", true);
+                    let _ = InvalidateRect(hwnd, None, false);
+                }
+                LRESULT(0)
+            }
+
             WM_CLOSE if etat_de(hwnd).is_some_and(|f| f.tous().any(|a| a.operation.is_some())) => {
                 if let Some(f) = etat_de(hwnd) {
                     f.app.annoncer("OPERATION EN COURS · ECHAP POUR L'ANNULER AVANT DE FERMER", true);
@@ -2005,6 +2405,8 @@ pub(crate) extern "system" fn procedure(hwnd: HWND, msg: u32, wparam: WPARAM, lp
                 if let Some(f) = if sous_modale { None } else { etat_de(hwnd) } {
                     fermer_formulaire(f);
                     sauver_session(f);
+                    // Le shell du panneau terminal est tué avec la fenêtre
+                    f.fermer_terminal();
                     // Fenêtre détruite en pleine animation : le fil de synchronisation sur l'écran s'arrête
                     if let Some(arret) = f.metronome.take() {
                         arret.store(true, std::sync::atomic::Ordering::Release);

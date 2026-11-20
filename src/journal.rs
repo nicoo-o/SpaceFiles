@@ -123,7 +123,17 @@ pub fn fichier_operations() -> Option<std::path::PathBuf> {
     Some(crate::reglages::dossier_donnees(true)?.join("operations.csv"))
 }
 
-/// Une ligne du journal des opérations, telle que le panneau terminal l'affiche.
+/// Combien d'opérations l'onglet JOURNAL du panneau terminal (T4c) garde en mémoire ; le dessin en montre ce qui tient
+pub const OPERATIONS_AFFICHEES: usize = 200;
+
+/// Nombre d'opérations écrites par ce processus depuis son lancement : l'onglet JOURNAL ne relit le fichier que quand il change
+static ECRITURES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+pub fn ecritures() -> usize {
+    ECRITURES.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Une ligne du journal des opérations (`operations.csv`), affichée par l'onglet JOURNAL du panneau terminal (T4c)
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Operation {
     pub date: String,
@@ -132,7 +142,7 @@ pub struct Operation {
 }
 
 impl Operation {
-    /// Heure seule : le panneau tient sur cinq lignes, la date complète est déjà dans le fichier.
+    /// Heure seule : la date complète est déjà dans le fichier.
     pub fn heure(&self) -> &str {
         self.date.get(11..16).unwrap_or(&self.date)
     }
@@ -146,6 +156,11 @@ pub fn dernieres_operations(max: usize) -> Vec<Operation> {
     }
     let Some(fichier) = fichier_operations() else { return Vec::new() };
     let Ok(texte) = std::fs::read_to_string(fichier) else { return Vec::new() };
+    dernieres_du_texte(&texte, max)
+}
+
+/// Les `max` dernières lignes valides du texte d'`operations.csv`, de la plus ancienne à la plus récente
+fn dernieres_du_texte(texte: &str, max: usize) -> Vec<Operation> {
     let mut operations: Vec<Operation> = texte.lines().filter_map(analyser_operation).collect();
     if operations.len() > max {
         operations.drain(..operations.len() - max);
@@ -219,6 +234,7 @@ pub fn operation(action: &str, detail: &str) {
     // BOM UTF-8 en tête : sans lui Excel lit les accents en ANSI
     let entete = if neuf { "\u{feff}DATE;ACTION;DETAIL\r\n" } else { "" };
     ajouter(&fichier, &format!("{entete}{date};{};{}\r\n", champ_csv(action), champ_csv(detail)));
+    ECRITURES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 }
 
 #[cfg(test)]
@@ -273,6 +289,19 @@ mod tests {
         assert!(analyser_operation("2026-11-05 10:04:03;COPIE").is_none());
         assert!(analyser_operation("").is_none());
         assert_eq!(Operation { date: "pas-une-date".into(), action: "X".into(), detail: String::new() }.heure(), "pas-une-date");
+    }
+
+    /// Le journal garde ses données (critère de T4c) : l'ordre du fichier est conservé, le plafond coupe les plus anciennes, et
+    /// l'en-tête avec son BOM comme une ligne cassée sont ignorés
+    #[test]
+    fn terminal_garde_les_dernieres_operations_dans_l_ordre() {
+        let t = "\u{feff}DATE;ACTION;DETAIL\r\n2026-11-05 10:00:00;COPIE;a\r\nligne cassée\r\n2026-11-05 10:01:00;DEPLACEMENT;b\r\n2026-11-05 10:02:00;CORBEILLE;c\r\n";
+        let toutes = dernieres_du_texte(t, 10);
+        assert_eq!(toutes.iter().map(|o| o.detail.as_str()).collect::<Vec<_>>(), ["a", "b", "c"]);
+        let deux = dernieres_du_texte(t, 2);
+        assert_eq!(deux.iter().map(|o| o.action.as_str()).collect::<Vec<_>>(), ["DEPLACEMENT", "CORBEILLE"]);
+        assert!(dernieres_du_texte(t, 0).is_empty());
+        assert!(dernieres_du_texte("", 5).is_empty());
     }
 
     /// Vraie panique d'un fil, dans un faux %LOCALAPPDATA% : à lancer seul (`--ignored`), il change l'environnement

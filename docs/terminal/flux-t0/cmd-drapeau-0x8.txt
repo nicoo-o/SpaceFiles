@@ -1,0 +1,3 @@
+␛[?9001h␛[?1004h␛[?25l␛[2J␛[m␛[HMicrosoft Windows [version 10.0.26300.9974]␛]0;C:\WINDOWS\SYSTEM32\cmd.exe␇␛[?25h␛[?25l\r\n
+(c) Microsoft Corporation. Tous droits rÃ©servÃ©s.␛[4;1HC:\Users\utilisateur\Desktop\projet perso code\nothing-explorer>prompt $E]133;A$E\$E]9;9;$P$E\$P$G␛[6;1H␛]0;AdministrateurÂ : C:\WINDOWS\SYSTEM32\cmd.exe␇␛[?25h␛]133;A␛\␛]9;9;C:\Users\utilisateur\Desktop\projet perso code\nothing-explorer␛\␛[?25lC:\Users\utilisateur\Desktop\projet perso code\nothing-explorer>cd \␛[8;1H␛[?25h␛]133;A␛\␛]9;9;C:\␛\␛[?25lC:\>echo bonjour\r\n
+bonjour␛[11;1H␛[?25h␛]133;A␛\␛]9;9;C:\␛\C:\>␛[?9001l␛[?1004l
